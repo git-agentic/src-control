@@ -240,6 +240,93 @@ fn a_stalled_request_does_not_hold_the_shutdown_past_its_deadline() {
     drop(s);
 }
 
+#[test]
+fn sigterm_during_a_clone_drains_or_cancels_cleanly() {
+    let root = tmp("clone-sigterm");
+    let token = bootstrap(&root.0);
+    let mut p = Proc::start(&root.0, &["--shutdown-timeout", "2"]);
+    let created = p
+        .send(
+            "POST",
+            "/api/v1/user/repos",
+            Some(&token),
+            Some(&serde_json::json!({"name":"clone-shutdown","auto_init":true})),
+        )
+        .unwrap();
+    assert_eq!(created.0, 201, "{}", created.1);
+    let url = format!("http://127.0.0.1:{}/siteadmin/clone-shutdown.git", p.port);
+    // Add a large incompressible blob through a real Git client.
+    let work = root.0.join("work");
+    let run = |args: &[&str], cwd: &Path| {
+        Command::new("git")
+            .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+            .env("HOME", &root.0)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    std::fs::create_dir(&work).unwrap();
+    assert!(run(&["init", "-q", "-b", "main"], &work).status.success());
+    let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+    let bytes: Vec<u8> = (0..(20 << 20))
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect();
+    std::fs::write(work.join("large.bin"), bytes).unwrap();
+    for args in [&["add", "."][..], &["commit", "-q", "-m", "large"][..]] {
+        assert!(run(args, &work).status.success());
+    }
+    let remote_auth = format!("-chttp.extraHeader=Authorization: token {token}");
+    assert!(run(&[&remote_auth, "push", &url, "main"], &work)
+        .status
+        .success());
+    let clone = root.0.join("clone");
+    let client = Command::new("git")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+        .env("HOME", &root.0)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg(&remote_auth)
+        .args(["clone", "-q", &url, clone.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Give the server a bounded chance to accept the transfer before shutdown.
+    let connected = (0..100).any(|_| TcpStream::connect(("127.0.0.1", p.port)).is_ok());
+    assert!(
+        connected,
+        "server stopped accepting before the clone started"
+    );
+    p.sigterm();
+    let status = p
+        .wait(Duration::from_secs(8))
+        .expect("server exits by timeout plus margin");
+    assert!(status.success(), "{status:?}");
+    let mut client = client;
+    let end = Instant::now() + Duration::from_secs(8);
+    let status = loop {
+        if let Some(status) = client.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < end, "clone hung after server shutdown");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let _ = status;
+}
+
 fn serve_with(tag: &str, listen: &str, extra: &[&str]) -> (Child, Tmp) {
     let root = tmp(tag);
     let child = Command::new(BIN)

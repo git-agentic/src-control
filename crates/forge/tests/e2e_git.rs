@@ -670,6 +670,115 @@ fn deleting_a_repository_ends_its_running_transports_first() {
 }
 
 #[test]
+fn a_cancelled_push_leaves_no_ref_lock_or_quarantine() {
+    let s = Srv::start();
+    let c = Client::new("cancel-push");
+    let url = repo(&s, "cancel-push");
+    let auth = token(&s.admin);
+    let work = seeded(&c, &url, &auth);
+    std::fs::write(work.join("big.bin"), noise(20 << 20)).unwrap();
+    c.ok(&work, None, &["add", "."]);
+    c.ok(&work, None, &["commit", "-q", "-m", "big"]);
+    let mut push = Command::new("git");
+    push.env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+        .env("HOME", &c.dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .current_dir(&work)
+        .arg("-c")
+        .arg(format!("http.extraHeader=Authorization: {auth}"))
+        .args(["push", "-q", &url, "main"]);
+    let child = push.spawn().unwrap();
+    let repo_dir = s.dir.join("repos").join("1.git");
+    wait_for("push transport and quarantine", || {
+        s.app.life.registry.live() > 0
+            && repo_dir
+                .join("objects")
+                .read_dir()
+                .ok()
+                .is_some_and(|mut e| {
+                    e.any(|x| {
+                        x.unwrap()
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("tmp_objdir-incoming-")
+                    })
+                })
+    });
+    let deleted = s.send(
+        "DELETE",
+        "/api/v1/repos/siteadmin/cancel-push",
+        Some(&auth),
+        None,
+    );
+    assert_eq!(deleted.status, 204, "{}", deleted.msg());
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success(), "cancelled push succeeded");
+    for dir in [
+        repo_dir,
+        s.dir.join("trash/1.git"),
+        s.dir.join("orphans/1.git"),
+    ] {
+        if dir.exists() {
+            let mut pending = vec![dir.clone()];
+            while let Some(path) = pending.pop() {
+                for entry in std::fs::read_dir(&path).unwrap() {
+                    let entry = entry.unwrap();
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    assert!(
+                        !name.ends_with(".lock") && !name.starts_with("tmp_objdir-incoming-"),
+                        "leftover: {}",
+                        entry.path().display()
+                    );
+                    if entry.file_type().unwrap().is_dir() {
+                        pending.push(entry.path());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn deleting_a_repository_during_a_clone_fails_the_clone() {
+    let s = Srv::start();
+    let c = Client::new("delete-clone");
+    let url = repo(&s, "delete-clone");
+    let auth = token(&s.admin);
+    let work = seeded(&c, &url, &auth);
+    std::fs::write(work.join("big.bin"), noise(20 << 20)).unwrap();
+    c.ok(&work, None, &["add", "."]);
+    c.ok(&work, None, &["commit", "-q", "-m", "big"]);
+    c.ok(&work, Some(&auth), &["push", "-q", &url, "main"]);
+    let mut clone = Command::new("git");
+    clone
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+        .env("HOME", &c.dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .current_dir(&c.dir)
+        .arg("-c")
+        .arg(format!("http.extraHeader=Authorization: {auth}"))
+        .args(["clone", "-q", &url, c.dir.join("clone").to_str().unwrap()]);
+    let child = clone.spawn().unwrap();
+    wait_for("upload-pack transport", || s.app.life.registry.live() > 0);
+    let deleted = s.send(
+        "DELETE",
+        "/api/v1/repos/siteadmin/delete-clone",
+        Some(&auth),
+        None,
+    );
+    assert_eq!(deleted.status, 204, "{}", deleted.msg());
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        !out.status.success(),
+        "clone succeeded after repository deletion"
+    );
+}
+
+#[test]
 fn a_push_over_the_size_cap_fails_and_changes_nothing() {
     let s = Srv::start_transport(scl_forge::cgi::Cfg {
         max_pack: 200 << 10,
