@@ -669,6 +669,250 @@ fn deleting_a_repository_ends_its_running_transports_first() {
     assert_eq!(r.status, 404);
 }
 
+/// Every entry under `dir` whose name a cancelled transport could leave behind.
+fn leftovers(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        for entry in std::fs::read_dir(&path).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".lock") || name.starts_with("tmp_objdir-incoming-") {
+                found.push(entry.path());
+            }
+            if entry.file_type().unwrap().is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    found
+}
+
+fn quarantined(repo_dir: &Path) -> bool {
+    std::fs::read_dir(repo_dir.join("objects"))
+        .unwrap()
+        .any(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("tmp_objdir-incoming-")
+        })
+}
+
+#[test]
+fn a_push_cancelled_mid_pack_moves_no_ref_and_its_quarantine_is_reclaimed() {
+    use std::io::Write;
+    // The server does not always see a client that leaves mid-body (the body read can miss the
+    // EOF, #316); the idle timeout then ends the transport. A short one bounds the test either way.
+    let s = Srv::start_transport(scl_forge::cgi::Cfg {
+        idle: std::time::Duration::from_secs(5),
+        ..Default::default()
+    });
+    let c = Client::new("cancel-push");
+    let url = repo(&s, "cancel-push");
+    let auth = token(&s.admin);
+    let work = seeded(&c, &url, &auth);
+    let old = c.ok(&work, None, &["rev-parse", "HEAD"]).trim().to_string();
+    std::fs::write(work.join("big.bin"), noise(8 << 20)).unwrap();
+    c.ok(&work, None, &["add", "."]);
+    c.ok(&work, None, &["commit", "-q", "-m", "big"]);
+    let new = c.ok(&work, None, &["rev-parse", "HEAD"]).trim().to_string();
+    // The real pack the client would send for `old..new`.
+    let mut pack_objects = Command::new("git")
+        .current_dir(&work)
+        .args(["pack-objects", "--stdout", "--revs", "-q"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    pack_objects
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{new}\n^{old}\n").as_bytes())
+        .unwrap();
+    let pack = pack_objects.wait_with_output().unwrap().stdout;
+    assert!(pack.len() > 8 << 20);
+    let cmd = format!("{old} {new} refs/heads/main\0report-status\n");
+    let mut body = format!("{:04x}{cmd}0000", cmd.len() + 4).into_bytes();
+    body.extend_from_slice(&pack);
+
+    let mut sock = std::net::TcpStream::connect(s.addr).unwrap();
+    write!(
+        sock,
+        "POST /siteadmin/cancel-push.git/git-receive-pack HTTP/1.1\r\nHost: x\r\nAuthorization: {auth}\r\nContent-Type: application/x-git-receive-pack-request\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .unwrap();
+    sock.write_all(&body[..body.len() / 2]).unwrap();
+    let repo_dir = s.dir.join("repos").join("1.git");
+    // The receive-pack is running and writing the pushed objects into its quarantine.
+    wait_for("the push to be receiving into its quarantine", || {
+        s.app.life.registry.live() == 1 && quarantined(&repo_dir)
+    });
+    // The client goes away mid-pack: the server cancels the transport (on the broken body, or
+    // at the idle timeout).
+    drop(sock);
+    wait_for("the transport to unregister", || {
+        s.app.life.registry.live() == 0
+    });
+    let tip = c.ok(&work, Some(&auth), &["ls-remote", &url, "refs/heads/main"]);
+    assert!(
+        tip.starts_with(&old),
+        "the cancelled push moved main: {tip}"
+    );
+    // git takes its ref locks only after the whole pack has arrived (see the next test).
+    let left = leftovers(&repo_dir);
+    assert!(
+        left.iter().all(|p| !p.to_string_lossy().ends_with(".lock")),
+        "no lock survives the cancel: {left:?}"
+    );
+    // git does not always get to remove its quarantine before the group is killed (seen with
+    // Apple git 2.54); maintenance reclaims what is left once it is old enough to have no owner.
+    for p in &left {
+        std::fs::File::open(p)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(86_400))
+            .unwrap();
+    }
+    let conn = scl_forge::db::connect(&s.app.data_dir).unwrap();
+    let _ = scl_forge::maintenance::maintain_repo(&s.app, &conn, 1);
+    assert_eq!(leftovers(&repo_dir), Vec::<PathBuf>::new());
+}
+
+#[test]
+fn a_push_cancelled_while_holding_its_ref_lock_releases_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Srv::start();
+    let c = Client::new("cancel-lock");
+    let url = repo(&s, "cancel-lock");
+    let auth = token(&s.admin);
+    let work = seeded(&c, &url, &auth);
+    let old = c.ok(&work, None, &["rev-parse", "HEAD"]).trim().to_string();
+    put_commit(&c, &work, "b.txt", "two\n");
+    // git runs `reference-transaction prepared` with the ref locks taken: hold the push there.
+    let marker = c.dir.join("locked");
+    let hook = s.dir.join("hooks/reference-transaction");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\n/bin/cat >/dev/null\n[ \"$1\" = prepared ] || exit 0\n: > '{m}'\nwhile [ -e '{m}' ]; do /bin/sleep 0.05; done\n",
+            m = marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let push = std::thread::spawn({
+        let (dir, work, auth, url) = (c.dir.clone(), work.clone(), auth.clone(), url.clone());
+        move || {
+            Command::new("git")
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+                .env("HOME", &dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .current_dir(&work)
+                .arg("-c")
+                .arg(format!("http.extraHeader=Authorization: {auth}"))
+                .args(["push", "-q", &url, "main"])
+                .output()
+                .unwrap()
+        }
+    });
+    let lock = s.dir.join("repos/1.git/refs/heads/main.lock");
+    wait_for("the push to hold its ref lock", || {
+        marker.exists() && lock.exists()
+    });
+    // Cancel the transport the way a delete or shutdown does, keeping the repository.
+    s.app.life.registry.close(1);
+    wait_for("the transport to end", || s.app.life.registry.live() == 0);
+    s.app.life.registry.reopen(1);
+    let _ = std::fs::remove_file(&marker);
+    std::fs::remove_file(&hook).unwrap();
+    assert!(!push.join().unwrap().status.success(), "the push was cut");
+    assert!(!lock.exists(), "git released the ref lock on SIGTERM");
+    let tip = c.ok(&work, Some(&auth), &["ls-remote", &url, "refs/heads/main"]);
+    assert!(
+        tip.starts_with(&old),
+        "the cancelled push moved main: {tip}"
+    );
+}
+
+/// Ask for `want`'s full pack over a raw socket and read only the response head, so the
+/// upload-pack is mid-transfer (its output is blocked on this socket) until the rest is read.
+fn slow_fetch(
+    addr: std::net::SocketAddr,
+    auth: &str,
+    repo: &str,
+    want: &str,
+) -> std::net::TcpStream {
+    use std::io::{BufRead, Write};
+    let body = format!("0032want {want}\n00000009done\n");
+    let mut sock = std::net::TcpStream::connect(addr).unwrap();
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .unwrap();
+    write!(
+        sock,
+        "POST /siteadmin/{repo}.git/git-upload-pack HTTP/1.1\r\nHost: x\r\nConnection: close\r\nAuthorization: {auth}\r\nContent-Type: application/x-git-upload-pack-request\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut r = std::io::BufReader::new(sock.try_clone().unwrap());
+    let mut line = String::new();
+    r.read_line(&mut line).unwrap();
+    assert!(line.starts_with("HTTP/1.1 200"), "{line}");
+    sock
+}
+
+/// Read the rest of a chunked response; `true` when it ended with the terminating chunk.
+fn ends_cleanly(mut sock: std::net::TcpStream) -> (bool, usize) {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    match sock.read_to_end(&mut buf) {
+        Ok(_) => {}
+        // A cut connection may end in a reset; a timeout means the server left it hanging.
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("the response neither ended nor broke: {e}"),
+    }
+    (buf.ends_with(b"\r\n0\r\n\r\n"), buf.len())
+}
+
+#[test]
+fn deleting_a_repository_during_a_clone_fails_the_clone() {
+    let s = Srv::start();
+    let c = Client::new("delete-clone");
+    let url = repo(&s, "delete-clone");
+    let auth = token(&s.admin);
+    let work = seeded(&c, &url, &auth);
+    std::fs::write(work.join("big.bin"), noise(20 << 20)).unwrap();
+    c.ok(&work, None, &["add", "."]);
+    c.ok(&work, None, &["commit", "-q", "-m", "big"]);
+    c.ok(&work, Some(&auth), &["push", "-q", &url, "main"]);
+    let want = c.ok(&work, None, &["rev-parse", "HEAD"]).trim().to_string();
+    // Control: read at once, the same request ends with the terminating chunk.
+    let (clean, whole) = ends_cleanly(slow_fetch(s.addr, &auth, "delete-clone", &want));
+    assert!(clean && whole > 20 << 20, "{whole} bytes");
+
+    let held = slow_fetch(s.addr, &auth, "delete-clone", &want);
+    wait_for("the upload-pack to be registered", || {
+        s.app.life.registry.live() == 1
+    });
+    let deleted = s.send(
+        "DELETE",
+        "/api/v1/repos/siteadmin/delete-clone",
+        Some(&auth),
+        None,
+    );
+    assert_eq!(deleted.status, 204, "{}", deleted.msg());
+    // The delete cancelled the transfer: the response stops without its terminating chunk, so
+    // the client sees an error, not a clean (but truncated) pack.
+    let (clean, got) = ends_cleanly(held);
+    assert!(
+        !clean && got < whole,
+        "{got} of {whole} bytes, clean: {clean}"
+    );
+}
+
 #[test]
 fn a_push_over_the_size_cap_fails_and_changes_nothing() {
     let s = Srv::start_transport(scl_forge::cgi::Cfg {
