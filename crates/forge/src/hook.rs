@@ -199,7 +199,8 @@ fn retain_deleted_heads(
 
 /// Test-only knob (`SC_FORGE_HOOK_HOLD` on the server): create `marker` once the row has been
 /// read, then wait (at most 30 s) until the test removes it, so a test can act between this
-/// push's read of the default branch and its ref update.
+/// push's read of the default branch and its ref update. Debug builds only.
+#[cfg(debug_assertions)]
 fn hold(marker: &Path) {
     if std::fs::write(marker, b"").is_err() {
         return;
@@ -237,6 +238,7 @@ pub fn run() -> i32 {
             return 1;
         }
     };
+    #[cfg(debug_assertions)]
     if let Some(p) = std::env::var_os("FORGE_TEST_HOOK_HOLD") {
         hold(Path::new(&p));
     }

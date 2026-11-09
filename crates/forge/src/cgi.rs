@@ -503,6 +503,7 @@ fn environment(l: &Launch, marker: &std::path::Path) -> Vec<(String, String)> {
     var("FORGE_USER_ID", l.plan.user.id.to_string());
     var("FORGE_ACCEPT_MARKER", marker.display().to_string());
     // Test-only knob, read from the server's own environment: see `hook::hold`.
+    #[cfg(debug_assertions)]
     if let Some(p) = std::env::var_os("SC_FORGE_HOOK_HOLD") {
         var("FORGE_TEST_HOOK_HOLD", p.to_string_lossy().into_owned());
     }
