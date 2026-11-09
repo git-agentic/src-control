@@ -163,7 +163,12 @@ fn a_pull_floor_set_on_a_running_server_retires_the_old_numbers() {
     let w = world();
     w.commit("f1", "f1.txt", Some("main"));
     scl_forge::admin::repo_set_pull_floor(&w.s.dir, "siteadmin", "w", 41).unwrap();
-    assert_eq!(w.open("f1")["number"], 42);
+    scl_forge::admin::repo_set_pull_floor(&w.s.dir, "siteadmin", "w", 10).unwrap();
+    assert_eq!(
+        w.open("f1")["number"],
+        42,
+        "a lower floor does not reopen retired numbers"
+    );
     assert_eq!(
         w.api("GET", "/pulls/1", None).status,
         404,
