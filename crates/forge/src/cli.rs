@@ -122,6 +122,25 @@ enum AdminCmd {
         #[command(subcommand)]
         cmd: OrgCmd,
     },
+    Repo {
+        #[command(subcommand)]
+        cmd: RepoCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum RepoCmd {
+    /// Number new pull requests above FLOOR (a migrated repository's highest old number).
+    SetPullFloor {
+        #[arg(long)]
+        owner: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        floor: i64,
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -258,6 +277,18 @@ fn run_admin(cmd: AdminCmd) -> Result<()> {
         } => {
             admin::org_create(&data_dir, &name, &owner)?;
             println!("Organization '{name}' has been successfully created!");
+        }
+        AdminCmd::Repo {
+            cmd:
+                RepoCmd::SetPullFloor {
+                    owner,
+                    name,
+                    floor,
+                    data_dir,
+                },
+        } => {
+            admin::repo_set_pull_floor(&data_dir, &owner, &name, floor)?;
+            println!("Pull requests of {owner}/{name} are numbered above {floor}");
         }
     }
     Ok(())
