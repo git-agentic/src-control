@@ -287,6 +287,7 @@ mod tests {
             .writers_idle(3, Duration::ZERO)
             .expect("a fetch is not a writer");
         assert_eq!(r.if_no_writer_since(3, since, || 1), Some(1));
+        drop(fetch); // the slot empties: its writer count must survive that
         drop(r.register(3, true, || true).unwrap()); // a push starts and ends
         assert_eq!(r.if_no_writer_since(3, since, || 1), None);
         let push = r.register(3, true, || true).unwrap();
@@ -294,7 +295,7 @@ mod tests {
             r.writers_idle(3, Duration::from_millis(20)).is_none(),
             "a live push"
         );
-        drop((push, fetch));
+        drop(push);
         assert!(r.writers_idle(3, Duration::ZERO).is_some());
     }
 
