@@ -1,6 +1,6 @@
 //! #316: a default-branch change racing a push that deletes the new default. Its own test binary,
 //! because the hook hold knob is read from the process environment.
-#![cfg(unix)]
+#![cfg(all(unix, debug_assertions))] // the hook hold knob is compiled into debug builds only
 
 mod common;
 use common::*;
