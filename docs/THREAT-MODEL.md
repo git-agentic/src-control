@@ -872,7 +872,9 @@ unless said otherwise).
   (`GIT_NO_REPLACE_OBJECTS`, `core.useReplaceRefs=false`). The default branch cannot be deleted, compared by Unicode
   lower case so a case alias does not slip past (`policy::tests`; the hook binary test
   `the_hook_binary_fails_closed`). Known gap: NFC/NFD-equivalent spellings of a non-ASCII default branch are not
-  folded (a macOS-filesystem quirk; marked `shortcut:` in `policy.rs`).
+  folded (a macOS-filesystem quirk; marked `shortcut:` in `policy.rs`). A push in flight read the default branch when it
+  started, so `PATCH default_branch` commits only while no push has registered on the repository since it checked the
+  branch, else 503 (`a_push_in_flight_keeps_the_default_branch_off_a_branch_it_deletes`, #316).
 - **Hook integrity.** `core.hooksPath` is pinned on every spawn to `<data>/hooks`, whose `pre-receive` is a symlink to
   the `sc-forge` binary, re-pointed at every start; repositories are created with `--template=` and carry no hooks of
   their own. The hook reads the database through a read-only opener (no create, `query_only`, schema version checked),

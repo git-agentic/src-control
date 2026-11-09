@@ -15,7 +15,8 @@
 //! shared lifecycle lock, each taken once. Nothing beneath that boundary may take the lifecycle lock
 //! again (no `with_read` helper): the lock is writer-preferring, so a queued delete between two
 //! shared acquisitions by one request deadlocks it. Never take the gate while holding the lifecycle
-//! lock.
+//! lock. The transport registry's mutex is innermost: never take the lifecycle lock or the gate
+//! under it (`Registry::if_no_writer_since`, `with_only`).
 
 use crate::gitproc::{Git, GitError, Identity, Spec};
 use crate::refname;
@@ -27,6 +28,9 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+
+/// How long a default-branch change waits for the repository's pushes to finish.
+const PUSH_WAIT: Duration = Duration::from_secs(10);
 
 /// Exclusive hold on the data directory for the life of the process.
 pub struct DirLock(#[allow(dead_code)] File);
@@ -75,6 +79,9 @@ pub enum LifecycleError {
     /// A branch protection rule forbids the operation.
     #[error("{0}")]
     Protected(String),
+    /// A push or maintenance pass is writing the repository; the caller may retry.
+    #[error("busy")]
+    Busy,
     /// A concurrent change kept winning; the caller may retry.
     #[error("{0}")]
     Conflict(String),
@@ -118,6 +125,9 @@ pub struct Lifecycle {
     gates: Mutex<HashMap<i64, Arc<crate::limits::Gate>>>,
     #[cfg(test)]
     crash_at: Mutex<Option<&'static str>>,
+    /// Tests: a push registers (and leaves) right after `set_default_branch` wrote `HEAD`.
+    #[cfg(test)]
+    push_after_head: std::sync::atomic::AtomicBool,
 }
 
 impl Lifecycle {
@@ -140,6 +150,8 @@ impl Lifecycle {
             gates: Mutex::default(),
             #[cfg(test)]
             crash_at: Mutex::default(),
+            #[cfg(test)]
+            push_after_head: Default::default(),
         })
     }
 
@@ -486,6 +498,11 @@ impl Lifecycle {
     }
 
     /// Make `branch` the default: it must exist; bare `HEAD` is written first, then the row.
+    ///
+    /// The `pre-receive` hook reads the default branch when a push starts, so a push already in
+    /// flight could delete the new default after it is set. The row is therefore committed only if
+    /// no push (or maintenance pass) has registered since the branch was checked; otherwise `HEAD`
+    /// is put back and the answer is `Busy`. A push that registers later reads the new row.
     pub fn set_default_branch(
         &self,
         conn: &Connection,
@@ -493,6 +510,17 @@ impl Lifecycle {
         branch: &str,
         now: i64,
     ) -> Result<(), LifecycleError> {
+        // Naming the current default changes nothing, so it need not wait for pushes (clients that
+        // send the whole repository object on every edit do this). A concurrent PATCH may have
+        // moved it since; this one is then ordered before that one.
+        if repos::find_by_id(conn, repo.id)?.is_some_and(|r| r.default_branch == branch) {
+            return Ok(());
+        }
+        // Before the lock: waiting for a push must not hold up the repository's readers.
+        let since = self
+            .registry
+            .writers_idle(repo.id, PUSH_WAIT)
+            .ok_or(LifecycleError::Busy)?;
         let lock = self.lock_for(repo.id);
         let _held = lock.write().unwrap_or_else(|e| e.into_inner());
         let current = repos::find_by_id(conn, repo.id)?
@@ -508,14 +536,31 @@ impl Lifecycle {
         }
         self.run(&dir, &["symbolic-ref", "HEAD", &full], None, None)?;
         self.step("head-written")?;
+        #[cfg(test)]
+        if self
+            .push_after_head
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            drop(self.registry.register(current.id, true, || true));
+        }
         let patch = RepoPatch {
             default_branch: Some(branch.to_string()),
             ..Default::default()
         };
-        if !repos::update_live(conn, current.id, &patch, now)? {
-            return Err(LifecycleError::Gone);
-        }
-        Ok(())
+        let committed = self.registry.if_no_writer_since(current.id, since, || {
+            repos::update_live(conn, current.id, &patch, now)
+        });
+        let failed = match committed {
+            Some(Ok(true)) => return Ok(()),
+            Some(Ok(false)) => return Err(LifecycleError::Gone),
+            Some(Err(e)) => e.into(),
+            None => LifecycleError::Busy,
+        };
+        // The row still names the old default: put `HEAD` back. A failed restore is what the
+        // reconciler's HEAD repair fixes, as after a crash at `head-written`.
+        let old = refname::branch_ref(&current.default_branch);
+        self.run(&dir, &["symbolic-ref", "HEAD", &old], None, None)?;
+        Err(failed)
     }
 
     /// Delete a branch (the caller has refused the default branch). `NoSuchBranch` when absent;
@@ -1046,6 +1091,32 @@ mod tests {
             "the repository survives in orphans/"
         );
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn a_push_that_registers_during_the_change_puts_head_back_and_answers_busy() {
+        let e = env("default-race");
+        let r = make(&e, "alpha", true).unwrap();
+        let dir = e.lc.repo_dir(r.id);
+        let main = rev(&e, &r, "main").unwrap();
+        e.lc.run(&dir, &["update-ref", "refs/heads/dev", &main], None, None)
+            .unwrap();
+        e.lc.push_after_head
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            e.lc.set_default_branch(&e.conn, &r, "dev", 20),
+            Err(LifecycleError::Busy)
+        ));
+        assert_eq!(head(&e, &r), "refs/heads/main");
+        let row = repos::find_by_id(&e.conn, r.id).unwrap().unwrap();
+        assert_eq!(row.default_branch, "main");
+        e.lc.push_after_head
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        e.lc.set_default_branch(&e.conn, &r, "dev", 21).unwrap();
+        assert_eq!(head(&e, &r), "refs/heads/dev");
+        // A live push makes a real change wait, but not one that names the current default.
+        let _push = e.lc.registry.register(r.id, true, || true).unwrap();
+        e.lc.set_default_branch(&e.conn, &r, "dev", 22).unwrap();
     }
 
     #[test]
