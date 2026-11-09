@@ -947,6 +947,41 @@ fn a_push_over_the_size_cap_fails_and_changes_nothing() {
     wait_for("cleanup", || s.app.life.registry.live() == 0);
 }
 
+/// `--git-memory-limit` is `RLIMIT_DATA`, which only Linux enforces usefully.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_git_memory_limit_stops_a_push_whose_object_needs_more() {
+    // 128 MiB of zeros: a tiny pack, but git inflates the blob in memory to hash it (it is
+    // under core.bigFileThreshold), so the receiving git needs well over 64 MiB.
+    let push_big = |s: &Srv, tag: &str| {
+        let c = Client::new(tag);
+        let url = repo(s, "smart");
+        let auth = token(&s.admin);
+        let work = seeded(&c, &url, &auth); // a small push works under the limit
+        std::fs::write(work.join("zeros.bin"), vec![0u8; 128 << 20]).unwrap();
+        c.ok(&work, None, &["add", "."]);
+        c.ok(&work, None, &["commit", "-q", "-m", "zeros"]);
+        let (ok, text) = c.git_in(&work, Some(&auth), &["push", "-q", &url, "main"]);
+        let tip = c.ok(&work, Some(&auth), &["ls-remote", &url, "refs/heads/main"]);
+        let parent = c.ok(&work, None, &["rev-parse", "HEAD~1"]);
+        wait_for("cleanup", || s.app.life.registry.live() == 0);
+        (ok, text, tip.starts_with(parent.trim()))
+    };
+    let limited = Srv::start_transport(scl_forge::cgi::Cfg {
+        git_memory: 64 << 20,
+        ..Default::default()
+    });
+    let (ok, text, unchanged) = push_big(&limited, "memlimit");
+    assert!(!ok && unchanged, "the limit must stop the push: {text}");
+    assert!(
+        text.contains("Out of memory"),
+        "stopped by the limit: {text}"
+    );
+    // Control: the same push under the default limit lands.
+    let (ok, text, unchanged) = push_big(&Srv::start(), "memlimit-control");
+    assert!(ok && !unchanged, "{text}");
+}
+
 #[test]
 fn a_full_disk_reserve_refuses_pushes_with_507_but_not_reads() {
     let s = Srv::start_transport(scl_forge::cgi::Cfg {
