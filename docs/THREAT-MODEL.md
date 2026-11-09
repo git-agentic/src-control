@@ -919,8 +919,11 @@ unless said otherwise).
   limit would also throttle Engine, whose clones come from one service account, so it needs a deliberate budget).
   A push's growth check credits its own written bytes back, but other pushes in flight are still counted twice (free space has dropped and they still hold the bytes), so it
   errs on the side of refusing. A killed push gets SIGTERM first (git removes its lock files and quarantine directory
-  from its signal handlers; we wait up to one second for the leader to exit and stderr to close, not tested) and then SIGKILL; a server killed outright can still leave a stale
-  `refs/heads/<x>.lock` or `objects/incoming-*` behind (cleanup is F5).
+  from its signal handlers; we wait up to one second for the leader to exit and stderr to close) and then SIGKILL. A push
+  cancelled mid-pack leaves no ref lock and moves no ref, but its `objects/tmp_objdir-incoming-*` quarantine can survive
+  (seen with Apple git 2.54); maintenance removes it once it is old enough to have no owner, as it does for a server
+  killed outright (`a_cancelled_push_leaves_no_ref_lock_or_quarantine`). A client that leaves mid-body is sometimes
+  noticed only at `--git-idle-timeout` (the body read can miss the EOF, about 1 run in 8 locally, #316).
 - **Process control.** One supervisor thread owns each child and its process group and signals the group while the
   leader is still an unreaped zombie (so a reused group id cannot be hit); the registry holds a cancel flag, never a
   group id. A client that hangs up ends the child (`a_large_push_and_clone_stream_and_a_vanished_client_ends_the_child`);
@@ -1158,8 +1161,11 @@ why each deletion is safe:
   line, so a supervisor that stops the service as soon as it is up still gets the drain. A stalled request does not hold the exit past
   the deadline plus up to ten seconds for the cancelled git processes to be reaped and the runtime's two-second teardown. Log
   writes cannot hold it either: they go through a bounded queue and a writer thread, and a stderr nobody reads costs dropped lines,
-  not a frozen server (a test fills a pipe with 6400 requests). Not covered by a test: a git transfer in flight across SIGTERM
-  (the order `drop(listener)`, stop signal, drain, `cancel_all` is source-reviewed).
+  not a frozen server (a test fills a pipe with 6400 requests). A git transfer in flight across SIGTERM finishes if it ends
+  within the drain (`sigterm_lets_a_clone_in_flight_finish_within_the_drain`); one still running at the deadline is cut
+  without its terminating chunk, so the client sees an error, and no git process group outlives the server
+  (`sigterm_cancels_a_clone_still_running_at_the_drain_deadline`). A repository delete cuts a clone the same way
+  (`deleting_a_repository_during_a_clone_fails_the_clone`).
 - **Bind gate.** Process tests pin it: `0.0.0.0`, `[::]`, a private address and a v4-mapped loopback are refused without
   `--behind-proxy` or `--allow-plaintext`; loopback needs no flag. Fail-closed on an address it cannot classify.
 - **Image.** Base images pinned by digest; trixie git (2.47) because the server needs 2.40 and bookworm has 2.39; runs as uid 10001; no

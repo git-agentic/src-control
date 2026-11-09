@@ -240,42 +240,41 @@ fn a_stalled_request_does_not_hold_the_shutdown_past_its_deadline() {
     drop(s);
 }
 
-#[test]
-fn sigterm_during_a_clone_drains_or_cancels_cleanly() {
-    let root = tmp("clone-sigterm");
-    let token = bootstrap(&root.0);
-    let mut p = Proc::start(&root.0, &["--shutdown-timeout", "2"]);
+/// A repository holding `len` bytes of incompressible content, pushed with a scrubbed git; returns
+/// the tip commit.
+fn big_repo(p: &Proc, root: &Path, token: &str, name: &str, len: usize) -> String {
     let created = p
         .send(
             "POST",
             "/api/v1/user/repos",
-            Some(&token),
-            Some(&serde_json::json!({"name":"clone-shutdown","auto_init":true})),
+            Some(token),
+            Some(&serde_json::json!({"name": name, "default_branch": "main"})),
         )
         .unwrap();
     assert_eq!(created.0, 201, "{}", created.1);
-    let url = format!("http://127.0.0.1:{}/siteadmin/clone-shutdown.git", p.port);
-    // Add a large incompressible blob through a real Git client.
-    let work = root.0.join("work");
-    let run = |args: &[&str], cwd: &Path| {
-        Command::new("git")
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .env_clear()
             .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
-            .env("HOME", &root.0)
+            .env("HOME", root)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_AUTHOR_NAME", "T")
             .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
             .env("GIT_COMMITTER_NAME", "T")
             .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
-            .current_dir(cwd)
+            .current_dir(&work)
             .args(args)
             .output()
-            .unwrap()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
-    std::fs::create_dir(&work).unwrap();
-    assert!(run(&["init", "-q", "-b", "main"], &work).status.success());
+    git(&["init", "-q", "-b", "main"]);
     let mut x: u64 = 0x2545_F491_4F6C_DD1D;
-    let bytes: Vec<u8> = (0..(20 << 20))
+    let bytes: Vec<u8> = (0..len)
         .map(|_| {
             x ^= x << 13;
             x ^= x >> 7;
@@ -283,48 +282,97 @@ fn sigterm_during_a_clone_drains_or_cancels_cleanly() {
             (x >> 24) as u8
         })
         .collect();
-    std::fs::write(work.join("large.bin"), bytes).unwrap();
-    for args in [&["add", "."][..], &["commit", "-q", "-m", "large"][..]] {
-        assert!(run(args, &work).status.success());
-    }
-    let remote_auth = format!("-chttp.extraHeader=Authorization: token {token}");
-    assert!(run(&[&remote_auth, "push", &url, "main"], &work)
-        .status
-        .success());
-    let clone = root.0.join("clone");
-    let client = Command::new("git")
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
-        .env("HOME", &root.0)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .arg(&remote_auth)
-        .args(["clone", "-q", &url, clone.to_str().unwrap()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+    std::fs::write(work.join("big.bin"), bytes).unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "big"]);
+    let url = format!("http://127.0.0.1:{}/siteadmin/{name}.git", p.port);
+    let auth = format!("http.extraHeader=Authorization: token {token}");
+    git(&["-c", &auth, "push", "-q", &url, "main"]);
+    git(&["rev-parse", "HEAD"])
+}
+
+/// Ask for `want`'s whole pack and read only the response head: the upload-pack is then
+/// mid-transfer, blocked on this socket, until the rest is read.
+fn held_fetch(p: &Proc, token: &str, name: &str, want: &str) -> TcpStream {
+    let body = format!("0032want {want}\n00000009done\n");
+    let mut s = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    write!(
+        s,
+        "POST /siteadmin/{name}.git/git-upload-pack HTTP/1.1\r\nHost: x\r\nConnection: close\r\nAuthorization: token {token}\r\nContent-Type: application/x-git-upload-pack-request\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut head = [0u8; 12];
+    s.read_exact(&mut head).unwrap();
+    assert_eq!(&head, b"HTTP/1.1 200", "the transfer started");
+    s
+}
+
+/// The process groups of the server's children (each git transport leads its own group).
+fn child_groups(server: u32) -> Vec<String> {
+    let out = Command::new("pgrep")
+        .args(["-P", &server.to_string()])
+        .output()
         .unwrap();
-    // Give the server a bounded chance to accept the transfer before shutdown.
-    let connected = (0..100).any(|_| TcpStream::connect(("127.0.0.1", p.port)).is_ok());
-    assert!(
-        connected,
-        "server stopped accepting before the clone started"
-    );
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+fn group_alive(pgid: &str) -> bool {
+    Command::new("pgrep")
+        .args(["-g", pgid])
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+/// `(ended with the terminating chunk, bytes)` for the rest of a held response.
+fn rest_of(mut s: TcpStream) -> (bool, usize) {
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf);
+    (buf.ends_with(b"\r\n0\r\n\r\n"), buf.len())
+}
+
+#[test]
+fn sigterm_lets_a_clone_in_flight_finish_within_the_drain() {
+    let root = tmp("clone-drain");
+    let token = bootstrap(&root.0);
+    let mut p = Proc::start(&root.0, &["--shutdown-timeout", "30"]);
+    let want = big_repo(&p, &root.0, &token, "drained", 16 << 20);
+    let held = held_fetch(&p, &token, "drained", &want);
     p.sigterm();
-    let status = p
-        .wait(Duration::from_secs(8))
-        .expect("server exits by timeout plus margin");
-    assert!(status.success(), "{status:?}");
-    let mut client = client;
-    let end = Instant::now() + Duration::from_secs(8);
-    let status = loop {
-        if let Some(status) = client.try_wait().unwrap() {
-            break status;
-        }
-        assert!(Instant::now() < end, "clone hung after server shutdown");
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let _ = status;
+    std::thread::sleep(Duration::from_millis(300)); // the drain has begun
+    let (clean, got) = rest_of(held);
+    assert!(clean && got > 16 << 20, "{got} bytes, clean: {clean}");
+    let st = p.wait(Duration::from_secs(20)).expect("exits after it");
+    assert!(st.success(), "{st:?}");
+}
+
+#[test]
+fn sigterm_cancels_a_clone_still_running_at_the_drain_deadline() {
+    let root = tmp("clone-cancel");
+    let token = bootstrap(&root.0);
+    let mut p = Proc::start(&root.0, &["--shutdown-timeout", "2"]);
+    let want = big_repo(&p, &root.0, &token, "cancelled", 16 << 20);
+    let held = held_fetch(&p, &token, "cancelled", &want);
+    let groups = child_groups(p.child.id());
+    assert!(!groups.is_empty(), "the transfer's git is running");
+    let t0 = Instant::now();
+    p.sigterm();
+    let st = p.wait(Duration::from_secs(15)).expect("exits");
+    assert!(st.success(), "{st:?}");
+    assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+    // Read only now: the transfer was cut, so the response has no terminating chunk (a client
+    // sees an error, not a clean but truncated pack), and no git outlives the server.
+    let (clean, got) = rest_of(held);
+    assert!(!clean, "{got} bytes ended cleanly");
+    for g in &groups {
+        assert!(!group_alive(g), "git process group {g} survived the server");
+    }
 }
 
 fn serve_with(tag: &str, listen: &str, extra: &[&str]) -> (Child, Tmp) {
