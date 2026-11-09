@@ -17,7 +17,7 @@ blake3 = "1.8.5"
 hex = "0.4.3"
 thiserror = "2.0.18"
 ed25519-dalek = "3.0.0"
-argon2 = "0.5"
+argon2 = "0.6"
 
 [dev-dependencies]
 rand_chacha = "0.3"
