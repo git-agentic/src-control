@@ -5,7 +5,7 @@
 
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use scl_core::ObjectId;
 
@@ -668,17 +668,20 @@ impl Transport for HttpTransport {
     }
 }
 
-/// Bound on how long an accepted connection may take to send its HTTP
-/// opening (request line + headers + blank line) before the server gives up
-/// on it. Guards the slow-loris case the Task 2 review flagged:
-/// `read_client_opening` bounds the opening in BYTES (`MAX_OPENING_BYTES`)
-/// but not in TIME, so a peer that trickles in under the byte cap and then
-/// stalls would otherwise hold a server thread (and its socket) forever.
-/// Applied only around the opening read — the opening timeout is REPLACED
-/// (not cleared) by `limits.timeout_secs`'s session read+write timeouts
-/// after the 200 status is written, before handing off to `wire::serve` —
-/// see `handle_http_connection` for the timeout sequencing.
-const OPENING_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// One overall bound on how long an accepted connection may take from accept
+/// to a complete HTTP opening (the TLS handshake, when there is one, plus the
+/// request line, headers and blank line) before the server gives up on it.
+/// Guards the slow-loris case: `read_client_opening` bounds the opening in
+/// BYTES (`MAX_OPENING_BYTES`) but a per-read socket timeout does not bound
+/// it in TIME, since a peer sending one byte just inside each timeout would
+/// hold a connection slot (8 KiB at 29 s a byte is about 66 hours) before any
+/// token check. So the budget is a deadline fixed at accept: every socket read
+/// first narrows the socket timeout to what is left, and the connection fails
+/// as timed out when none is. The deadline is REPLACED (not cleared) by
+/// `limits.timeout_secs`'s session read+write timeouts after the 200 status is
+/// written, before handing off to `wire::serve` — see `handle_http_connection`
+/// for the sequencing.
+const OPENING_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long the client allows the connect, TLS handshake, opening and wire
 /// handshake to take before giving up on a silent or stalled peer. Matches the
@@ -1174,6 +1177,7 @@ pub fn serve_http_listener(
                 limits,
                 tls.as_ref(),
                 store.as_deref(),
+                OPENING_TIMEOUT,
             ) {
                 eprintln!("sc serve --http: connection error: {e}");
             }
@@ -1199,8 +1203,9 @@ pub fn serve_http_listener(
 /// Handle one accepted connection end to end: bounded-time opening read →
 /// validate `root` is a repo → status line → `wire::serve`.
 ///
-/// The read timeout is set BEFORE `read_client_opening` (closing the
-/// slow-loris gap: the opening is bounded in bytes but not time) and
+/// One deadline, [`OPENING_TIMEOUT`] from accept, bounds the TLS handshake and
+/// `read_client_opening` together (closing the slow-loris gap: the opening is
+/// bounded in bytes but a per-read timeout would not bound it in time). It is
 /// REPLACED (P31, not simply cleared) by `limits.timeout_secs`'s session
 /// timeout — on both the read and write sides — AFTER the 200 status is
 /// written and BEFORE handing off to `wire::serve`: a legitimate large pack
@@ -1212,7 +1217,8 @@ pub fn serve_http_listener(
 /// `wire::serve` are all generic over Read/Write, so one enum layer at the
 /// seam keeps plaintext and TLS on the identical code path after wrap.
 enum SrvRead {
-    Plain(TcpStream),
+    /// The socket, and the opening deadline while one applies.
+    Plain(TcpStream, Option<Instant>),
     Tls(scl_tlsio::TlsServerReadHalf),
 }
 enum SrvWrite {
@@ -1222,7 +1228,16 @@ enum SrvWrite {
 impl Read for SrvRead {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
-            SrvRead::Plain(s) => s.read(buf),
+            SrvRead::Plain(s, deadline) => {
+                if let Some(at) = *deadline {
+                    let left = at.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(std::io::ErrorKind::TimedOut.into());
+                    }
+                    s.set_read_timeout(Some(left))?;
+                }
+                s.read(buf)
+            }
             SrvRead::Tls(r) => r.read(buf),
         }
     }
@@ -1242,13 +1257,14 @@ impl Write for SrvWrite {
     }
 }
 impl SrvRead {
-    /// P31 session timeouts, below TLS when wrapped. SO_RCVTIMEO/SO_SNDTIMEO
-    /// live on the socket (shared across `try_clone` fds), so setting them
-    /// through either half governs the whole connection — the same fact the
-    /// plaintext path has relied on since P31.
-    fn set_session_timeouts(&self, d: Option<Duration>) -> std::io::Result<()> {
+    /// P31 session timeouts, below TLS when wrapped; they replace the opening
+    /// deadline. SO_RCVTIMEO/SO_SNDTIMEO live on the socket (shared across
+    /// `try_clone` fds), so setting them through either half governs the whole
+    /// connection — the same fact the plaintext path has relied on since P31.
+    fn set_session_timeouts(&mut self, d: Option<Duration>) -> std::io::Result<()> {
         match self {
-            SrvRead::Plain(s) => {
+            SrvRead::Plain(s, deadline) => {
+                *deadline = None;
                 s.set_read_timeout(d)?;
                 s.set_write_timeout(d)
             }
@@ -1257,6 +1273,7 @@ impl SrvRead {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_http_connection(
     stream: TcpStream,
     root: &std::path::Path,
@@ -1265,20 +1282,21 @@ fn handle_http_connection(
     limits: ServeLimits,
     tls: Option<&scl_tlsio::TlsServerConfig>,
     store: Option<&str>,
+    opening_timeout: Duration,
 ) -> Result<()> {
-    stream
-        .set_read_timeout(Some(OPENING_READ_TIMEOUT))
-        .map_err(|e| Error::ConnectionLost(format!("sc+http set_read_timeout: {e}")))?;
-
+    let deadline = Instant::now() + opening_timeout;
     let (mut reader, mut writer) = match tls {
         None => {
             let r = stream
                 .try_clone()
                 .map_err(|e| Error::ConnectionLost(format!("sc+http socket clone: {e}")))?;
-            (BufReader::new(SrvRead::Plain(r)), SrvWrite::Plain(stream))
+            (
+                BufReader::new(SrvRead::Plain(r, Some(deadline))),
+                SrvWrite::Plain(stream),
+            )
         }
         Some(cfg) => {
-            let t = scl_tlsio::server_stream(cfg, stream)?;
+            let t = scl_tlsio::server_stream(cfg, stream, Some(deadline))?;
             let (r, w) = t.split();
             (BufReader::new(SrvRead::Tls(r)), SrvWrite::Tls(w))
         }
@@ -1377,7 +1395,7 @@ fn handle_http_connection(
         Some(Duration::from_secs(limits.timeout_secs))
     };
     reader
-        .get_ref()
+        .get_mut()
         .set_session_timeouts(session)
         .map_err(|e| Error::ConnectionLost(format!("sc+http set session timeouts: {e}")))?;
 
@@ -2673,6 +2691,48 @@ mod tests {
             let _ = serve_http_listener(listener, &root, false, false, limits, None, None);
         });
         addr
+    }
+
+    /// A peer sending one byte of a never-ending header well inside any
+    /// per-read timeout still loses the connection at the opening deadline,
+    /// before any token check.
+    #[test]
+    fn a_trickled_opening_fails_at_the_overall_deadline() {
+        let root = tmp_served_root("trickle");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let deadline = Duration::from_millis(600);
+        let served = root.clone();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let t0 = Instant::now();
+            let r = handle_http_connection(
+                stream,
+                &served,
+                false,
+                false,
+                ServeLimits::default(),
+                None,
+                None,
+                deadline,
+            );
+            (r, t0.elapsed())
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.write_all(b"POST / HTTP/1.1\r\n").unwrap();
+        while !server.is_finished() {
+            if c.write_all(b"X").is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let (r, took) = server.join().unwrap();
+        r.unwrap(); // a timed-out opening is answered 400 and closed, not an error
+        assert!(
+            took >= deadline && took < deadline + Duration::from_secs(2),
+            "closed after {took:?}, expected about {deadline:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn open_ok(addr: std::net::SocketAddr) -> TcpStream {

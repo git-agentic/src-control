@@ -394,7 +394,19 @@ too, not just the src-control-side metadata.
     read *and* write timeouts on the session socket for its whole lifetime — not
     just the opening's original 30s, which used to be cleared once the wire
     handoff began. A trip is connection-fatal (frame desync precludes recovery);
-    the spooled temp pack is guard-cleaned on the resulting unwind.
+    the spooled temp pack is guard-cleaned on the resulting unwind. A per-read
+    timeout does not bound a peer that sends a byte just inside it each time, and
+    before authentication that held a connection slot for hours (8 KiB of opening
+    at 29 s a byte), so 32 such peers filled the default `--max-connections`
+    before any token check. The TLS handshake and the HTTP opening now share one
+    30 s deadline fixed at accept (every socket read and write narrows the timeout
+    to the time left); the session timeout replaces it after the 200 status. Known
+    limit: on macOS one blocking `send` can wait more than once with the same
+    relative timeout, so a `--tls-cert` chain larger than the socket send buffer
+    (over about 128 KiB) sent to a peer that reads slowly can outlast the deadline;
+    the minted identity is a few KiB and is not affected. An empty
+    `ST_PACK_CHUNK` frame, which moves neither the `--max-pack-size` count nor the
+    idle timeout, is a protocol error; the sender never emits one.
   - **Accept-loop hot-spin under fd exhaustion:** a hardcoded exponential backoff
     (5ms doubling to a 1s cap, reset on the next successful accept — Go
     `net/http`'s shape) paces retries around `EMFILE`/`ENFILE` instead of
@@ -689,6 +701,12 @@ too, not just the src-control-side metadata.
   same request scope and server cost apply per fetch; `--no-blob-limit` removes
   the scope and adds no plaintext access (it is an unfiltered fetch, which also
   receives private-branch ciphertext).
+- **A filtered walk is bounded by the object count, not the path count.** A
+  chain of trees whose two entries name the same child is a few KB with `2^depth`
+  paths, and any writer can plant one with `PutObject`. The filtered reachability
+  walk (`blob:limit` and prefix `GetPack`) keys a directory by id alone once it is
+  wholly inside the filter scope, so each tree is read once; only the ancestors of
+  a filter prefix are keyed by path.
 - **Operations that need a complete closure refuse on a partial clone, fail
   closed:** `sc export`, `sc rewrap`, `sc grant`/`revoke`, private branches, and
   `sc push` to a git remote. They refuse rather than run on partial data.
