@@ -169,12 +169,15 @@ fn require_kind<S: RefObjects>(src: &mut S, id: &ObjectId, want: Kind, what: &st
 
 /// Decide whether branch `current` (its tip, `None` for a new branch) may move
 /// to `new`. `tips` is every existing ref's tip, trusted as already connected.
+/// Returns the tips the verdict actually leaned on (where the walk stopped), so
+/// the caller can confirm each is still a tip when the move is applied: a tip
+/// that was removed or rewritten meanwhile no longer vouches for its history.
 pub(crate) fn check_ref_move<S: RefObjects>(
     src: &mut S,
     tips: &BTreeSet<ObjectId>,
     current: Option<ObjectId>,
     new: ObjectId,
-) -> Result<()> {
+) -> Result<BTreeSet<ObjectId>> {
     let new_node = read(src, &new, "ref target")?;
     if !matches!(new_node, Node::Snapshot(_) | Node::Manifest(_)) {
         return refuse(format!(
@@ -194,6 +197,7 @@ pub(crate) fn check_ref_move<S: RefObjects>(
     }
     let mut boundary = tips.clone();
     boundary.extend(current);
+    let mut trusted = BTreeSet::new();
     match new_node {
         Node::Snapshot(_) => {
             if let Some(cur) = current {
@@ -201,11 +205,18 @@ pub(crate) fn check_ref_move<S: RefObjects>(
                     return Err(Error::NonFastForward);
                 }
             }
-            verify_snapshots(src, &boundary, &[new], &mut Verified::default())
+            verify_snapshots(
+                src,
+                &boundary,
+                &mut trusted,
+                &[new],
+                &mut Verified::default(),
+            )?;
         }
-        Node::Manifest(m) => verify_manifests(src, &boundary, current, new, m),
+        Node::Manifest(m) => verify_manifests(src, &boundary, &mut trusted, current, new, m)?,
         _ => unreachable!("kind checked above"),
     }
+    Ok(trusted)
 }
 
 /// Is `target` an ancestor of `from` over snapshot parents (early exit)?
@@ -226,10 +237,12 @@ fn snapshot_reaches<S: RefObjects>(src: &mut S, from: ObjectId, target: ObjectId
 }
 
 /// Connectivity of the snapshot history reachable from `starts`, stopping at
-/// `boundary`. `done` collects tree and blob ids already verified.
+/// `boundary`, which it records in `trusted` as it stops. `done` collects tree
+/// and blob ids already verified.
 fn verify_snapshots<S: RefObjects>(
     src: &mut S,
     boundary: &BTreeSet<ObjectId>,
+    trusted: &mut BTreeSet<ObjectId>,
     starts: &[ObjectId],
     done: &mut Verified,
 ) -> Result<()> {
@@ -237,6 +250,7 @@ fn verify_snapshots<S: RefObjects>(
     let mut queue: VecDeque<ObjectId> = seen.iter().copied().collect();
     while let Some(id) = queue.pop_front() {
         if boundary.contains(&id) {
+            trusted.insert(id);
             continue;
         }
         let snap = read_snapshot(src, &id, "commit")?;
@@ -340,6 +354,7 @@ fn verify_tree<S: RefObjects>(
 fn verify_manifests<S: RefObjects>(
     src: &mut S,
     boundary: &BTreeSet<ObjectId>,
+    trusted: &mut BTreeSet<ObjectId>,
     current: Option<ObjectId>,
     new: ObjectId,
     new_manifest: BranchManifest,
@@ -353,11 +368,13 @@ fn verify_manifests<S: RefObjects>(
     loop {
         if Some(id) == current {
             found = true;
+            trusted.insert(id);
             terminal = Some(m);
             break;
         }
         // A new branch needs no ancestry, so it can stop at a trusted tip.
         if current.is_none() && boundary.contains(&id) {
+            trusted.insert(id);
             terminal = Some(m);
             break;
         }
@@ -382,7 +399,7 @@ fn verify_manifests<S: RefObjects>(
         for r in &roots {
             read_snapshot(src, r, "manifest base or anchor")?;
         }
-        verify_snapshots(src, boundary, &roots, &mut done)?;
+        verify_snapshots(src, boundary, trusted, &roots, &mut done)?;
         // Every closure entry must be a sealed object: one naming a public
         // snapshot would make reachability mark it seen without walking it.
         // An entry the previous manifest already lists is inside its verified

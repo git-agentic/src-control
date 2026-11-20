@@ -889,9 +889,14 @@ impl Transport for BucketTransport {
         // never referenced — correct per spec; `compact` sweeps it later, ADR-0057).
         let pending: Vec<String> = std::mem::take(&mut *self.pending_packs.borrow_mut());
         let pending_objects = std::mem::take(&mut *self.pending_objects.borrow_mut());
-        // The ref rule's verdict for one current tip; a CAS retry that finds the
-        // same tip need not repeat the walk (objects only accumulate).
-        let mut checked_against: Option<Option<ObjectId>> = None;
+        // The ref rule's verdict for one current tip and the tips it trusted; a
+        // CAS retry that finds the same tip, with those tips still in place,
+        // need not repeat the walk (objects only accumulate). The commit itself
+        // is a CAS on the manifest the check read, so the tips it trusted are
+        // still tips when it lands, and compaction never deletes what the
+        // chain names.
+        let mut checked_against: Option<(Option<ObjectId>, std::collections::BTreeSet<ObjectId>)> =
+            None;
         for attempt in 0..MAX_CAS_RETRIES {
             if attempt > 0 {
                 std::thread::sleep(cas_backoff(attempt));
@@ -923,19 +928,22 @@ impl Transport for BucketTransport {
             // be our client (`sc serve --store`, or a direct bucket writer):
             // the shared ref rule (kind, ancestry, connectivity) runs here,
             // over this call's pending objects and the chain.
-            if checked_against != Some(current) {
-                let tips = self
-                    .view
-                    .borrow()
-                    .as_ref()
-                    .map(|v| v.refs.values().copied().collect())
-                    .unwrap_or_default();
+            let tips: std::collections::BTreeSet<ObjectId> = self
+                .view
+                .borrow()
+                .as_ref()
+                .map(|v| v.refs.values().copied().collect())
+                .unwrap_or_default();
+            let still_valid = checked_against
+                .as_ref()
+                .is_some_and(|(c, trusted)| *c == current && trusted.is_subset(&tips));
+            if !still_valid {
                 let mut objects = RefView {
                     bucket: self,
                     pending: &pending_objects,
                 };
-                crate::ref_guard::check_ref_move(&mut objects, &tips, current, *id)?;
-                checked_against = Some(current);
+                let trusted = crate::ref_guard::check_ref_move(&mut objects, &tips, current, *id)?;
+                checked_against = Some((current, trusted));
             }
             // Claim a log slot for this attempt. `put_new` on `log/<seq>` is
             // the claim: if another writer already landed that seq, we didn't

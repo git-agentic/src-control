@@ -140,6 +140,16 @@ fn refused_by_id(obj: &Object) -> bool {
     matches!(obj, Object::Sealed(_) | Object::Manifest(_))
 }
 
+/// What the unlocked half of a local `update_ref` leaned on, for the locked
+/// half to confirm (see `LocalTransport::commit_ref_move`).
+struct RefVerdict {
+    /// Every object the verdict read: each must still be on disk.
+    relied_on: std::collections::BTreeSet<ObjectId>,
+    /// Tips the walk stopped at as already connected: each must still be a
+    /// branch tip.
+    trusted_tips: std::collections::BTreeSet<ObjectId>,
+}
+
 /// Transport over a remote `.sc/` directory on the local filesystem.
 pub struct LocalTransport {
     layout: Layout,
@@ -235,11 +245,7 @@ impl LocalTransport {
     /// the verdict relied on: a cached read can outlive a gc prune, so
     /// [`LocalTransport::commit_ref_move`] confirms each is still on disk once
     /// it holds the lock, which gc also takes.
-    fn verify_ref_move(
-        &self,
-        current: Option<ObjectId>,
-        new: ObjectId,
-    ) -> Result<std::collections::BTreeSet<ObjectId>> {
+    fn verify_ref_move(&self, current: Option<ObjectId>, new: ObjectId) -> Result<RefVerdict> {
         use crate::ref_guard::{Kind, Node, RefObjects};
         struct Session<'a> {
             store: &'a mut Store,
@@ -286,8 +292,11 @@ impl LocalTransport {
             relied_on: Default::default(),
             reloaded: false,
         };
-        crate::ref_guard::check_ref_move(&mut session, &tips, current, new)?;
-        Ok(session.relied_on)
+        let trusted = crate::ref_guard::check_ref_move(&mut session, &tips, current, new)?;
+        Ok(RefVerdict {
+            relied_on: session.relied_on,
+            trusted_tips: trusted,
+        })
     }
 
     /// The locked half of `update_ref`: with the repo lock held, confirm the
@@ -298,8 +307,9 @@ impl LocalTransport {
         branch: &str,
         id: &ObjectId,
         expected_old: Option<&ObjectId>,
-        relied_on: &std::collections::BTreeSet<ObjectId>,
+        verdict: &RefVerdict,
     ) -> Result<()> {
+        let relied_on = &verdict.relied_on;
         let _lock = RepoLock::acquire(&self.layout)?;
         // Revalidate inside the lock: the checks before it ran unlocked, so the
         // ref may have moved since (two concurrent pushes).
@@ -330,6 +340,20 @@ impl LocalTransport {
         }
         if current.as_ref() != expected_old {
             return Err(Error::NonFastForward);
+        }
+        // The walk stopped at other branches' tips as already connected. If one
+        // was removed or rewritten since, gc may have pruned what it vouched for.
+        if !verdict.trusted_tips.is_empty() {
+            let heads: std::collections::BTreeSet<ObjectId> =
+                crate::refs::list_heads(&self.layout)?
+                    .into_iter()
+                    .map(|(_, t)| t)
+                    .collect();
+            if let Some(t) = verdict.trusted_tips.iter().find(|t| !heads.contains(t)) {
+                return Err(Error::InvalidArgument(format!(
+                    "ref update refused: {t} is no longer a branch tip, so its history was not vouched for; retry the push"
+                )));
+            }
         }
         // A stat per object, under the lock. A miss rescans the pack directory
         // once before it counts (a repack moves objects between files).
@@ -838,8 +862,8 @@ impl Transport for LocalTransport {
         // the repo-wide lock, from the tip the caller expects; under the lock
         // only `current == expected_old` and the objects' presence have to be
         // confirmed, which makes the verified relation the one that is applied.
-        let relied_on = self.verify_ref_move(expected_old.copied(), *id)?;
-        self.commit_ref_move(branch, id, expected_old, &relied_on)
+        let verdict = self.verify_ref_move(expected_old.copied(), *id)?;
+        self.commit_ref_move(branch, id, expected_old, &verdict)
     }
 
     /// Bounded sender (P25): builds the transfer set into a temp pack file
@@ -1136,11 +1160,14 @@ mod tests {
         let c2 = put_commit(&t, "c2", Some(c1));
         t.update_ref("main", &c1, None).unwrap();
 
-        let relied_on = t.verify_ref_move(Some(c1), c2).unwrap();
-        assert!(relied_on.contains(&c2), "the walk relied on the new tip");
+        let verdict = t.verify_ref_move(Some(c1), c2).unwrap();
+        assert!(
+            verdict.relied_on.contains(&c2),
+            "the walk relied on the new tip"
+        );
         prune_loose(&layout, &c2);
         let err = t
-            .commit_ref_move("main", &c2, Some(&c1), &relied_on)
+            .commit_ref_move("main", &c2, Some(&c1), &verdict)
             .unwrap_err();
         assert!(err.to_string().contains("no longer on disk"), "{err}");
         assert_eq!(t.list_refs().unwrap(), vec![("main".to_string(), c1)]);
@@ -1150,12 +1177,51 @@ mod tests {
         drop(t);
         let t = LocalTransport::open(&layout.root).unwrap();
         let c2 = put_commit(&t, "c2", Some(c1));
-        let relied_on = t.verify_ref_move(Some(c1), c2).unwrap();
-        t.commit_ref_move("main", &c2, Some(&c1), &relied_on)
-            .unwrap();
+        let verdict = t.verify_ref_move(Some(c1), c2).unwrap();
+        t.commit_ref_move("main", &c2, Some(&c1), &verdict).unwrap();
         assert_eq!(t.list_refs().unwrap(), vec![("main".to_string(), c2)]);
         drop(t);
         std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    /// The walk trusts other branches' tips as connected. If such a branch is
+    /// moved or removed before the lock is taken, gc could have pruned what it
+    /// vouched for, so the locked half refuses and nothing moves.
+    #[test]
+    fn a_trusted_tip_that_stops_being_a_tip_refuses_the_move() {
+        for remove in [true, false] {
+            let layout = tmp_remote(if remove { "bound-rm" } else { "bound-mv" });
+            let t = LocalTransport::open(&layout.root).unwrap();
+            let base = put_commit(&t, "base", None);
+            let ahead = put_commit(&t, "ahead", Some(base));
+            t.update_ref("base-branch", &base, None).unwrap();
+            // `feature` is created from the commit `base-branch` points at, so
+            // the walk stops there and leans on that branch.
+            let verdict = t.verify_ref_move(None, ahead).unwrap();
+            assert!(verdict.trusted_tips.contains(&base));
+            if remove {
+                std::fs::remove_file(layout.ref_path("base-branch")).unwrap();
+            } else {
+                t.update_ref("base-branch", &ahead, Some(&base)).unwrap();
+                // ...and the old tip is no longer a tip anywhere.
+                std::fs::write(
+                    layout.ref_path("base-branch"),
+                    format!("{}\n", put_commit(&t, "elsewhere", None).to_hex()),
+                )
+                .unwrap();
+            }
+            let err = t
+                .commit_ref_move("feature", &ahead, None, &verdict)
+                .unwrap_err();
+            assert!(err.to_string().contains("no longer a branch tip"), "{err}");
+            assert!(!t.list_refs().unwrap().iter().any(|(b, _)| b == "feature"));
+            // Judged afresh, with the branch where it is now, it lands.
+            let verdict = t.verify_ref_move(None, ahead).unwrap();
+            t.commit_ref_move("feature", &ahead, None, &verdict)
+                .unwrap();
+            drop(t);
+            std::fs::remove_dir_all(&layout.root).unwrap();
+        }
     }
 
     /// Enumerating refs while another push writes one must not trip over its
