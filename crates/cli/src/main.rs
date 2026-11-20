@@ -3006,7 +3006,7 @@ fn run_branch_list(json: bool, identity: Option<PathBuf>) -> Result<()> {
             (true, true) => " (private)".into(),
             (true, false) => " (private, no access)".into(),
         };
-        println!("{star} {name}{marker}");
+        println!("{star} {}{marker}", scl_core::sanitize_display_line(&name));
     }
     Ok(())
 }
@@ -3294,11 +3294,9 @@ fn run_secret(op: SecretOp) -> Result<()> {
             let named = resolve_names(&dir, &to)?;
             let escrows = load_escrows(&recipients_path)?;
             let pks = append_escrow(named.clone(), &escrows);
-            repo.secret_add(&name, value.as_bytes(), &pks)?;
-            // Only the keys named here are recorded as accepted (a key that is
-            // also escrow included); the escrow keys appended above count from
-            // `[escrow]` at check time.
-            repo.accept_keys(&format!("secret:{name}"), &named)?;
+            // Only the named keys are recorded as accepted, before the ref
+            // moves; the escrow keys count from `[escrow]` at check time.
+            repo.secret_add_with_escrow(&name, value.as_bytes(), &named, &escrows)?;
             println!("added secret {name} for {} recipient(s)", pks.len());
         }
         SecretOp::Grant { name, to, identity } => {
@@ -3327,7 +3325,12 @@ fn run_secret(op: SecretOp) -> Result<()> {
                 println!("{}", serde_json::Value::Array(arr));
             } else {
                 for info in infos {
-                    println!("{}  ({} recipient(s))", info.name, info.recipients);
+                    // A secret name comes from the repository.
+                    println!(
+                        "{}  ({} recipient(s))",
+                        scl_core::sanitize_display_line(&info.name),
+                        info.recipients
+                    );
                 }
             }
         }
@@ -3424,7 +3427,11 @@ fn run_policy(op: PolicyOp) -> Result<()> {
             }
             // The whole batch is checked, then written once.
             repo.accept_recipients(&scope, &resolved)?;
-            println!("accepted {} recipient(s) for {scope}", resolved.len());
+            println!(
+                "accepted {} recipient(s) for {}",
+                resolved.len(),
+                scl_core::sanitize_display_line(&scope)
+            );
             // A `path:` scope names a rule's prefix exactly. One the tip has no
             // rule for is recorded all the same (a rule may arrive by a merge),
             // but it is usually a typo. A private branch has no rule list to read.
@@ -3442,10 +3449,11 @@ fn run_policy(op: PolicyOp) -> Result<()> {
         }
         PolicyOp::Forget { scope, key } => {
             let (id, _) = parse_recipient_ref(&key)?;
+            let shown = scl_core::sanitize_display_line(&scope);
             if repo.forget_recipient(&scope, &id)? {
-                println!("forgot {id} for {scope}");
+                println!("forgot {id} for {shown}");
             } else {
-                println!("{id} was not accepted for {scope}");
+                println!("{id} was not accepted for {shown}");
             }
         }
     }
@@ -4807,7 +4815,11 @@ fn run_protect(prefix: Option<String>, to: Vec<String>, list: bool, json: bool) 
         }
         for (p, recips) in prefixes {
             let granted = recips.iter().filter(|r| r.granted).count();
-            println!("{p}  ({granted} granted)");
+            // A rule prefix comes from the repository.
+            println!(
+                "{}  ({granted} granted)",
+                scl_core::sanitize_display_line(&p)
+            );
             for r in recips {
                 let state = if r.granted { "granted" } else { "REVOKED" };
                 println!("  {}  {}@e{}", r.id.as_str(), state, r.epoch);
@@ -4839,11 +4851,9 @@ fn run_protect(prefix: Option<String>, to: Vec<String>, list: bool, json: bool) 
     let named = resolve_names(&dir, &to)?;
     let escrows = load_escrows(&recipients_path)?;
     let pks = append_escrow(named.clone(), &escrows);
-    let id = repo.protect(&prefix, &pks, None)?;
-    // Only the keys named here are recorded as accepted (a key that is also
-    // escrow included); the escrow keys appended above count from `[escrow]`
-    // at check time.
-    repo.accept_keys(&format!("path:{prefix}"), &named)?;
+    // Only the named keys are recorded as accepted, before the refs move; the
+    // escrow keys count from `[escrow]` at check time.
+    let id = repo.protect_with_escrow(&prefix, &named, &escrows, None)?;
     println!(
         "protected {prefix} for {} recipient(s): {}",
         pks.len(),

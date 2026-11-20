@@ -168,7 +168,7 @@ pub(crate) fn describe(pairs: &[Unaccepted]) -> String {
             p.command_lines()
         ));
     }
-    out.push_str("Nothing was written.");
+    out.push_str("No ref moved and no approval was recorded.");
     out
 }
 
@@ -345,9 +345,8 @@ fn write_pairs(layout: &Layout, pairs: &BTreeSet<(String, String)>) -> Result<()
         .iter()
         .map(|(s, e)| format!("{}\t{e}\n", esc(s)))
         .collect();
-    let tmp = layout.dot_sc.join("accepted-recipients.tmp");
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, layout.accepted_recipients_path())?;
+    // As durable as the ref write it precedes: fsynced, renamed, parent fsynced.
+    scl_core::fsutil::atomic_write_durable(&layout.accepted_recipients_path(), body.as_bytes())?;
     Ok(())
 }
 
@@ -365,9 +364,45 @@ fn validate_scope(scope: &str) -> Result<()> {
     }
 }
 
+/// Approvals a command is validating but has not recorded yet; dropped, they
+/// are gone. See [`Repo::stage_approvals`].
+pub(crate) struct StagedApprovals<'a>(&'a Repo);
+
+impl Drop for StagedApprovals<'_> {
+    fn drop(&mut self) {
+        self.0.staged.lock().unwrap().clear();
+    }
+}
+
 impl Repo {
+    /// The record as this repo reads it: the file, plus any approvals staged by
+    /// the running command.
     pub(crate) fn accepted(&self) -> Result<Accepted> {
-        Accepted::load(&self.layout)
+        let mut accepted = Accepted::load(&self.layout)?;
+        for (scope, key) in self.staged.lock().unwrap().iter() {
+            accepted = match scope {
+                Some(scope) => accepted.with_named(scope, std::slice::from_ref(key)),
+                None => accepted.with_escrow(std::slice::from_ref(key)),
+            };
+        }
+        Ok(accepted)
+    }
+
+    /// Count `named` as accepted for `scope`, and `escrows` as accepted
+    /// everywhere, while the returned guard lives, without writing the record.
+    /// A command that must validate a whole plan (every seal it would make)
+    /// before it records anything stages the keys it was given, validates, then
+    /// records the named ones with `accept_keys` and only then moves a ref.
+    pub(crate) fn stage_approvals(
+        &self,
+        scope: &str,
+        named: &[PublicKey],
+        escrows: &[PublicKey],
+    ) -> StagedApprovals<'_> {
+        let mut staged = self.staged.lock().unwrap();
+        staged.extend(named.iter().map(|k| (Some(scope.to_string()), k.clone())));
+        staged.extend(escrows.iter().map(|k| (None, k.clone())));
+        StagedApprovals(self)
     }
 
     /// Record recipients as accepted for `scope` (`sc policy accept`;
@@ -410,20 +445,6 @@ impl Repo {
             .map(|k| (k.recipient_id(), Some(k.clone())))
             .collect();
         self.accept_recipients(scope, &entries)
-    }
-
-    /// [`Repo::accept_keys`] for a recipient list a command assembled from what
-    /// the user named plus the configured escrow keys. An escrow key is never
-    /// recorded: it counts as accepted from the current `[escrow]` config at
-    /// check time, so removing it from there takes the acceptance with it.
-    pub(crate) fn accept_named_keys(&self, scope: &str, keys: &[PublicKey]) -> Result<()> {
-        let accepted = self.accepted()?;
-        let named: Vec<PublicKey> = keys
-            .iter()
-            .filter(|k| !accepted.escrow.contains(k.recipient_id().as_str()))
-            .cloned()
-            .collect();
-        self.accept_keys(scope, &named)
     }
 
     /// Remove every accepted pair of `scope` for this recipient (`sc policy
@@ -598,7 +619,7 @@ mod tests {
                 w.atk.to_key_string()
             )) && text.contains(&format!("sc revoke --recipient-id {atk_id} -- secret/sub/"))
                 && text.contains("(UNKNOWN)")
-                && text.contains("Nothing was written."),
+                && text.contains("No ref moved and no approval was recorded."),
             "{text}"
         );
 
@@ -844,8 +865,18 @@ mod tests {
         put(&w.v_root, "docs/y.txt", "y\n");
         let tip = w.v.head_tip().unwrap();
         let oplog = w.v.oplog().unwrap().len();
+        let record = std::fs::read(w.v.layout().accepted_recipients_path()).unwrap();
         let pairs = refused(w.v.protect("docs/", std::slice::from_ref(&me), None));
         assert_eq!(pairs[0].scope, "path:secret/sub/");
+        assert_eq!(
+            std::fs::read(w.v.layout().accepted_recipients_path()).unwrap(),
+            record,
+            "the named key was recorded although the plan was refused"
+        );
+        assert!(
+            w.v.staged.lock().unwrap().is_empty(),
+            "a staged approval outlived the command"
+        );
         assert_eq!(w.v.head_tip().unwrap(), tip, "no ref move");
         assert_eq!(w.v.oplog().unwrap().len(), oplog, "no oplog record");
         assert!(w
@@ -1057,10 +1088,20 @@ mod tests {
         let toml = format!("[escrow]\nkeys = [\"{}\"]\n", escrow.to_key_string());
         put(&root, ".sc/recipients.toml", &toml);
         put(&root, "p/x.txt", "x\n");
-        repo.protect("p/", &[me.clone(), escrow.clone()], None)
-            .unwrap();
-        repo.secret_add("S", b"v", &[me.clone(), escrow.clone()])
-            .unwrap();
+        repo.protect_with_escrow(
+            "p/",
+            std::slice::from_ref(&me),
+            std::slice::from_ref(&escrow),
+            None,
+        )
+        .unwrap();
+        repo.secret_add_with_escrow(
+            "S",
+            b"v",
+            std::slice::from_ref(&me),
+            std::slice::from_ref(&escrow),
+        )
+        .unwrap();
         repo.branch_private(
             "b",
             &sk,
@@ -1106,8 +1147,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Make `.sc` read-only so the record cannot be written (a read still works)
+    /// until the guard drops. Refs and objects live in subdirectories, which
+    /// stay writable: a ref that moved despite the failed record write would
+    /// show up as a changed tip.
+    #[cfg(unix)]
+    struct ReadOnlyDotSc(PathBuf);
+    #[cfg(unix)]
+    impl ReadOnlyDotSc {
+        fn new(dot_sc: &Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dot_sc, std::fs::Permissions::from_mode(0o555)).unwrap();
+            ReadOnlyDotSc(dot_sc.to_path_buf())
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for ReadOnlyDotSc {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
     // The local approval goes before the ref moves: when the record cannot be
     // written the revoke fails with nothing moved, and it lands once it can.
+    #[cfg(unix)]
     #[test]
     fn a_revoke_drops_the_approval_before_it_moves_the_ref() {
         let root = dir("revoke-order");
@@ -1119,26 +1183,24 @@ mod tests {
         repo.secret_add("S", b"v", &[a.clone(), b.clone()]).unwrap();
         repo.branch_private("emb", &sk, std::slice::from_ref(&b), &[])
             .unwrap();
-        let block = root.join(".sc/accepted-recipients.tmp");
-        std::fs::create_dir(&block).unwrap();
-
         let tip = repo.head_tip().unwrap();
-        assert!(repo.revoke("p/", &b.recipient_id()).is_err());
-        assert_eq!(repo.head_tip().unwrap(), tip, "path revoke moved the ref");
-        assert!(repo.secret_revoke("S", &b.recipient_id()).is_err());
-        assert_eq!(repo.head_tip().unwrap(), tip, "secret revoke moved the ref");
-        assert_eq!(repo.secret_recipients("S").unwrap().len(), 2);
         let emb = crate::refs::read_branch_tip(repo.layout(), "emb").unwrap();
-        assert!(repo
-            .branch_revoke("emb", &sk, &b.recipient_id(), std::slice::from_ref(&a))
-            .is_err());
-        assert_eq!(
-            crate::refs::read_branch_tip(repo.layout(), "emb").unwrap(),
-            emb,
-            "branch revoke moved the ref"
-        );
-
-        std::fs::remove_dir(&block).unwrap();
+        {
+            let _ro = ReadOnlyDotSc::new(&repo.layout().dot_sc);
+            assert!(repo.revoke("p/", &b.recipient_id()).is_err());
+            assert_eq!(repo.head_tip().unwrap(), tip, "path revoke moved the ref");
+            assert!(repo.secret_revoke("S", &b.recipient_id()).is_err());
+            assert_eq!(repo.head_tip().unwrap(), tip, "secret revoke moved the ref");
+            assert_eq!(repo.secret_recipients("S").unwrap().len(), 2);
+            assert!(repo
+                .branch_revoke("emb", &sk, &b.recipient_id(), std::slice::from_ref(&a))
+                .is_err());
+            assert_eq!(
+                crate::refs::read_branch_tip(repo.layout(), "emb").unwrap(),
+                emb,
+                "branch revoke moved the ref"
+            );
+        }
         repo.revoke("p/", &b.recipient_id()).unwrap();
         repo.secret_revoke("S", &b.recipient_id()).unwrap();
         assert_eq!(repo.secret_recipients("S").unwrap().len(), 1);
@@ -1148,7 +1210,60 @@ mod tests {
         let acc = repo.accepted().unwrap();
         for scope in ["path:p/", "secret:S", "branch:emb"] {
             assert_eq!(acc.unaccepted(scope, std::slice::from_ref(&b)).len(), 1);
+            assert!(acc.unaccepted(scope, std::slice::from_ref(&a)).is_empty());
         }
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // The named approvals are recorded before the ref moves, so a record write
+    // that fails leaves a `protect` or a `secret add` unlanded.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_record_write_leaves_protect_and_secret_add_unlanded() {
+        let root = dir("write-first");
+        let (_, a) = generate_keypair();
+        let (_, escrow) = generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        put(&root, "q/x.txt", "x\n");
+        // A first seal creates `.sc/local-key`, which later commands only read.
+        repo.protect("q/", std::slice::from_ref(&a), None).unwrap();
+        put(&root, "p/x.txt", "x\n");
+        let tip = repo.head_tip().unwrap();
+        let oplog = repo.oplog().unwrap().len();
+        {
+            let _ro = ReadOnlyDotSc::new(&repo.layout().dot_sc);
+            assert!(repo
+                .protect_with_escrow(
+                    "p/",
+                    std::slice::from_ref(&a),
+                    std::slice::from_ref(&escrow),
+                    None
+                )
+                .is_err());
+            assert_eq!(repo.head_tip().unwrap(), tip, "protect moved the ref");
+            assert!(repo
+                .secret_add_with_escrow(
+                    "S",
+                    b"v",
+                    std::slice::from_ref(&a),
+                    std::slice::from_ref(&escrow)
+                )
+                .is_err());
+            assert_eq!(repo.head_tip().unwrap(), tip, "secret add moved the ref");
+        }
+        assert_eq!(repo.oplog().unwrap().len(), oplog);
+        // Once the record can be written both land, with only the named key recorded.
+        repo.protect_with_escrow(
+            "p/",
+            std::slice::from_ref(&a),
+            std::slice::from_ref(&escrow),
+            None,
+        )
+        .unwrap();
+        let record = std::fs::read_to_string(repo.layout().accepted_recipients_path()).unwrap();
+        assert!(record.contains("path:p/\t"), "{record}");
+        assert!(!record.contains(&escrow.to_key_string()), "{record}");
         drop(repo);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1341,6 +1456,91 @@ mod tests {
         // A seal needs the record.
         put(&root, "p/x.txt", "changed\n");
         let err = repo.commit("me", "seal").unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err}");
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // A registry entry sealed under another name is skipped by rewrap, as
+    // `secret_rotate` refuses it: approving it by the registry name and
+    // resealing it under the sealed name would hand it the wrong approvals.
+    #[test]
+    fn rewrap_skips_a_relabeled_secret_instead_of_resealing_it() {
+        let root = dir("relabeled");
+        let (sk, pk) = generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        // `pk` is approved for the registry name only.
+        repo.accept_keys("secret:A", std::slice::from_ref(&pk))
+            .unwrap();
+        let tip = {
+            let secret = scl_crypto::seal("B", b"value-of-b", std::slice::from_ref(&pk));
+            let sid = repo
+                .vfs()
+                .store()
+                .lock()
+                .unwrap()
+                .put(Object::Secret(secret))
+                .unwrap();
+            let root_id = repo.vfs().write_tree(&[]).unwrap();
+            let mut secrets = std::collections::BTreeMap::new();
+            secrets.insert("A".to_string(), sid);
+            repo.commit_snapshot(
+                root_id,
+                vec![],
+                secrets,
+                scl_core::Protection::default(),
+                "w",
+                "plant",
+            )
+            .unwrap()
+        };
+        let before = repo.snapshot(&tip).unwrap().secrets;
+
+        let report = repo
+            .rewrap(&sk, &[], std::slice::from_ref(&pk), false)
+            .unwrap();
+        assert!(report.secrets_rewrapped.is_empty(), "{report:?}");
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+        assert_eq!(report.skipped[0].0, "secret A");
+        assert!(
+            report.skipped[0].1.contains("sealed as \"B\""),
+            "{:?}",
+            report.skipped
+        );
+        assert!(report.commit.is_none(), "nothing was resealed");
+        assert_eq!(repo.snapshot(&tip).unwrap().secrets, before);
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // The record is read when an entry actually mints a wrap: a randomized
+    // blob whose targets all have a wrap is rebuilt from the existing ones.
+    #[test]
+    fn rewrap_reads_the_record_only_for_entries_that_mint_a_wrap() {
+        let root = dir("rewrap-lazy");
+        let (sk, pk) = generate_keypair();
+        let (_, other) = generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        put(&root, "p/x.txt", "x\n");
+        repo.protect("p/", std::slice::from_ref(&pk), None).unwrap();
+        let record = repo.layout().accepted_recipients_path();
+        std::fs::remove_file(&record).unwrap();
+        std::fs::create_dir(&record).unwrap();
+
+        // Every target already has a wrap: nothing is minted, no record needed.
+        let report = repo
+            .rewrap(&sk, &[], std::slice::from_ref(&pk), false)
+            .unwrap();
+        assert_eq!(report.blobs_rewrapped, 1, "{report:?}");
+        // A fresh DEK wraps to every target, so the record is read.
+        let err = repo
+            .rewrap_with(&sk, &[], std::slice::from_ref(&pk), false, true)
+            .unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err}");
+        // So does a target with no wrap yet.
+        let err = repo
+            .rewrap(&sk, std::slice::from_ref(&other), &[pk], false)
+            .unwrap_err();
         assert!(matches!(err, Error::Io(_)), "{err}");
         drop(repo);
         let _ = std::fs::remove_dir_all(root);

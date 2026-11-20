@@ -84,12 +84,27 @@ impl Repo {
         Ok(id)
     }
 
-    /// Seal `value` to `recipients` and register it under `name`.
+    /// Seal `value` to `recipients` and register it under `name`. Every key in
+    /// `recipients` counts as named by the caller (see
+    /// [`Repo::secret_add_with_escrow`]).
     pub fn secret_add(
         &self,
         name: &str,
         value: &[u8],
         recipients: &[PublicKey],
+    ) -> Result<ObjectId> {
+        self.secret_add_with_escrow(name, value, recipients, &[])
+    }
+
+    /// [`Repo::secret_add`] with the keys the user `named` apart from the
+    /// `escrows` a command appends. Both can read the secret; only `named` is
+    /// recorded as accepted, and it is recorded before the ref moves.
+    pub fn secret_add_with_escrow(
+        &self,
+        name: &str,
+        value: &[u8],
+        named: &[PublicKey],
+        escrows: &[PublicKey],
     ) -> Result<ObjectId> {
         self.refuse_on_private("sc secret add")?;
         // P19-I1: policy ops that move the branch tip via `commit_registry`
@@ -106,11 +121,13 @@ impl Repo {
             return Err(Error::RebaseInProgress);
         }
         check_secret_name(name)?;
-        require_recipients(recipients)?;
+        let recipients = append_dedup(named.to_vec(), escrows);
+        require_recipients(&recipients)?;
         // The caller named these keys, so they are accepted for this secret
-        // (the escrow keys a command appends are not recorded).
-        self.accept_named_keys(&crate::accepted::secret_scope(name), recipients)?;
-        let secret = scl_crypto::seal(name, value, recipients);
+        // (the escrow keys a command appends are not recorded). Recorded before
+        // the ref moves, so a failed write leaves nothing landed.
+        self.accept_keys(&crate::accepted::secret_scope(name), named)?;
+        let secret = scl_crypto::seal(name, value, &recipients);
         let id = {
             let arc = self.store_arc();
             let i = arc.lock().unwrap().put(Object::Secret(secret))?;

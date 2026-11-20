@@ -47,8 +47,10 @@ is escaped (`%`, tab, newline, carriage return) because a path prefix can hold
 any byte but NUL. Local `[escrow]` keys from `.sc/recipients.toml` count as
 accepted in every scope.
 
-It is local state like `.sc/local-key`: written atomically (temp file and
-rename) by a command that holds the repo lock, never part of a snapshot, never
+It is local state like `.sc/local-key`: written atomically and durably
+(`fsutil::atomic_write_durable`: fsynced temp file, rename, fsynced directory,
+as durable as the ref write it precedes) by a command that holds the repo lock,
+never part of a snapshot, never
 in a pack, never sent by clone, fetch or push, and not read by `sc gc`. `sc ws`
 and `sc work` commit through the host repo, so they use the host's record. Its
 integrity depends on the working-tree path guard (a checkout never writes under
@@ -71,13 +73,14 @@ removes the key from the data. A scope is a rule prefix, secret name or branch
 name, so the repository controls it: every field is escaped with
 `sanitize_display_line`, and a scope with control characters gets no command
 at all, only a pointer to `sc protect --list`, `sc secret list` or
-`sc branch list`:
+`sc branch list` (which, like `sc policy accept` and `forget`, print repository
+text through the same escaping):
 
 ```
 path:secret/sub/ grants a recipient you have not accepted: 3f9a... (UNKNOWN).
   Accept: sc policy accept path:secret/sub/ --key scl-pk-... --allow-unknown
   Remove: sc revoke --recipient-id 3f9a... -- secret/sub/
-Nothing was written.
+No ref moved and no approval was recorded.
 ```
 
 Remove is `sc revoke --recipient-id <id> -- <prefix>`,
@@ -93,9 +96,9 @@ carry that copies existing wraps is never gated:
 |---|---|---|
 | `protect::encrypt_protected`, the one function that turns a rule's recipients into wraps | `path:<winning prefix>` | refuses the whole call, naming every pair |
 | callers: `snapshot_files` (commit, amend, merge/pick/rebase completion, `sc ws harvest`, `sc work`, `ws refresh`), the clean merge, `replay_commit` (cherry-pick, rebase), `branch_publish` (private-branch protected files) | | inherit it |
-| `sc protect` | `path:<prefix>` | validates the candidate rule before anything moves (even with nothing to seal), then builds the rule's snapshot and the sealing commit before either ref moves (it advanced the ref before its sealing commit), so a refusal under any rule leaves ref and oplog alone |
+| `sc protect` | `path:<prefix>` | validates the candidate rule before anything moves (even with nothing to seal), then builds the rule's snapshot and the sealing commit with the named keys staged in memory, records the approvals, and only then moves the refs (it advanced the ref before its sealing commit), so a refusal under any rule leaves refs, oplog and record alone |
 | `secret_rotate` | `secret:<NAME>` | refuses on the final recipient set |
-| `rewrap` (secrets and protected paths) | `secret:<NAME>`, `path:<prefix>` | an entry with an unaccepted key is skipped and reported, the rest is committed, the exit code is non-zero (ADR-0027 skip-and-report) |
+| `rewrap` (secrets and protected paths) | `secret:<NAME>`, `path:<prefix>` | an entry with an unaccepted key is skipped and reported, the rest is committed, the exit code is non-zero (ADR-0027 skip-and-report). A secret registered under a name other than the one it is sealed under is skipped before it is opened (the registry name would pick the approvals, the sealed name the reseal). The record is read only for an entry that mints a wrap: a secret that opens, a path re-sealed or rotated, or a target with no wrap yet; a randomized path whose every wrap is reused copies them and needs no approval |
 | `branch_revoke` | `branch:<name>` | refuses on the remaining set |
 
 A conflict stop writes plaintext and seals nothing, so it is not gated; its
@@ -106,13 +109,13 @@ completion commit is.
 Only keys the user names on the command line are accepted without asking:
 `sc protect --to`, `sc grant`, `sc secret add`, `sc secret grant`,
 `sc secret rotate --to`, `sc branch --private --to` (and the creator's own
-key) and `sc branch grant`. The library functions behind them record the keys
-they were given, minus any key in the current `[escrow]` (a command appends the
-escrow keys to the list it passes in, and those are not the user's choice); the
-CLI then records the keys the user named, so a named key that is also escrow
-survives its removal from `[escrow]`. `sc secret rotate --to` records from the
-CLI because the library cannot tell a named set from one derived from wrap
-labels. A key that comes from repository data, by any route, is never
+key) and `sc branch grant`. A command passes the keys the user named and the
+escrow keys it appends to the library separately (`protect_with_escrow`,
+`secret_add_with_escrow`, `branch_private`), and only the named keys are
+recorded, before any ref moves, so a named key that is also escrow survives its
+removal from `[escrow]` and a failed record write leaves the operation unlanded.
+`sc secret rotate --to` records from the CLI, before the rotate, because the
+library cannot tell a named set from one derived from wrap labels. A key that comes from repository data, by any route, is never
 auto-accepted. The local revoke commands remove the pair they revoke, after
 validation and before the new ref is published, so an interruption leaves a
 revoke that did not land (retry it), never a landed revoke whose approval

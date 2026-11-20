@@ -26,11 +26,28 @@ impl Repo {
     /// recipient. If nothing matches yet, the rule is still recorded for future
     /// commits. The `identity` arg is reserved for future re-encrypt symmetry
     /// (e.g. re-protecting already-committed plaintext) and is unused today.
-    /// Returns the id of the resulting commit.
+    /// Returns the id of the resulting commit. Every key in `recipients` counts
+    /// as named by the caller (see [`Repo::protect_with_escrow`]).
     pub fn protect(
         &self,
         prefix: &str,
         recipients: &[scl_crypto::PublicKey],
+        identity: Option<&scl_crypto::SecretKey>,
+    ) -> Result<ObjectId> {
+        self.protect_with_escrow(prefix, recipients, &[], identity)
+    }
+
+    /// [`Repo::protect`] with the keys the user `named` apart from the `escrows`
+    /// a command appends. Both get the rule; only `named` is recorded as
+    /// accepted (escrow counts from `[escrow]` at check time, ADR-0059). The
+    /// approvals are staged in memory while the whole plan (the rule and the
+    /// sealing commit) is validated, then recorded, then the refs move, so a
+    /// refusal leaves the record and the refs as they were.
+    pub fn protect_with_escrow(
+        &self,
+        prefix: &str,
+        named: &[scl_crypto::PublicKey],
+        escrows: &[scl_crypto::PublicKey],
         _identity: Option<&scl_crypto::SecretKey>,
     ) -> Result<ObjectId> {
         self.refuse_on_private("sc protect")?;
@@ -48,7 +65,8 @@ impl Repo {
         if crate::rebase_state::in_progress(self.layout()) {
             return Err(Error::RebaseInProgress);
         }
-        crate::secrets::require_recipients(recipients)?;
+        let recipients = crate::secrets::append_dedup(named.to_vec(), escrows);
+        crate::secrets::require_recipients(&recipients)?;
         // Load the tip's protection, add/replace the rule, and persist it as a
         // policy-only commit (same root) so `commit` below sees the new prefix.
         let (root, parents, secrets, mut protection) = match self.head_tip()? {
@@ -66,7 +84,7 @@ impl Repo {
                 // Existing rule: (re-)grant the named recipients at the next epoch.
                 // Never rebuild the rule wholesale — that would drop tombstones.
                 let epoch = rule.next_epoch();
-                for pk in recipients {
+                for pk in &recipients {
                     rule.set_standing(pk.to_bytes(), epoch, scl_core::RecipientState::Granted);
                 }
             }
@@ -94,10 +112,10 @@ impl Repo {
                 .map(|k| scl_crypto::PublicKey::from_bytes(*k))
                 .collect();
             self.accepted()?
-                .with_named(&scope, recipients)
+                .with_named(&scope, named)
+                .with_escrow(escrows)
                 .require(&scope, &granted)?;
         }
-        self.accept_named_keys(&scope, recipients)?;
         let head = crate::refs::current_branch(self.layout())?;
         let before = crate::refs::read_branch_tip(self.layout(), &head)?;
         // Build the rule's snapshot and the sealing commit on top of it before
@@ -115,20 +133,26 @@ impl Repo {
         let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
         let mut cache = self.open_protected_cache()?;
         let message = format!("encrypt under {prefix}");
-        let id = self.snapshot_files(
-            files,
-            Some(policy_id),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &self.sparse_spec()?,
-            &self.layout.root,
-            Some(&mut cache),
-            "system",
-            &message,
-        )?;
+        let id = {
+            // The keys it was given count as accepted for this one validation.
+            let _staged = self.stage_approvals(&scope, named, escrows);
+            self.snapshot_files(
+                files,
+                Some(policy_id),
+                None,
+                None,
+                None,
+                None,
+                None,
+                &self.sparse_spec()?,
+                &self.layout.root,
+                Some(&mut cache),
+                "system",
+                &message,
+            )?
+        };
+        // Validated: record the approvals, then move the refs.
+        self.accept_keys(&scope, named)?;
         crate::refs::write_branch_tip(self.layout(), &head, &policy_id)?;
         crate::oplog::record(
             self.layout(),

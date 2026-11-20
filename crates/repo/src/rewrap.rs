@@ -110,6 +110,21 @@ impl Repo {
                     }
                 }
             };
+            // The secret is sealed under its own name and the AEAD binds it. An
+            // entry registered under another name would be approved here by the
+            // registry name and resealed under the sealed one, so it is skipped
+            // (as `secret_rotate` refuses it) before anything is opened.
+            if secret.name != name {
+                skipped.push((
+                    format!("secret {name}"),
+                    format!(
+                        "registry entry points at a secret sealed as {:?}; \
+                         rotate it with --value instead",
+                        secret.name
+                    ),
+                ));
+                continue;
+            }
             // Resolve current recipient ids to pubkeys from the known pool.
             let mut targets: Vec<PublicKey> = Vec::new();
             let mut unresolvable = None;
@@ -140,6 +155,18 @@ impl Repo {
                 continue;
             }
             let targets = crate::secrets::append_dedup(targets, escrows);
+            let value = match scl_crypto::open(&secret, identity) {
+                Ok(v) => v,
+                Err(_) => {
+                    skipped.push((
+                        format!("secret {name}"),
+                        "identity cannot open this secret".into(),
+                    ));
+                    continue;
+                }
+            };
+            // A secret opens, so it gets a fresh seal: that is a wrap to every
+            // target, and the record is read now.
             if accepted.is_none() {
                 accepted = Some(self.accepted()?.with_escrow(escrows));
             }
@@ -154,16 +181,6 @@ impl Repo {
                 ));
                 continue;
             }
-            let value = match scl_crypto::open(&secret, identity) {
-                Ok(v) => v,
-                Err(_) => {
-                    skipped.push((
-                        format!("secret {name}"),
-                        "identity cannot open this secret".into(),
-                    ));
-                    continue;
-                }
-            };
             crate::secrets::require_recipients(&targets)?;
             if dry_run {
                 secrets_rewrapped.push(name);
@@ -263,21 +280,32 @@ impl Repo {
                     target_pks.push(e.clone());
                 }
             }
-            if accepted.is_none() {
-                accepted = Some(self.accepted()?.with_escrow(escrows));
-            }
-            let pending = accepted
-                .as_ref()
-                .expect("loaded above")
-                .unaccepted(&scope, &target_pks);
-            if !pending.is_empty() {
-                skipped.push((
-                    format!("path {path}"),
-                    crate::accepted::describe_inline(&pending),
-                ));
-                continue;
-            }
             let convergent = perms & scl_core::RANDOMIZED == 0;
+            // An entry mints a wrap when it is re-sealed under a fresh DEK, or
+            // when a target has no wrap yet. Reusing every existing wrap copies
+            // them and needs no approval, so the record is not read.
+            let mints_a_wrap = convergent
+                || rotate
+                || target_pks.iter().any(|pk| {
+                    !wks.iter()
+                        .any(|w| w.recipient_id == pk.recipient_id().as_str())
+                });
+            if mints_a_wrap {
+                if accepted.is_none() {
+                    accepted = Some(self.accepted()?.with_escrow(escrows));
+                }
+                let pending = accepted
+                    .as_ref()
+                    .expect("loaded above")
+                    .unaccepted(&scope, &target_pks);
+                if !pending.is_empty() {
+                    skipped.push((
+                        format!("path {path}"),
+                        crate::accepted::describe_inline(&pending),
+                    ));
+                    continue;
+                }
+            }
             if convergent || rotate {
                 // Convergent (pre-P33): eager upgrade. Randomized with
                 // `rotate`: a genuine cutover to a fresh DEK. Either way:

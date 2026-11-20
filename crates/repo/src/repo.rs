@@ -62,6 +62,9 @@ pub struct AbortReport {
 pub struct Repo {
     pub(crate) layout: Layout,
     pub(crate) vfs: VfsRepo,
+    /// Approvals the running command is validating but has not recorded
+    /// (`Repo::stage_approvals`).
+    pub(crate) staged: std::sync::Mutex<Vec<(Option<String>, scl_crypto::PublicKey)>>,
     _lock: RepoLock,
 }
 
@@ -125,6 +128,7 @@ impl Repo {
         Ok(Repo {
             layout,
             vfs: VfsRepo::new(store),
+            staged: std::sync::Mutex::new(Vec::new()),
             _lock: lock,
         })
     }

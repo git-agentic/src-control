@@ -192,7 +192,7 @@ fn a_fresh_clone_refuses_a_rule_seal_until_the_key_is_accepted() {
         "sc policy accept path:secret/ --key",
         "sc revoke --recipient-id",
         "-- secret/",
-        "Nothing was written.",
+        "No ref moved and no approval was recorded.",
     ] {
         assert!(err.contains(want), "missing {want:?} in: {err}");
     }
@@ -401,6 +401,49 @@ fn a_path_scope_with_no_rule_at_the_tip_warns_but_is_recorded() {
         stderr(&out)
     );
     assert!(record(&root).contains("path:secrets/\t"));
+
+    std::fs::remove_dir_all(&root).unwrap();
+    std::fs::remove_dir_all(&keys).unwrap();
+}
+
+#[test]
+fn listings_and_policy_output_escape_repository_text() {
+    let root = tmp("escape");
+    let keys = tmp("escape-keys");
+    let (_, alice_pk) = keygen(&keys, "alice");
+    assert!(sc(&root, &["init"]).status.success());
+    std::fs::write(
+        root.join(".sc/recipients.toml"),
+        format!("[recipients]\nalice = \"{alice_pk}\"\n"),
+    )
+    .unwrap();
+    // A rule prefix is repository data: it can hold an escape sequence.
+    let prefix = "ev\u{1b}[2Jil/";
+    let out = sc(&root, &["protect", prefix, "--to", "alice"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let out = sc(&root, &["protect", "--list"]);
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        out.status.success() && text.contains("ev\\x1b[2Jil/"),
+        "{text:?}"
+    );
+    assert!(!text.contains('\u{1b}'), "raw escape in {text:?}");
+
+    let scope = format!("path:{prefix}");
+    let out = sc(&root, &["policy", "accept", &scope, "--key", &alice_pk]);
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        !text.contains('\u{1b}') && text.contains("\\x1b"),
+        "{text:?}"
+    );
+    let out = sc(&root, &["policy", "forget", &scope, &alice_pk]);
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        !text.contains('\u{1b}') && text.contains("\\x1b"),
+        "{text:?}"
+    );
 
     std::fs::remove_dir_all(&root).unwrap();
     std::fs::remove_dir_all(&keys).unwrap();
