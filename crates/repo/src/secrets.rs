@@ -401,7 +401,7 @@ impl Repo {
             // as `B` could be served under the registry key `A`.
             if secret.name != name {
                 return Err(Error::InvalidArgument(format!(
-                    "registry entry {name} points at a secret sealed as {:?}; refusing to run",
+                    "registry entry {name:?} points at a secret sealed as {:?}; refusing to run",
                     secret.name
                 )));
             }
