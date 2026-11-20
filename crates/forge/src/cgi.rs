@@ -510,6 +510,12 @@ fn environment(l: &Launch, marker: &std::path::Path) -> Vec<(String, String)> {
     env
 }
 
+/// Only a receive-pack run is a writer. A dumb-protocol GET has no service and needs only Read, so
+/// counting it would let a slow read-only client stall `PATCH default_branch` and lock cleanup.
+fn registers_as_writer(service: Option<Service>) -> bool {
+    service == Some(Service::Receive)
+}
+
 fn launch(l: Launch) -> Result<Started, LaunchError> {
     let repo_id = l.plan.access.repo.id;
     let cfg = l.app.transports.cfg.clone();
@@ -520,8 +526,7 @@ fn launch(l: Launch) -> Result<Started, LaunchError> {
         .registry
         .register(
             repo_id,
-            // Only a fetch is known to write no lock and no quarantine directory.
-            l.plan.service != Some(Service::Upload),
+            registers_as_writer(l.plan.service),
             || matches!(repos::find_by_id(&conn, repo_id), Ok(Some(r)) if r.state == "live"),
         )
         .ok_or_else(|| {
@@ -1050,4 +1055,16 @@ pub async fn handle(app: Arc<App>, req: Req, body: Incoming, path: GitPath) -> R
 /// A plain (non-streamed) answer as a response, for the server's own use.
 pub fn answer(r: crate::http::Resp) -> Response<RespBody> {
     buffered(r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_receive_pack_registers_as_a_writer() {
+        assert!(registers_as_writer(Some(Service::Receive)));
+        assert!(!registers_as_writer(Some(Service::Upload)));
+        assert!(!registers_as_writer(None), "a dumb GET is a reader");
+    }
 }
