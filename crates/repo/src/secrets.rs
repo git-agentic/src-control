@@ -388,10 +388,6 @@ impl Repo {
         // different name refuses the whole run.
         let mut entries = Vec::new();
         for (name, id) in self.registry()? {
-            if check_secret_name(&name).is_err() {
-                eprintln!("warning: secret name {name:?} is not allowed; skipping");
-                continue;
-            }
             let obj = {
                 let arc = self.store_arc();
                 let o = arc.lock().unwrap().get(&id)?;
@@ -408,6 +404,12 @@ impl Repo {
                     "registry entry {name} points at a secret sealed as {:?}; refusing to run",
                     secret.name
                 )));
+            }
+            // Checked after the binding, so a relabeled entry refuses even
+            // when its key is one that would be skipped.
+            if check_secret_name(&name).is_err() {
+                eprintln!("warning: secret name {name:?} is not allowed; skipping");
+                continue;
             }
             entries.push((name, secret));
         }
@@ -1407,6 +1409,17 @@ mod tests {
         let err = repo.secret_values(&sk, false).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
         assert!(err.to_string().contains('A'), "{err}");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // A relabel under a key that would be skipped still refuses.
+        let root = tmp_root("relabel-denied");
+        let repo = Repo::init(&root).unwrap();
+        plant(&repo, "LD_PRELOAD", "DB_URL", b"x", &pk);
+        assert!(matches!(
+            repo.secret_values(&sk, false),
+            Err(Error::InvalidArgument(_))
+        ));
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
