@@ -80,7 +80,7 @@ pub(crate) fn walk_tree(
     let mut gaps = BTreeSet::new();
     // `filter = None` never consults `expanded` (see the bare-id gate below),
     // so a throwaway empty set is correct and harmless here.
-    let mut expanded = HashSet::new();
+    let mut expanded = Expanded::new();
     walk_tree_filtered(src, root, seen, &mut gaps, None, &mut expanded)
 }
 
@@ -98,6 +98,26 @@ pub trait PrefixFilter {
     /// an ancestor of an in-filter prefix). The empty root path always
     /// descends.
     fn should_descend(&self, path: &str) -> bool;
+}
+
+/// Trees already pushed for expansion under a filter, keyed by
+/// [`expansion_key`].
+type Expanded = HashSet<(ObjectId, Option<String>)>;
+
+/// The expansion identity of tree `id` at `path`. A verdict depends on the
+/// path only while `path` is a strict ancestor of a filter prefix. A non-root
+/// path that `matches` is wholly in scope (every descendant matches too: the
+/// `/`-boundary prefix rule a [`PrefixFilter`] must keep), so its key drops
+/// the path. Without that, a chain of trees whose two entries name the same
+/// child has `2^depth` distinct paths for `depth` objects, and one hostile
+/// `PutObject` chain would make every filtered walk exponential. Path-bound
+/// keys stay few: only the ancestors of a prefix, plus roots, carry one.
+fn expansion_key(f: &dyn PrefixFilter, id: ObjectId, path: &str) -> (ObjectId, Option<String>) {
+    if !path.is_empty() && f.matches(path) {
+        (id, None)
+    } else {
+        (id, Some(path.to_owned()))
+    }
 }
 
 impl PrefixFilter for crate::promisor::Promisor {
@@ -186,7 +206,7 @@ pub fn reachable_objects_limited(
     // expanded at its own (root, "") path — see `walk_tree_filtered`'s doc
     // comment for why a bare-id gate on the root is wrong under a filter
     // (C1, P27 final review).
-    let mut expanded: HashSet<(ObjectId, String)> = HashSet::new();
+    let mut expanded = Expanded::new();
     let mut included = walk_snapshots(src, tips, |src, snapshot, root, included| {
         let mut gate = blob_limit.map(|limit| SizeGate {
             limit,
@@ -410,8 +430,10 @@ pub fn filter_manifest_wants(
 /// in-filter content that's ONLY reachable via a second, later path (the
 /// first path's out-of-filter verdict wins by accident of traversal
 /// order). So under a filter, expansion is gated on the `(id, path)` pair
-/// instead — `included` still dedups by bare id for the *result*, since an
-/// id counts as held once regardless of how many paths reach it.
+/// instead (see [`expansion_key`]: the path part is dropped once a directory
+/// is wholly in scope, which bounds the walk by the object count rather than
+/// the path count) — `included` still dedups by bare id for the *result*,
+/// since an id counts as held once regardless of how many paths reach it.
 ///
 /// `expanded` is owned by the caller and spans the WHOLE reachability walk
 /// (every tip/snapshot in one `reachable_objects_filtered` call), not just
@@ -432,7 +454,7 @@ fn walk_tree_filtered(
     included: &mut BTreeSet<ObjectId>,
     gaps: &mut BTreeSet<ObjectId>,
     filter: Option<&dyn PrefixFilter>,
-    expanded: &mut HashSet<(ObjectId, String)>,
+    expanded: &mut Expanded,
 ) -> Result<()> {
     walk_tree_sized(src, root, included, gaps, filter, expanded, None)
 }
@@ -474,7 +496,7 @@ fn walk_tree_sized(
     included: &mut BTreeSet<ObjectId>,
     gaps: &mut BTreeSet<ObjectId>,
     filter: Option<&dyn PrefixFilter>,
-    expanded: &mut HashSet<(ObjectId, String)>,
+    expanded: &mut Expanded,
     mut size: Option<&mut SizeGate<'_>>,
 ) -> Result<()> {
     let mut stack: Vec<(ObjectId, String)> = Vec::new();
@@ -484,9 +506,9 @@ fn walk_tree_sized(
                 stack.push((root, String::new()));
             }
         }
-        Some(_) => {
+        Some(f) => {
             included.insert(root);
-            if expanded.insert((root, String::new())) {
+            if expanded.insert(expansion_key(f, root, "")) {
                 stack.push((root, String::new()));
             }
         }
@@ -532,7 +554,7 @@ fn walk_tree_sized(
                     Some(f) => {
                         if f.should_descend(&child_path) {
                             included.insert(e.id);
-                            if expanded.insert((e.id, child_path.clone())) {
+                            if expanded.insert(expansion_key(f, e.id, &child_path)) {
                                 stack.push((e.id, child_path));
                             }
                         } else {
@@ -1110,5 +1132,86 @@ mod tests {
         let mut s = arc.lock().unwrap();
         s.delete(&snap_id).unwrap();
         assert!(reachable_objects_partial(&mut s, &[snap_id]).is_err());
+    }
+
+    /// Counts object reads so a walk's work is observable without a test seam.
+    struct CountingSource {
+        store: Store,
+        gets: usize,
+    }
+
+    impl ObjectSource for CountingSource {
+        fn get(&mut self, id: &ObjectId) -> Result<Object> {
+            self.gets += 1;
+            Ok(Store::get(&mut self.store, id)?)
+        }
+    }
+
+    /// `levels` trees where each holds two entries ("a", "b") naming the next
+    /// tree: a few KB on the wire, `2^levels` distinct paths. Returns the
+    /// snapshot id.
+    fn diamond_chain(store: &mut Store, levels: usize) -> ObjectId {
+        let leaf = store.put(Object::blob(b"x".to_vec())).unwrap();
+        let entry = |name: &str, kind, id| scl_core::TreeEntry {
+            name: name.into(),
+            kind,
+            id,
+            mode: scl_core::FileMode::FILE,
+            perms: 0,
+        };
+        let mut next = store
+            .put(Object::Tree(scl_core::Tree::new(vec![entry(
+                "f",
+                EntryKind::Blob,
+                leaf,
+            )])))
+            .unwrap();
+        for _ in 0..levels {
+            next = store
+                .put(Object::Tree(scl_core::Tree::new(vec![
+                    entry("a", EntryKind::Tree, next),
+                    entry("b", EntryKind::Tree, next),
+                ])))
+                .unwrap();
+        }
+        store
+            .put(Object::Snapshot(scl_core::Snapshot {
+                root: next,
+                parents: vec![],
+                author: "t".into(),
+                timestamp: 0,
+                message: "c".into(),
+                secrets: BTreeMap::new(),
+                protection: Default::default(),
+            }))
+            .unwrap()
+    }
+
+    /// A tree whose two entries share one child, repeated, must not make a
+    /// filtered walk read `2^levels` trees: once a directory is wholly inside
+    /// the filter scope, it is expanded once by id.
+    #[test]
+    fn filtered_walk_over_a_diamond_chain_is_linear() {
+        const LEVELS: usize = 18;
+        let mut store = Store::with_budget(1 << 20);
+        let snap = diamond_chain(&mut store, LEVELS);
+        let mut src = CountingSource { store, gets: 0 };
+        // Size-only scope: every path is in scope (a `blob:limit` clone/fetch).
+        let all = crate::promisor::Promisor::with_blob_limit("o", vec![], 1);
+        let r = reachable_objects_limited(&mut src, &[snap], Some(&all), Some(1), &BTreeSet::new())
+            .unwrap();
+        assert_eq!(r.included.len(), LEVELS + 3, "snapshot, trees, blob");
+        assert!(src.gets <= 2 * LEVELS + 8, "walk read {} objects", src.gets);
+
+        // A prefix scope: the ancestors are path-bound, the scope below is not.
+        src.gets = 0;
+        let r = reachable_objects_filtered(
+            &mut src,
+            &[snap],
+            Some(&crate::promisor::Promisor::new("o", vec!["a/".into()])),
+        )
+        .unwrap();
+        assert_eq!(r.included.len(), LEVELS + 3);
+        assert!(src.gets <= 2 * LEVELS + 8, "walk read {} objects", src.gets);
     }
 }
