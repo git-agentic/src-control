@@ -117,6 +117,17 @@ pub fn mirror_push(mirror: &Path, branch: &str) -> anyhow::Result<()> {
     run_git(mirror, &["push", "--quiet", "origin", &spec])
 }
 
+/// The commit (hex) that `branch` points at on the network remote itself, asked of the server (the
+/// mirror only holds what we last fetched or exported). `None` if the branch does not exist there.
+pub fn remote_branch_tip(mirror: &Path, branch: &str) -> anyhow::Result<Option<String>> {
+    let refname = format!("refs/heads/{branch}");
+    let out = run_git_capture(mirror, &["ls-remote", "origin", &refname])?;
+    Ok(out.lines().find_map(|l| {
+        let (oid, name) = l.split_once('\t')?;
+        (name == refname).then(|| oid.to_string())
+    }))
+}
+
 /// The remote's default branch (`HEAD` symref), e.g. "main".
 pub fn remote_default_branch(mirror: &Path) -> anyhow::Result<String> {
     let out = run_git_capture(mirror, &["ls-remote", "--symref", "origin", "HEAD"])?;

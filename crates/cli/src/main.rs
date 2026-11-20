@@ -4487,6 +4487,23 @@ fn run_push(remote: &str, include_encrypted: bool, no_transcripts: bool) -> Resu
     }
 }
 
+/// Refuse unsafe Git tree names in every commit a network push would upload: the history of
+/// `local_tip` minus what the server already has. The server's tip is asked of the server; one sc has
+/// no mark for (or no branch at all) means the whole history is checked.
+fn check_names_pending_network_upload(
+    repo: &scl_repo::Repo,
+    mirror: &std::path::Path,
+    branch: &str,
+    local_tip: scl_core::ObjectId,
+    git_to_sc: &std::collections::HashMap<String, scl_core::ObjectId>,
+) -> Result<()> {
+    let server_sc = scl_gitio::bridge::remote_branch_tip(mirror, branch)?
+        .and_then(|hex| git_to_sc.get(&hex).copied());
+    let store_arc = repo.vfs().store();
+    let mut store = store_arc.lock().unwrap();
+    scl_gitio::check_names_pending_upload(&mut store, local_tip, server_sc)
+}
+
 /// Push the current branch to a git-backed remote, fast-forward-only. The
 /// snapshot↔commit marks map carries identity so already-pushed commits are
 /// reused, not rewritten.
@@ -4535,6 +4552,9 @@ fn run_push_git(repo: &scl_repo::Repo, remote: &str, include_encrypted: bool) ->
         match git_to_sc.get(&remote_git_hex) {
             Some(&remote_sc) if remote_sc == local_tip => {
                 if scl_gitio::bridge::is_network_git_url(&url) {
+                    check_names_pending_network_upload(
+                        repo, &path, &branch, local_tip, &git_to_sc,
+                    )?;
                     scl_gitio::bridge::mirror_push(&path, &branch)?;
                 }
                 println!("push {remote} (git): already up to date");
@@ -4554,6 +4574,13 @@ fn run_push_git(repo: &scl_repo::Repo, remote: &str, include_encrypted: bool) ->
                 );
             }
         }
+    }
+
+    // The mirror can hold commits the server lacks (an earlier push failed after exporting, possibly
+    // by a client without the name checks), and export skips those as already written. Check
+    // everything the network push will upload, before export moves anything.
+    if scl_gitio::bridge::is_network_git_url(&url) {
+        check_names_pending_network_upload(repo, &path, &branch, local_tip, &git_to_sc)?;
     }
 
     // Export (reusing known commits), then persist newly-written marks.

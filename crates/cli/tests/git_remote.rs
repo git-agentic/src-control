@@ -340,3 +340,55 @@ fn push_refuses_when_remote_has_unseen_commit() {
 
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+// A hostile `.gitmodules` is refused in what a push uploads, but not in history the server already
+// has: git itself accepted that commit, and a fix that removes the file must still push. Goes
+// through the network bridge (file://), which asks the server for its tip.
+#[test]
+fn network_push_checks_names_only_in_commits_the_server_lacks() {
+    let root = tmp("netnames");
+    let hub = root.join("hub.git");
+    git(
+        &root,
+        &["init", "-q", "--bare", "-b", "main", hub.to_str().unwrap()],
+    );
+    let up = root.join("up");
+    std::fs::create_dir_all(&up).unwrap();
+    git(&up, &["init", "-q", "-b", "main"]);
+    std::fs::write(up.join(".gitmodules"), b"# none\n").unwrap();
+    std::fs::write(up.join("a.txt"), b"a").unwrap();
+    git(&up, &["add", "."]);
+    git(&up, &["commit", "-q", "-m", "old"]);
+    git(&up, &["push", "-q", hub.to_str().unwrap(), "main"]);
+
+    let screpo = root.join("work");
+    std::fs::create_dir_all(&screpo).unwrap();
+    assert!(sc(&screpo, &["init"]).status.success());
+    let url = format!("file://{}", hub.display());
+    assert!(sc(&screpo, &["remote", "add", "hub", &url, "--git"])
+        .status
+        .success());
+    assert!(sc(&screpo, &["fetch", "hub"]).status.success());
+    assert!(sc(&screpo, &["merge", "hub/main"]).status.success());
+
+    // The fix removes the file: allowed although the server's history has it.
+    std::fs::remove_file(screpo.join(".gitmodules")).unwrap();
+    assert!(sc(&screpo, &["commit", "-m", "drop"]).status.success());
+    let p = sc(&screpo, &["push", "hub"]);
+    assert!(p.status.success(), "{}", String::from_utf8_lossy(&p.stderr));
+    let tip = git(&hub, &["rev-parse", "main"]).stdout;
+
+    // A new commit that adds it again is refused, and the server is untouched.
+    std::fs::write(screpo.join(".gitmodules"), b"# again\n").unwrap();
+    assert!(sc(&screpo, &["commit", "-m", "again"]).status.success());
+    let p = sc(&screpo, &["push", "hub"]);
+    assert!(!p.status.success());
+    assert!(
+        String::from_utf8_lossy(&p.stderr).contains("not a safe Git path"),
+        "{}",
+        String::from_utf8_lossy(&p.stderr)
+    );
+    assert_eq!(git(&hub, &["rev-parse", "main"]).stdout, tip);
+
+    std::fs::remove_dir_all(&root).unwrap();
+}
