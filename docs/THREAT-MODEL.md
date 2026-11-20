@@ -799,7 +799,9 @@ protected paths, plaintext.
     laid. An edit, a replacement or a symlink survives (#255, #256, #259).
   - `merge --abort`, `cherry-pick --abort` and `rebase --abort` finish past a
     kept resolution edit instead of refusing, so it cannot trap the user in the
-    stop (a directory holding untracked content, or a blocked parent, still refuses):
+    stop (a directory holding untracked content, or a file of yours where a
+    directory must be, still refuses; a path with a symlink among its parents is
+    left alone and reported in `kept`, never written through):
     they restore the tip, drop the stop's state and return an `AbortReport`
     whose `kept` paths (changed since the stop) and `skipped` protected paths
     `sc` prints. Recorded plaintext and sidecars are removed whatever their

@@ -972,12 +972,16 @@ pub(crate) fn under_symlink(root: &Path, rel: &str) -> bool {
     let mut end = 0;
     while let Some(i) = rel[end..].find('/') {
         end += i;
-        if root
-            .join(&rel[..end])
-            .symlink_metadata()
-            .is_ok_and(|m| m.is_symlink())
-        {
-            return true;
+        // Fail closed: a lstat error other than "nothing there" (also when a
+        // parent is a file) reads as blocked, not as "not a symlink".
+        match root.join(&rel[..end]).symlink_metadata() {
+            Ok(m) if !m.is_symlink() => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            _ => return true,
         }
         end += 1;
     }
@@ -1268,19 +1272,25 @@ fn materialize_impl(
     // Before the first write, whatever `old_root` is (an unborn merge or a clone
     // has none, so the obstruction checks below do not run): a symlink among a
     // written path's parents would carry the write out of its directory, e.g.
-    // `link -> .sc` or a directory outside the checkout. Never followed.
+    // `link -> .sc` or a directory outside the checkout. Never followed. A
+    // forward operation refuses; a restore (an abort) finishes anyway, so it
+    // leaves such a path alone and reports it in `kept`.
+    let mut through_link: BTreeSet<String> = BTreeSet::new();
     for path in target.keys().filter(|p| sparse.matches(p)) {
         if under_symlink(&layout.root, path) {
-            return Err(Error::InvalidArgument(format!(
-                "cannot write {path}: a parent directory is a symlink; \
-                 move it away, then retry"
-            )));
+            if restore_owned.is_none() {
+                return Err(Error::InvalidArgument(format!(
+                    "cannot write {path}: a parent directory is a symlink; \
+                     move it away, then retry"
+                )));
+            }
+            through_link.insert(path.clone());
         }
     }
     // Set when an interrupted `sparse set`'s marker widened the removal bound;
     // cleared once this call has finished laying the tree out under `sparse`.
     let mut prev_marker_used = false;
-    let mut kept = Vec::new();
+    let mut kept: Vec<String> = through_link.iter().cloned().collect();
     // Paths the replaced tree tracks (within the removal walk's bound), with
     // their blob ids.
     let mut old_tracked: BTreeMap<String, ObjectId> = BTreeMap::new();
@@ -1349,7 +1359,10 @@ fn materialize_impl(
         // may hold only directories and files this pass is about to delete.
         // Anything else is the user's, and refusing now (rather than at the
         // write, after the pass and earlier writes) changes nothing (#247).
-        for path in target.keys().filter(|p| sparse.matches(p)) {
+        for path in target
+            .keys()
+            .filter(|p| sparse.matches(p) && !through_link.contains(*p))
+        {
             let full = safe_join(&layout.root, path)?;
             if full.symlink_metadata().is_ok_and(|m| m.is_dir())
                 && !dir_clearable(&full, path, &|c| removals.contains(c))
@@ -1362,7 +1375,9 @@ fn materialize_impl(
         }
         refuse_blocked_parents(
             &layout.root,
-            target.keys().filter(|p| sparse.matches(p)),
+            target
+                .keys()
+                .filter(|p| sparse.matches(p) && !through_link.contains(*p)),
             &|c| removals.contains(c),
         )?;
         for p in removals {
@@ -1379,7 +1394,7 @@ fn materialize_impl(
     }
     let mut skipped = Vec::new();
     for (path, (blob_id, mode, perms)) in &target {
-        if !sparse.matches(path) {
+        if !sparse.matches(path) || through_link.contains(path) {
             continue;
         }
         let full = safe_join(&layout.root, path)?;
