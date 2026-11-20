@@ -237,7 +237,11 @@ pub(crate) fn ref_rules_hold<T: crate::transport::Transport>(t: &T) {
         ("file and tree entry share an id", vec![&dirx], &reuse),
         ("tree entry names a blob", vec![&b1], &tree_over_blob),
         ("file entry names a tree", vec![&dir1, &b1], &file_over_tree),
-        ("file entry names a sealed object", vec![&sealed], &file_over_sealed),
+        (
+            "file entry names a sealed object",
+            vec![&sealed],
+            &file_over_sealed,
+        ),
     ] {
         let c = snap(root.id(), &[c2.id()], what);
         let mut objs = objs;
