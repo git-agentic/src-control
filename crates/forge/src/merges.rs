@@ -470,9 +470,10 @@ fn publish(git: &Git, dir: &Path, i: &Intent) -> Result<bool, GitError> {
 }
 
 /// Test-only knob: `SC_FORGE_MERGE_PAUSE_MS` stretches the two crash windows of a merge (after the
-/// journal row, and after the base moved) so a test can SIGKILL the server inside them. Unset in
-/// production.
+/// journal row, and after the base moved) so a test can SIGKILL the server inside them. Compiled
+/// into debug builds only, so a release server never reads it.
 fn pause_for_tests() {
+    #[cfg(debug_assertions)]
     if let Some(ms) = std::env::var("SC_FORGE_MERGE_PAUSE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())

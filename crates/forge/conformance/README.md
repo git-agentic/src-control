@@ -158,11 +158,13 @@ success, ...), as well as every deliberate sc-forge difference.
   override is refused (`applied to a different exchange`) when the exchange actually produced differs,
   including for `skip`.
 - `expect` keys depend on `kind`: http `status`, `message_contains`, `fields`, `ignore_fields`,
-  `ignore_headers`, `ignore_body`, `skip`; git `ok`, `message_contains`, `skip`; note `value`, `skip`.
+  `ignore_headers`, `ignore_body`, `body`, `absent_headers`, `skip`; git `ok`, `message_contains`, `skip`; note `value`, `skip`.
   A key that does not apply to the entry's kind is a load error. The keys: `status` (number or list), `message_contains`, `ok` (git), `value` (note; works for
   `strict=False` notes too), `fields` (pin body values by dotted path, `$len` pins an array length),
   `ignore_fields` (dotted paths left out of the body comparison), `ignore_headers` (recorded headers left out),
-  `ignore_body` (no body comparison at all) and `skip` (only when unavoidable; say why in `reason`).
+  `ignore_body` (no body comparison at all), `body` (the exact JSON object the departed answer must have: the same
+  keys, every value compared, URLs included; use it with `ignore_body` to pin a changed error shape instead of
+  dropping the check), `absent_headers` (headers that must not be present on the departed answer) and `skip` (only when unavoidable; say why in `reason`).
 - A departure replaces only what it names. Whatever it sets (`status`, `fields`, `message_contains`, ...), the
   recorded headers (minus `ignore_headers`) and every JSON field not in `ignore_fields` or `fields` are still
   compared, and a top-level error `message` is checked by `message_contains` instead of the recorded text.

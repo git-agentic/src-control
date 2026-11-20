@@ -3,7 +3,7 @@
 //! reconciler must leave the forge consistent: no pending intent, no receipt ref, and every pull
 //! request either wholly merged (its merge commit on the base, two parents) or wholly open (its
 //! head not on the base).
-#![cfg(unix)]
+#![cfg(all(unix, debug_assertions))] // the merge pause knob is compiled into debug builds only
 
 use serde_json::{json, Value};
 use std::io::{Read, Write};

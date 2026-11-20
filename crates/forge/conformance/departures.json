@@ -1748,11 +1748,26 @@
   "kind": "http",
   "match": "GET /api/v1/orgs/acme/repos",
   "expect": {
+   "status": 404,
+   "message_contains": [
+    "getorgbyname"
+   ],
+   "ignore_body": true,
    "ignore_headers": [
+    "x-total-count"
+   ],
+   "body": {
+    "errors": [
+     "user redirect does not exist [name: acme]"
+    ],
+    "message": "GetOrgByName",
+    "url": "<base>/api/swagger"
+   },
+   "absent_headers": [
     "x-total-count"
    ]
   },
-  "reason": "Gitea leaks all 11 organization repositories in X-Total-Count even when the body is access-filtered. The complete body stays compared; e2e_repos::listings_are_filtered_by_access_with_visible_counts checks visible-count filtering for a read collaborator and an outsider."
+  "reason": "sc-forge answers a caller who cannot see a private organization and can read nothing in it like a missing organization (404 GetOrgByName); Gitea answers 200 with an empty list [ignore_body: the recorded 200 body has another shape than the departed answer; `body` pins the missing-organization error, `absent_headers` that no count leaks]. K#56 (a collaborator) still lists what it can read."
  },
  {
   "scenario": "K",
@@ -1765,5 +1780,47 @@
    ]
   },
   "reason": "Gitea leaks all 11 organization repositories in X-Total-Count even when the body is access-filtered. The complete body stays compared; e2e_repos::listings_are_filtered_by_access_with_visible_counts checks visible-count filtering for a read collaborator and an outsider."
+ },
+ {
+  "scenario": "B",
+  "exchange": 32,
+  "kind": "http",
+  "match": "GET /api/v1/orgs/acme",
+  "expect": {
+   "status": 404,
+   "message_contains": [
+    "getorgbyname"
+   ],
+   "ignore_body": true,
+   "body": {
+    "errors": [
+     "user redirect does not exist [name: acme]"
+    ],
+    "message": "GetOrgByName",
+    "url": "<base>/api/swagger"
+   }
+  },
+  "reason": "sc-forge answers a private organization the caller cannot see exactly like a missing one (404 GetOrgByName); Gitea's 'HasOrgOrUserVisible' tells the two apart [ignore_body: the recorded `errors` is null; `body` pins the missing-organization error shape and URL]"
+ },
+ {
+  "scenario": "K",
+  "exchange": 54,
+  "kind": "http",
+  "match": "GET /api/v1/orgs/acme",
+  "expect": {
+   "status": 404,
+   "message_contains": [
+    "getorgbyname"
+   ],
+   "ignore_body": true,
+   "body": {
+    "errors": [
+     "user redirect does not exist [name: acme]"
+    ],
+    "message": "GetOrgByName",
+    "url": "<base>/api/swagger"
+   }
+  },
+  "reason": "sc-forge answers a private organization the caller cannot see exactly like a missing one (404 GetOrgByName); Gitea's 'HasOrgOrUserVisible' tells the two apart [ignore_body: the recorded `errors` is null; `body` pins the missing-organization error shape and URL]"
  }
 ]

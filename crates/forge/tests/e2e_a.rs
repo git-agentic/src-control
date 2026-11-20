@@ -151,13 +151,18 @@ fn users_orgs_and_visibility() {
         nf.json()["errors"],
         json!(["user redirect does not exist [name: nobody-org]"])
     );
-    // Private org: owner and admin see it, others get the recorded 404.
+    // Private org: owner and admin see it, others get exactly what a missing organization gets
+    // (a recorded departure from Gitea's `HasOrgOrUserVisible`, which told the two apart).
     let hidden = s.get("/api/v1/orgs/acme", &token(&bob));
     assert_eq!(
         (hidden.status, hidden.msg().as_str()),
-        (404, "HasOrgOrUserVisible")
+        (404, "GetOrgByName")
     );
-    assert_eq!(hidden.json()["errors"], serde_json::Value::Null);
+    let missing = s.get("/api/v1/orgs/acmf", &token(&bob));
+    assert_eq!(
+        (hidden.status, hidden.s_text().replace("acme", "<o>")),
+        (missing.status, missing.s_text().replace("acmf", "<o>"))
+    );
     let perms = s.get("/api/v1/users/siteadmin/orgs/acme/permissions", &adm);
     assert_eq!(
         perms.json(),
@@ -963,11 +968,32 @@ fn private_org_permissions_are_hidden_from_outsiders() {
         "/api/v1/users/siteadmin/orgs/secret/permissions",
         &token(&eve),
     );
-    assert_eq!(
-        (r.status, r.msg().as_str()),
-        (404, "HasOrgOrUserVisible"),
-        "no membership oracle for outsiders"
-    );
+    // An outsider cannot tell a private organization from a missing one on any org route.
+    for (hidden, missing) in [
+        (
+            "/api/v1/users/siteadmin/orgs/secret/permissions",
+            "/api/v1/users/siteadmin/orgs/secrex/permissions",
+        ),
+        ("/api/v1/orgs/secret", "/api/v1/orgs/secrex"),
+        ("/api/v1/orgs/secret/repos", "/api/v1/orgs/secrex/repos"),
+    ] {
+        let (h, m) = (s.get(hidden, &token(&eve)), s.get(missing, &token(&eve)));
+        assert_eq!(h.status, 404, "{hidden}");
+        assert_eq!(
+            (
+                h.status,
+                h.s_text().replace("secret", "<o>"),
+                h.header("content-type")
+            ),
+            (
+                m.status,
+                m.s_text().replace("secrex", "<o>"),
+                m.header("content-type")
+            ),
+            "{hidden}"
+        );
+    }
+    assert_eq!(r.status, 404, "no membership oracle for outsiders");
     assert_eq!(
         s.get("/api/v1/users/siteadmin/orgs/secret/permissions", &adm)
             .status,
@@ -1222,5 +1248,113 @@ fn serve_refuses_unusable_settings_at_startup() {
         let (refused, err) = run(&["--public-url", bad]);
         assert!(refused && err.contains("--public-url"), "{bad}: {err}");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_busy_password_gate_answers_503_and_refunds_the_attempt() {
+    // A budget of one attempt per source: without the refund the second request is a 429.
+    let s = Srv::start_backoff(scl_forge::limits::Backoff::new(
+        1,
+        std::time::Duration::ZERO,
+    ));
+    let pw = s.mk_user("alice");
+    let body = json!({"name": "t", "scopes": ["all"]});
+    // Hold every Argon2 slot (the harness builds the app with 4): the check must give up, not queue.
+    let held: Vec<_> = (0..4).map(|_| s.app.gate.acquire()).collect();
+    let r = s.post(
+        "/api/v1/users/alice/tokens",
+        &basic("alice", &pw),
+        body.clone(),
+    );
+    assert_eq!(r.status, 503, "{}", r.msg());
+    assert_eq!(r.headers["retry-after"], "5");
+    drop(held);
+    // The refused attempt left no failure behind and returned its source reservation.
+    let r = s.post("/api/v1/users/alice/tokens", &basic("alice", &pw), body);
+    assert_eq!(r.status, 201, "{}", r.msg());
+}
+
+#[test]
+fn admin_passwords_can_come_from_stdin_but_not_both_ways() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!("scl-forge-stdin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let run = |args: &[&str], stdin: &str| {
+        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_sc-forge"))
+            .args(args)
+            .arg("--data-dir")
+            .arg(&dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        c.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+        let o = c.wait_with_output().unwrap();
+        (
+            o.status.success(),
+            String::from_utf8_lossy(&o.stderr).to_string(),
+        )
+    };
+    let create = |extra: &[&str], stdin: &str| {
+        let mut a = vec![
+            "admin",
+            "user",
+            "create",
+            "--username",
+            "eng",
+            "--email",
+            "e@example.invalid",
+        ];
+        a.extend_from_slice(extra);
+        run(&a, stdin)
+    };
+    // Generated, so no password literal reaches the hashing code (CodeQL hard-coded-credential rule).
+    let pw1 = scl_crypto::random_hex(12);
+    let pw2 = scl_crypto::random_hex(12);
+    // The trailing newline is not part of the password; an empty line is refused.
+    assert!(!create(&["--password-stdin"], "\n").0, "empty password");
+    assert!(!create(&["--password-stdin"], "").0, "no line at all");
+    let (ok, err) = create(
+        &["--password-stdin", "--must-change-password=false"],
+        &format!("{pw1}\r\n"),
+    );
+    assert!(ok, "{err}");
+    let (ok, err) = create(&["--password", "x", "--password-stdin"], "y\n");
+    assert!(
+        !ok && err.contains("cannot be used with"),
+        "exclusive: {err}"
+    );
+    let (ok, err) = create(&[], "y\n");
+    assert!(
+        !ok && err.contains("--password"),
+        "one of them is required: {err}"
+    );
+    let (ok, err) = run(
+        &[
+            "admin",
+            "user",
+            "change-password",
+            "--username",
+            "eng",
+            "--password-stdin",
+            "--must-change-password=false",
+        ],
+        &format!("{pw2}\n"),
+    );
+    assert!(ok, "{err}");
+    let hash_of = |pw: &str| {
+        let conn = scl_forge::db::open_for_admin(&dir).unwrap();
+        let u = scl_forge::store::find_by_login(&conn, "eng")
+            .unwrap()
+            .unwrap();
+        scl_crypto::verify_password(pw, Some(&u.password_hash))
+    };
+    assert!(
+        hash_of(&pw2),
+        "the stdin password was stored, without its newline"
+    );
+    assert!(!hash_of(&pw1));
     let _ = std::fs::remove_dir_all(&dir);
 }

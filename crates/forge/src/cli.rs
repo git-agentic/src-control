@@ -3,6 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use scl_forge::limits::{Cidr, Proxies};
 use scl_forge::server::{bind_gate, make_app, serve, Limits};
 use scl_forge::{admin, db};
+use std::io::BufRead;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -148,8 +149,16 @@ enum UserCmd {
     Create {
         #[arg(long)]
         username: String,
+        /// Visible in the process list and shell history; prefer `--password-stdin`.
+        #[arg(
+            long,
+            required_unless_present = "password_stdin",
+            conflicts_with = "password_stdin"
+        )]
+        password: Option<String>,
+        /// Read the password from one line of standard input.
         #[arg(long)]
-        password: String,
+        password_stdin: bool,
         #[arg(long)]
         email: String,
         #[arg(long)]
@@ -163,8 +172,16 @@ enum UserCmd {
     ChangePassword {
         #[arg(long)]
         username: String,
+        /// Visible in the process list and shell history; prefer `--password-stdin`.
+        #[arg(
+            long,
+            required_unless_present = "password_stdin",
+            conflicts_with = "password_stdin"
+        )]
+        password: Option<String>,
+        /// Read the password from one line of standard input.
         #[arg(long)]
-        password: String,
+        password_stdin: bool,
         #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value = "true", action = clap::ArgAction::Set)]
         must_change_password: bool,
         #[arg(long)]
@@ -218,6 +235,25 @@ pub fn run() -> Result<()> {
     }
 }
 
+/// The password from `--password`, or one line of stdin for `--password-stdin` (the trailing
+/// newline is stripped; an empty line is refused).
+fn password_arg(arg: Option<String>, from_stdin: bool) -> Result<String> {
+    if !from_stdin {
+        return arg.context("--password or --password-stdin is required");
+    }
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .context("read the password from stdin")?;
+    let pw = line.strip_suffix('\n').unwrap_or(&line);
+    let pw = pw.strip_suffix('\r').unwrap_or(pw);
+    if pw.is_empty() {
+        bail!("the password read from stdin is empty");
+    }
+    Ok(pw.to_string())
+}
+
 fn run_admin(cmd: AdminCmd) -> Result<()> {
     match cmd {
         AdminCmd::User {
@@ -225,12 +261,14 @@ fn run_admin(cmd: AdminCmd) -> Result<()> {
                 UserCmd::Create {
                     username,
                     password,
+                    password_stdin,
                     email,
                     admin: a,
                     must_change_password,
                     data_dir,
                 },
         } => {
+            let password = password_arg(password, password_stdin)?;
             admin::user_create(
                 &data_dir,
                 &username,
@@ -246,10 +284,12 @@ fn run_admin(cmd: AdminCmd) -> Result<()> {
                 UserCmd::ChangePassword {
                     username,
                     password,
+                    password_stdin,
                     must_change_password,
                     data_dir,
                 },
         } => {
+            let password = password_arg(password, password_stdin)?;
             admin::user_change_password(&data_dir, &username, &password, must_change_password)?;
             println!("{username}'s password has been successfully updated!");
         }

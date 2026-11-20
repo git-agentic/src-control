@@ -77,15 +77,21 @@ async fn handle(
     let started = std::time::Instant::now();
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
-    let source = app.proxies.resolve(
-        peer,
-        app.proxies
-            .header
-            .as_deref()
-            .and_then(|h| req.headers().get(h))
-            .and_then(|v| v.to_str().ok()),
-    );
-    let resp = handle_request(app, limits, peer, req).await;
+    // Resolved once, from every forwarded-for field in order and as raw bytes, and reused for the
+    // limiter and the access log: a malformed or repeated field must not change who they see.
+    let source = match app.proxies.header.as_deref() {
+        Some(h) => {
+            let values: Vec<&[u8]> = req
+                .headers()
+                .get_all(h)
+                .iter()
+                .map(|v| v.as_bytes())
+                .collect();
+            app.proxies.resolve_values(peer, &values)
+        }
+        None => peer,
+    };
+    let resp = handle_request(app, limits, source, req).await;
     if let Ok(r) = &resp {
         let status = r.status().as_u16();
         if !(status == 200 && matches!(path.as_str(), "/healthz" | "/api/healthz")) {
@@ -108,7 +114,7 @@ async fn handle(
 async fn handle_request(
     app: Arc<App>,
     limits: Limits,
-    peer: IpAddr,
+    source: IpAddr,
     req: Request<Incoming>,
 ) -> Result<Response<RespBody>, std::convert::Infallible> {
     let (parts, body) = req.into_parts();
@@ -122,12 +128,6 @@ async fn handle_request(
         transport::Route::NotGit => {}
         transport::Route::Unknown => return Ok(cgi::answer(transport::not_found())),
         transport::Route::Git(g) => {
-            let source = app.proxies.resolve(
-                peer,
-                headers
-                    .get(app.proxies.header.as_deref().unwrap_or(""))
-                    .map(String::as_str),
-            );
             let r = Req {
                 method: parts.method.as_str().to_string(),
                 path: parts.uri.path().to_string(),
@@ -161,12 +161,6 @@ async fn handle_request(
             )))
         }
     };
-    let source = app.proxies.resolve(
-        peer,
-        headers
-            .get(app.proxies.header.as_deref().unwrap_or(""))
-            .map(String::as_str),
-    );
     let r = Req {
         method: parts.method.as_str().to_string(),
         path: parts.uri.path().to_string(),
