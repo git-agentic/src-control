@@ -190,7 +190,8 @@ fn a_fresh_clone_refuses_a_rule_seal_until_the_key_is_accepted() {
         "path:secret/ grants a recipient you have not accepted",
         "(alice)",
         "sc policy accept path:secret/ --key",
-        "sc revoke secret/ --recipient-id",
+        "sc revoke --recipient-id",
+        "-- secret/",
         "Nothing was written.",
     ] {
         assert!(err.contains(want), "missing {want:?} in: {err}");
@@ -217,7 +218,8 @@ fn a_fresh_clone_refuses_a_default_secret_rotate_until_accepted() {
     assert!(
         err.contains("secret:DB grants a recipient you have not accepted")
             && err.contains("sc policy accept secret:DB --key")
-            && err.contains("sc secret revoke DB --recipient-id"),
+            && err.contains("sc secret revoke --recipient-id")
+            && err.contains("-- DB"),
         "{err}"
     );
 
@@ -358,6 +360,47 @@ fn escrow_keys_are_not_recorded_by_protect_or_secret_add() {
     let shown = String::from_utf8_lossy(&sc(&root, &["escrow", "show"]).stdout).to_string();
     let escrow_id = shown.split(": ").nth(1).unwrap().lines().next().unwrap();
     assert!(!rec.contains(escrow_id), "escrow id recorded: {rec}");
+
+    std::fs::remove_dir_all(&root).unwrap();
+    std::fs::remove_dir_all(&keys).unwrap();
+}
+
+#[test]
+fn a_path_scope_with_no_rule_at_the_tip_warns_but_is_recorded() {
+    let root = tmp("norule");
+    let keys = tmp("norule-keys");
+    let (_, alice_pk) = keygen(&keys, "alice");
+    assert!(sc(&root, &["init"]).status.success());
+    std::fs::write(
+        root.join(".sc/recipients.toml"),
+        format!("[recipients]\nalice = \"{alice_pk}\"\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("secret")).unwrap();
+    std::fs::write(root.join("secret/a.txt"), "data\n").unwrap();
+    let out = sc(&root, &["protect", "secret/", "--to", "alice"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    // A rule exists for `secret/`: no warning.
+    let out = sc(
+        &root,
+        &["policy", "accept", "path:secret/", "--key", &alice_pk],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("warning"), "{}", stderr(&out));
+
+    // None for `secret` (a different prefix string): warned, still recorded.
+    let out = sc(
+        &root,
+        &["policy", "accept", "path:secrets/", "--key", &alice_pk],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("warning: no protection rule"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(record(&root).contains("path:secrets/\t"));
 
     std::fs::remove_dir_all(&root).unwrap();
     std::fs::remove_dir_all(&keys).unwrap();

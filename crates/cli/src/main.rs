@@ -3425,6 +3425,20 @@ fn run_policy(op: PolicyOp) -> Result<()> {
             // The whole batch is checked, then written once.
             repo.accept_recipients(&scope, &resolved)?;
             println!("accepted {} recipient(s) for {scope}", resolved.len());
+            // A `path:` scope names a rule's prefix exactly. One the tip has no
+            // rule for is recorded all the same (a rule may arrive by a merge),
+            // but it is usually a typo. A private branch has no rule list to read.
+            if let Some(prefix) = scope.strip_prefix("path:") {
+                if let Ok(rules) = repo.protected_prefixes() {
+                    if !rules.iter().any(|(p, _)| p == prefix) {
+                        eprintln!(
+                            "warning: no protection rule with the prefix {:?} at the tip of the current branch; \
+                             recorded anyway (see `sc protect --list`)",
+                            scl_core::sanitize_display_line(prefix)
+                        );
+                    }
+                }
+            }
         }
         PolicyOp::Forget { scope, key } => {
             let (id, _) = parse_recipient_ref(&key)?;
@@ -5022,7 +5036,12 @@ fn run_rewrap(identity: Option<PathBuf>, dry_run: bool, rotate: bool) -> Result<
     if !report.skipped.is_empty() {
         eprintln!("skipped {} entr(ies):", report.skipped.len());
         for (entry, reason) in &report.skipped {
-            eprintln!("  {entry}: {reason}");
+            // Paths and names come from the repository.
+            eprintln!(
+                "  {}: {}",
+                scl_core::sanitize_display_line(entry),
+                scl_core::sanitize_display_line(reason)
+            );
         }
         let again = if rotate {
             "sc rewrap --rotate"

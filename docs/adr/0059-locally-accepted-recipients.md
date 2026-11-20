@@ -76,14 +76,15 @@ at all, only a pointer to `sc protect --list`, `sc secret list` or
 ```
 path:secret/sub/ grants a recipient you have not accepted: 3f9a... (UNKNOWN).
   Accept: sc policy accept path:secret/sub/ --key scl-pk-... --allow-unknown
-  Remove: sc revoke secret/sub/ --recipient-id 3f9a...
+  Remove: sc revoke --recipient-id 3f9a... -- secret/sub/
 Nothing was written.
 ```
 
-Remove is `sc revoke <prefix> --recipient-id <id>`, `sc secret revoke <NAME>
---recipient-id <id>` or `sc branch revoke <name> --recipient-id <id>
---identity <key>`. A target that starts with `-` is written flags first and
-after `--` (`sc revoke --recipient-id <id> -- -x/`).
+Remove is `sc revoke --recipient-id <id> -- <prefix>`,
+`sc secret revoke --recipient-id <id> -- <NAME>` or
+`sc branch revoke --recipient-id <id> --identity <key> -- <name>`: flags first,
+then `--`, then the target, so a target that starts with `-` is not read as a
+flag. The quoting of a target is POSIX shell only.
 
 The gate sits where wraps are minted, after the carry-or-seal decision, so a
 carry that copies existing wraps is never gated:
@@ -125,7 +126,9 @@ so accepting a key you cannot identify takes a flag you typed. A `path:` scope
 needs the full key: pass the `scl-pk-` string, or an id that resolves through
 `[recipients]` or `[escrow]`. `--allow-unknown` does not lift that: an id with
 no key behind it is an error for a `path:` scope. The batch is checked as a
-whole and written once, so a bad entry leaves the record as it was.
+whole and written once, so a bad entry leaves the record as it was. A `path:`
+scope that names no rule at the tip prints a warning and is recorded anyway (a
+rule may arrive by a merge, and a typo is only a harmless dead line).
 `sc policy forget <scope> <key>` removes one. Both touch only the local file,
 so both work while a merge, pick or rebase is stopped, and a refused
 completion can be retried after an accept.
@@ -191,6 +194,11 @@ stays 6.
   `sc grant <prefix> --to <name>` first) and refuses while a merge, pick or
   rebase is stopped (accept, or abort the operation). A writer with a higher
   epoch can add the key back after a revoke.
+- **A revoke made in another clone does not remove this clone's acceptance.**
+  If Alice revokes Mallory, Bob's clone still accepts Mallory for that scope,
+  and a later re-grant of Mallory at a higher epoch is sealed to without a
+  prompt. Recording the grant epoch with each `path:` pair would close it
+  (deferred).
 - **`sc work` discards a refused agent's work.** Its harvest error is reported
   per workspace, but the temporary checkouts go with the session. Accept the
   keys first (`sc policy accept`); `sc ws` workspaces persist and can retry.

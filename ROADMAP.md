@@ -955,7 +955,9 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
   an allowed name (`sc verify --require` before `sc run` is the mitigation);
   (4) `sc policy status` and `sc policy accept --all`; (5) a refused `sc work`
   harvest discards the agent's checkout with the session (a preflight that
-  refuses to start would avoid it).
+  refuses to start would avoid it); (6) record the grant epoch with each
+  `path:` pair, so a revoke made in another clone, followed by a re-grant at a
+  higher epoch, is not sealed to on the strength of an old acceptance.
 - **Leases (P36a follow-on).** The only cross-writer coordination today is
   the manifest's compare-and-swap; there is no lease/TTL primitive for
   operations that need to hold exclusive intent across more than one bucket

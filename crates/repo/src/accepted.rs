@@ -101,15 +101,14 @@ impl Unaccepted {
         ))
     }
 
-    /// The command that removes the recipient from the repository data, flags
-    /// first and the target after `--` when it starts with `-`. `None` when the
-    /// scope holds control characters.
+    /// The command that removes the recipient from the repository data: flags
+    /// first, then `--`, then the target, so a target that starts with `-` is
+    /// not read as a flag. `None` when the scope holds control characters.
     pub fn remove_command(&self) -> Option<String> {
         if !self.scope_is_plain() {
             return None;
         }
         let (kind, target) = self.scope.split_once(':').unwrap_or(("", &self.scope));
-        let target = sh_quote(target);
         let (head, flags) = match kind {
             "path" => ("sc revoke", format!("--recipient-id {}", self.id)),
             "secret" => ("sc secret revoke", format!("--recipient-id {}", self.id)),
@@ -118,11 +117,7 @@ impl Unaccepted {
                 format!("--recipient-id {} --identity <key>", self.id),
             ),
         };
-        Some(if target.starts_with('-') {
-            format!("{head} {flags} -- {target}")
-        } else {
-            format!("{head} {target} {flags}")
-        })
+        Some(format!("{head} {flags} -- {}", sh_quote(target)))
     }
 
     /// Where to look at a scope that has no safe command.
@@ -147,7 +142,8 @@ impl Unaccepted {
     }
 }
 
-/// Quote `s` for a POSIX shell unless it is plainly safe.
+/// Quote `s` for a POSIX shell unless it is plainly safe. The `'\''` escape is
+/// POSIX only; PowerShell and cmd.exe quote differently and are not handled.
 fn sh_quote(s: &str) -> String {
     if !s.is_empty()
         && s.chars()
@@ -600,7 +596,7 @@ mod tests {
             text.contains(&format!(
                 "sc policy accept path:secret/sub/ --key {} --allow-unknown",
                 w.atk.to_key_string()
-            )) && text.contains(&format!("sc revoke secret/sub/ --recipient-id {atk_id}"))
+            )) && text.contains(&format!("sc revoke --recipient-id {atk_id} -- secret/sub/"))
                 && text.contains("(UNKNOWN)")
                 && text.contains("Nothing was written."),
             "{text}"
@@ -709,7 +705,7 @@ mod tests {
         assert!(pairs[0]
             .remove_command()
             .unwrap()
-            .starts_with("sc secret revoke API_TOKEN --recipient-id"));
+            .starts_with("sc secret revoke --recipient-id"));
 
         let report = v.rewrap(&vsk, &[], &both, false).unwrap();
         assert_eq!(report.secrets_rewrapped, vec!["OTHER".to_string()]);
@@ -1223,9 +1219,10 @@ mod tests {
         assert!(plain.accept_command().is_some() && plain.remove_command().is_some());
     }
 
-    // A target that starts with `-` goes after `--`, flags first.
+    // The target always goes after the flags and `--`, so one that starts with
+    // `-` is not read as a flag.
     #[test]
-    fn a_remove_command_puts_a_dashed_target_after_the_flags() {
+    fn a_remove_command_puts_the_target_after_the_flags() {
         let id = "0".repeat(32);
         let at = |scope: &str| {
             Unaccepted {
@@ -1249,7 +1246,64 @@ mod tests {
             at("branch:-b"),
             format!("sc branch revoke --recipient-id {id} --identity <key> -- -b")
         );
-        assert_eq!(at("path:x/"), format!("sc revoke x/ --recipient-id {id}"));
+        assert_eq!(
+            at("path:x/"),
+            format!("sc revoke --recipient-id {id} -- x/")
+        );
+    }
+
+    // The record's integrity does not rest on this change alone: a tree that
+    // carries `.sc/accepted-recipients` or `.sc/recipients.toml` (the escrow
+    // list also counts as accepted) must not be able to write them on clone.
+    // That is the working-tree path guard's job (PR #367).
+    #[test]
+    #[ignore = "needs PR #367"]
+    fn a_cloned_tree_cannot_plant_the_record_or_the_recipients_file() {
+        for (i, planted) in [".sc/accepted-recipients", ".sc/recipients.toml"]
+            .into_iter()
+            .enumerate()
+        {
+            let s_root = dir(&format!("plant-s{i}"));
+            let c_root = dir(&format!("plant-c{i}"));
+            std::fs::remove_dir_all(&c_root).unwrap();
+            let src = Repo::init(&s_root).unwrap();
+            put(&s_root, "readme.txt", "hello\n");
+            let tip = src.commit("me", "base").unwrap();
+            let snap = src.snapshot(&tip).unwrap();
+            let root = src
+                .vfs()
+                .write_tree_with_perms(&[
+                    (
+                        "readme.txt".to_string(),
+                        b"hello\n".to_vec(),
+                        scl_core::FileMode::FILE,
+                        0,
+                    ),
+                    (
+                        planted.to_string(),
+                        b"planted".to_vec(),
+                        scl_core::FileMode::FILE,
+                        0,
+                    ),
+                ])
+                .unwrap();
+            src.commit_snapshot(root, vec![tip], snap.secrets, snap.protection, "w", "plant")
+                .unwrap();
+            drop(src);
+
+            let cloned = Repo::clone_to(&s_root, &c_root);
+            assert!(
+                cloned.is_err(),
+                "a clone of a tree holding {planted} succeeded"
+            );
+            assert!(
+                !c_root.join(planted).exists(),
+                "{planted} was written by a checkout"
+            );
+            drop(cloned);
+            let _ = std::fs::remove_dir_all(s_root);
+            let _ = std::fs::remove_dir_all(c_root);
+        }
     }
 
     // An unreadable record blocks a seal, not a commit that wraps nothing.

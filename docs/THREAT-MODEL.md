@@ -159,10 +159,14 @@ too, not just the src-control-side metadata.
   ciphertext is not bound to its path, so a file relocated under an accepted
   prefix can gain recipients through that prefix's rewrap (a format change,
   deferred). A spurious reseal of unchanged content (a lost cache) is a seal and
-  refuses like any other. The printed revoke command can itself refuse (`sc revoke`
-  will not remove a rule's last recipient, and will not run while a merge, pick or
-  rebase is stopped), and a refused `sc work` harvest discards that agent's
-  temporary checkout with the session; accept first, or use `sc ws`.
+  refuses like any other. A revoke made in another clone does not remove this
+  clone's acceptance: if Alice revokes Mallory, Bob's clone still accepts her, and
+  a later re-grant at a higher epoch is sealed to without a prompt (recording the
+  grant epoch with each `path:` pair would close it; deferred). The printed
+  revoke command can itself refuse (`sc revoke` will not remove a rule's last
+  recipient, and will not run while a merge, pick or rebase is stopped), and a
+  refused `sc work` harvest discards that agent's temporary checkout with the
+  session; accept first, or use `sc ws`.
 - **Local cache key, `sc keygen` identity and TLS serve key are owner-only on
   unix and Windows (P33, #214, #281):** the
   unchanged-detection cache is keyed by `.sc/local-key`, created owner-only from
