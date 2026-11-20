@@ -501,6 +501,16 @@ too, not just the src-control-side metadata.
   unchanged; the diagnostic text is now sent raw (not as escaped `Display`
   output) and without the doubled prefix `Protocol` and `Remote` used to carry,
   and is escaped only when displayed. Paths are not escaped.
+- **The server enforces fast-forward and ref-target kind, not just the client.**
+  `UpdateRef` (every transport, local-path pushes and `sc serve --store`
+  included) is checked under the remote's own lock: the new tip must be a held
+  snapshot or private-branch manifest, and an existing branch's tip must be an
+  ancestor of it (a manifest's ancestry is its `prev` chain plus its base).
+  A writer therefore cannot rewind or sideways-move a branch, or point one at
+  an absent object or a blob, whatever its client does; an ancestry walk that
+  hits an object the repository does not hold fails closed. Write access can
+  still add history and fast-forward any branch, so it stays full authority
+  over new commits.
 
 ## Bucket remotes (`sc+wal://` / `sc+s3://`) — ADR-0046/0057
 
@@ -513,8 +523,9 @@ too, not just the src-control-side metadata.
 - **Write access is full authority over refs and history.** Anyone who can
   write to the bucket's manifest key can move any branch to any commit —
   fast-forward-only enforcement (the manifest compare-and-swap plus the
-  `Error::NonFastForward` check) is **cooperative**, honored by the `sc`
-  client, not cryptographically enforced by the bucket. A writer with raw
+  `Error::NonFastForward` check) is **cooperative** for a writer that talks to
+  the bucket directly (a served `--store` instance enforces it, see Network
+  transport), not cryptographically enforced by the bucket. A writer with raw
   bucket access (outside the `sc` client) can bypass it entirely, the same
   way a user with raw filesystem access to a git bare repo can force-move a
   ref underneath git's own client-side checks. Scope bucket write credentials

@@ -747,6 +747,19 @@ impl Transport for LocalTransport {
         if current.as_ref() != expected_old {
             return Err(Error::NonFastForward);
         }
+        // The pushing client checks fast-forward too, but a writer need not be
+        // our client: enforce it here, under the lock.
+        {
+            let mut store = self.store.borrow_mut();
+            crate::merge::check_ref_move(current, *id, |o| {
+                if !store.contains(o) {
+                    return Err(Error::InvalidArgument(format!(
+                        "object {o} is not a snapshot or manifest held here, so the ref update cannot be verified"
+                    )));
+                }
+                crate::merge::commit_parents(o, store.get(o)?)
+            })?;
+        }
         crate::refs::write_branch_tip(&self.layout, branch, id)
     }
 
@@ -965,11 +978,74 @@ mod tests {
             Err(Error::CorruptObject(_))
         ));
 
-        t.update_ref("main", &id, None).unwrap();
-        assert_eq!(t.list_refs().unwrap(), vec![("main".to_string(), id)]);
+        let tip = put_commit(&t, "tip", None);
+        t.update_ref("main", &tip, None).unwrap();
+        assert_eq!(t.list_refs().unwrap(), vec![("main".to_string(), tip)]);
         assert_eq!(t.head_branch().unwrap(), "main");
 
         std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    /// Store a stand-in snapshot (see `fake_commit`) and return its id.
+    fn put_commit(t: &LocalTransport, tag: &str, parent: Option<ObjectId>) -> ObjectId {
+        let o = crate::test_support::fake_commit(tag, parent);
+        t.put_object(&o.id(), &o.encode()).unwrap();
+        o.id()
+    }
+
+    /// The server, not the pushing client, enforces fast-forward and the
+    /// target's kind: a writer with a ref-update verb must not be able to
+    /// rewind or sideways-move a branch, or point it at something that is not
+    /// a held snapshot (which would break clone, fetch and gc for everyone).
+    #[test]
+    fn update_ref_enforces_fast_forward_and_target_kind() {
+        let layout = tmp_remote("ff");
+        let t = LocalTransport::open(&layout.root).unwrap();
+        let c1 = put_commit(&t, "c1", None);
+        let c2 = put_commit(&t, "c2", Some(c1));
+        let c3 = put_commit(&t, "c3", Some(c2));
+        let unrelated = put_commit(&t, "unrelated", None);
+        let blob = Object::blob(b"a blob".to_vec());
+        t.put_object(&blob.id(), &blob.encode()).unwrap();
+        let absent = Object::blob(b"never stored".to_vec()).id();
+        let tip_is = |want: ObjectId| {
+            assert_eq!(t.list_refs().unwrap(), vec![("main".to_string(), want)]);
+        };
+
+        // Creation to a held snapshot; a fast-forward over more than one step.
+        t.update_ref("main", &c1, None).unwrap();
+        t.update_ref("main", &c3, Some(&c1)).unwrap();
+        tip_is(c3);
+
+        // Rewind and sideways moves are refused even with a correct
+        // expected_old, and nothing moves.
+        for target in [c1, c2, unrelated] {
+            assert!(
+                matches!(
+                    t.update_ref("main", &target, Some(&c3)),
+                    Err(Error::NonFastForward)
+                ),
+                "{target} must be refused"
+            );
+            tip_is(c3);
+        }
+
+        // An absent object, a blob, and a blob as a branch creation.
+        assert!(t.update_ref("main", &absent, Some(&c3)).is_err());
+        assert!(matches!(
+            t.update_ref("main", &blob.id(), Some(&c3)),
+            Err(Error::BadRef(_))
+        ));
+        assert!(t.update_ref("fresh", &absent, None).is_err());
+        assert!(matches!(
+            t.update_ref("fresh", &blob.id(), None),
+            Err(Error::BadRef(_))
+        ));
+        tip_is(c3);
+
+        // A new branch may point at any held snapshot, and an unrelated one
+        // is a fresh history, not a sideways move.
+        t.update_ref("fresh", &unrelated, None).unwrap();
     }
 
     #[test]
@@ -979,9 +1055,9 @@ mod tests {
         // the second writer fails instead of silently clobbering the first.
         let layout = tmp_remote("cas");
         let t = LocalTransport::open(&layout.root).unwrap();
-        let c1 = Object::blob(b"c1".to_vec()).id();
-        let c2 = Object::blob(b"c2".to_vec()).id();
-        let c3 = Object::blob(b"c3".to_vec()).id();
+        let c1 = put_commit(&t, "c1", None);
+        let c2 = put_commit(&t, "c2", Some(c1));
+        let c3 = put_commit(&t, "c3", Some(c1));
 
         // Create: expected None means "branch must not exist".
         t.update_ref("main", &c1, None).unwrap();
@@ -1301,6 +1377,11 @@ mod tests {
         repo.branch("other").unwrap();
         std::fs::write(root.join("x.txt"), b"a\nMAIN\nc\n").unwrap();
         let main_tip = repo.commit("t", "main").unwrap();
+        // A descendant of main's tip, which is what a legitimate push brings.
+        repo.branch("ahead").unwrap();
+        repo.switch("ahead").unwrap();
+        std::fs::write(root.join("y.txt"), b"y\n").unwrap();
+        let pushed = repo.commit("t", "ahead").unwrap();
         repo.switch("other").unwrap();
         std::fs::write(root.join("x.txt"), b"a\nOTHER\nc\n").unwrap();
         repo.commit("t", "other").unwrap();
@@ -1313,7 +1394,6 @@ mod tests {
         drop(repo);
 
         let t = LocalTransport::open(&root).unwrap();
-        let pushed = Object::blob(b"pushed".to_vec()).id();
         // The checked-out branch: refused, and nothing moved.
         assert!(matches!(
             t.update_ref("main", &pushed, Some(&main_tip)),

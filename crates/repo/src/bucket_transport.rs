@@ -74,6 +74,12 @@ pub struct BucketTransport {
     /// (possibly long-lived, e.g. `wire::serve`-hosted) transport regardless
     /// of whether this call succeeds or fails.
     pending_packs: RefCell<Vec<String>>,
+    /// Parents of every snapshot and manifest received since the last
+    /// `update_ref`, which is not yet on the manifest chain and so not in
+    /// `view.index`; lets `update_ref` check fast-forward over objects that
+    /// are only in a pending pack. Taken, like `pending_packs`, at the top of
+    /// each `update_ref`.
+    pending_commits: RefCell<BTreeMap<ObjectId, Vec<ObjectId>>>,
     /// Signature and transcript objects found in each scanned pack, keyed by
     /// pack hash (#229). Packs are immutable, so an entry never goes stale;
     /// it spares a long-lived `serve --store` session from re-reading every
@@ -233,6 +239,7 @@ impl BucketTransport {
             pack_cache: RefCell::new(None),
             staged: RefCell::new(Vec::new()),
             pending_packs: RefCell::new(Vec::new()),
+            pending_commits: RefCell::new(BTreeMap::new()),
             leaf_cache: RefCell::new(BTreeMap::new()),
             saw_absent: Cell::new(false),
             attempt_tag: RefCell::new(None),
@@ -675,6 +682,17 @@ impl crate::reachable::ObjectSource for BucketSource<'_> {
     }
 }
 
+/// The parents of `obj` if it is a snapshot or a manifest (what `update_ref`
+/// may point a branch at), else `None`.
+fn commit_parents_of(id: &ObjectId, obj: &Object) -> Option<Vec<ObjectId>> {
+    match obj {
+        Object::Snapshot(_) | Object::Manifest(_) => {
+            crate::merge::commit_parents(id, obj.clone()).ok()
+        }
+        _ => None,
+    }
+}
+
 /// Attempts `update_ref` makes at the manifest CAS before it gives up (the
 /// documented "rerun the push" outcome).
 const MAX_CAS_RETRIES: u32 = 16;
@@ -775,6 +793,9 @@ impl Transport for BucketTransport {
         if ObjectId::of(bytes) != *id {
             return Err(Error::CorruptObject(*id));
         }
+        if let Some(parents) = commit_parents_of(id, &Object::decode(bytes)?) {
+            self.pending_commits.borrow_mut().insert(*id, parents);
+        }
         self.staged.borrow_mut().push((*id, bytes.to_vec()));
         Ok(())
     }
@@ -787,12 +808,18 @@ impl Transport for BucketTransport {
         // pinned byte-stable for a given object set (core), so the rebuilt
         // pack still content-addresses identically for identical input.
         let mut objects: Vec<(ObjectId, Vec<u8>)> = Vec::new();
+        let mut commits = BTreeMap::new();
         scl_core::pack::parse_pack_reader(src, |id, obj| {
+            if let Some(parents) = commit_parents_of(&id, &obj) {
+                commits.insert(id, parents);
+            }
             objects.push((id, obj.encode()));
             Ok(())
         })?;
         let (hash, ids) = self.upload_pack(&objects)?;
         self.pending_packs.borrow_mut().push(hash);
+        // Only after the upload: a failed one must not leave ids that no pack holds.
+        self.pending_commits.borrow_mut().extend(commits);
         Ok(ids)
     }
 
@@ -821,6 +848,7 @@ impl Transport for BucketTransport {
         // the bucket regardless (content-addressed, inert orphan garbage if
         // never referenced — correct per spec; `compact` sweeps it later, ADR-0057).
         let pending: Vec<String> = std::mem::take(&mut *self.pending_packs.borrow_mut());
+        let pending_commits = std::mem::take(&mut *self.pending_commits.borrow_mut());
         for attempt in 0..MAX_CAS_RETRIES {
             if attempt > 0 {
                 std::thread::sleep(cas_backoff(attempt));
@@ -848,6 +876,27 @@ impl Transport for BucketTransport {
             if current.as_ref() != expected_old {
                 return Err(Error::NonFastForward);
             }
+            // The pushing client checks fast-forward too, but a writer need not
+            // be our client (`sc serve --store`, or a direct bucket writer):
+            // refuse a rewind, a sideways move, or a target that is absent or
+            // not a snapshot or manifest. Objects only in a pending pack are
+            // not in the view yet, so their parents come from `pending_commits`.
+            crate::merge::check_ref_move(current, *id, |o| {
+                if let Some(parents) = pending_commits.get(o) {
+                    return Ok(parents.clone());
+                }
+                let on_chain = self
+                    .view
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|v| v.index.contains_key(o));
+                if !on_chain {
+                    return Err(Error::InvalidArgument(format!(
+                        "object {o} is not a snapshot or manifest held here, so the ref update cannot be verified"
+                    )));
+                }
+                crate::merge::commit_parents(o, Object::decode(&self.object_bytes(o)?)?)
+            })?;
             // Claim a log slot for this attempt. `put_new` on `log/<seq>` is
             // the claim: if another writer already landed that seq, we didn't
             // win it and try the next one — the entry we didn't win becomes
@@ -932,6 +981,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::test_support::fake_commit;
     use crate::transport::Transport;
     use crate::walfmt::{
         checkpoint_key, idx_key, log_key, pack_key, Checkpoint, LogEntry, Manifest, RefUpdate,
@@ -1179,6 +1229,64 @@ mod tests {
         assert!(!broot.exists());
     }
 
+    /// `sc serve --store` and direct bucket writers get the same server-side
+    /// rule as `LocalTransport`: no rewind, no sideways move, and a target that
+    /// is a held snapshot (including one only in the pending pack).
+    #[test]
+    fn update_ref_enforces_fast_forward_and_target_kind() {
+        let broot = std::env::temp_dir().join(format!("scl-bt-ff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&broot);
+        let t = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        let put = |c: &Object| t.put_object(&c.id(), &c.encode()).unwrap();
+        let c1 = fake_commit("c1", None);
+        let c2 = fake_commit("c2", Some(c1.id()));
+        let c3 = fake_commit("c3", Some(c2.id()));
+        let unrelated = fake_commit("unrelated", None);
+        let blob = Object::blob(b"a blob".to_vec());
+        let absent = ObjectId::of(b"never stored");
+
+        // Creation, then a two-step fast-forward whose objects are all pending.
+        put(&c1);
+        t.update_ref("main", &c1.id(), None).unwrap();
+        put(&c2);
+        put(&c3);
+        t.update_ref("main", &c3.id(), Some(&c1.id())).unwrap();
+        let tip_is = |want: ObjectId| {
+            assert_eq!(t.list_refs().unwrap(), vec![("main".to_string(), want)]);
+        };
+        tip_is(c3.id());
+
+        // Each refused call takes the pending pack with it, so stage the
+        // pending-only objects (an unrelated snapshot, a blob) again before it.
+        let stage = || {
+            put(&unrelated);
+            put(&blob);
+        };
+        // Rewind and sideways moves: on-chain targets and a pending one.
+        for target in [c1.id(), c2.id(), unrelated.id()] {
+            stage();
+            assert!(
+                matches!(
+                    t.update_ref("main", &target, Some(&c3.id())),
+                    Err(Error::NonFastForward)
+                ),
+                "{target} must be refused"
+            );
+            tip_is(c3.id());
+        }
+        // Absent and wrong-kind targets, for an existing branch and a new one.
+        for branch in ["main", "fresh"] {
+            let old = (branch == "main").then(|| c3.id());
+            for target in [absent, blob.id()] {
+                stage();
+                assert!(t.update_ref(branch, &target, old.as_ref()).is_err());
+            }
+        }
+        tip_is(c3.id());
+        drop(t);
+        std::fs::remove_dir_all(&broot).unwrap();
+    }
+
     #[test]
     fn put_object_stages_and_update_ref_commits_them() {
         let broot = std::env::temp_dir().join(format!("scl-bt-stage-{}", std::process::id()));
@@ -1348,7 +1456,7 @@ mod tests {
         // racer-b's thread is even scheduled, and the (1, 1) result below
         // would hold trivially with the manifest CAS never actually contended.
         let mk_tip = |tag: &[u8]| {
-            let obj = Object::blob(tag.to_vec()); // any distinct object works as a fake tip
+            let obj = fake_commit(std::str::from_utf8(tag).unwrap(), Some(base));
             (obj.id(), obj.encode())
         };
         let gate = std::sync::Barrier::new(2);
@@ -1428,7 +1536,7 @@ mod tests {
                             DirBucket::open(&broot).unwrap(),
                         ))
                         .unwrap();
-                        let obj = Object::blob(format!("agent-{i}").into_bytes());
+                        let obj = fake_commit(&format!("agent-{i}"), None);
                         t.put_object(&obj.id(), &obj.encode()).unwrap();
                         note(status, format!("writer-{i:03}"), "at the gate".into());
                         gate.wait();
@@ -1530,7 +1638,7 @@ mod tests {
                 lost: AtomicU32::new(0),
             }))
             .unwrap();
-            let obj = Object::blob(b"budget".to_vec());
+            let obj = fake_commit("budget", None);
             t.put_object(&obj.id(), &obj.encode()).unwrap();
             let res = t.update_ref("main", &obj.id(), None);
             if lands {
@@ -1611,7 +1719,7 @@ mod tests {
         assert_eq!(t2.list_refs().unwrap(), vec![("main".to_string(), tip)]);
         assert!(!t2.has_object(&orphan_obj.id()).unwrap());
         // …and a live push steps over the claimed seq 2 (lands at 3+) and works.
-        let next = Object::blob(b"after crash".to_vec());
+        let next = fake_commit("after crash", None);
         t2.put_object(&next.id(), &next.encode()).unwrap();
         t2.update_ref("recovered", &next.id(), None).unwrap();
         let t3 = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
@@ -1933,7 +2041,7 @@ mod tests {
             .unwrap();
 
         let t = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
-        let obj = Object::blob(b"carry-push".to_vec());
+        let obj = fake_commit("carry-push", None);
         let (tip, bytes) = (obj.id(), obj.encode());
         t.put_object(&tip, &bytes).unwrap();
         t.update_ref("carried", &tip, None).unwrap();
@@ -1960,7 +2068,7 @@ mod tests {
         let t = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
         let n = CHECKPOINT_INTERVAL + 2;
         for i in 0..n {
-            let obj = Object::blob(format!("fold-{i}").into_bytes());
+            let obj = fake_commit(&format!("fold-{i}"), None);
             t.put_object(&obj.id(), &obj.encode()).unwrap();
             t.update_ref(&format!("w-{i}"), &obj.id(), None).unwrap();
         }
@@ -2037,7 +2145,7 @@ mod tests {
         )))
         .unwrap();
         for i in 0..(CHECKPOINT_INTERVAL + 2) {
-            let obj = Object::blob(format!("foldfail-{i}").into_bytes());
+            let obj = fake_commit(&format!("foldfail-{i}"), None);
             t.put_object(&obj.id(), &obj.encode()).unwrap();
             t.update_ref(&format!("w-{i}"), &obj.id(), None).unwrap(); // must all be Ok
         }

@@ -2749,6 +2749,42 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// The receiving side enforces fast-forward over the manifest chain too
+    /// (`prev` plus base): a first push, a commit and a grant (each a new
+    /// manifest chained to the last) all land, and a rolled-back manifest is
+    /// refused by the server even when the caller names the right old tip.
+    #[test]
+    fn private_branch_pushes_fast_forward_on_the_server() {
+        use crate::transport::{LocalTransport, Transport};
+        let (root, repo, (alice_sk, _), (_, bob_pk)) = setup("pushff");
+        let dst = tmp_root("pushff-dst");
+        drop(Repo::init(&dst).unwrap());
+        repo.remote_add("origin", dst.to_str().unwrap()).unwrap();
+        repo.branch_private("fix", &alice_sk, &[], &[]).unwrap();
+        let (m1, _) = repo.branch_manifest("fix").unwrap().unwrap();
+        repo.switch_with_identity("fix", Some(&alice_sk)).unwrap();
+        repo.push("origin").unwrap();
+
+        write(&root, "fix.txt", "v1\n");
+        repo.commit_private("alice", "c1", Some(&alice_sk)).unwrap();
+        repo.push("origin").unwrap();
+        repo.branch_grant("fix", &alice_sk, &bob_pk).unwrap();
+        let (m3, _) = repo.branch_manifest("fix").unwrap().unwrap();
+        repo.push("origin").unwrap();
+
+        let remote = LocalTransport::open(&dst).unwrap();
+        assert_eq!(remote.list_refs().unwrap(), vec![("fix".to_string(), m3)]);
+        assert!(matches!(
+            remote.update_ref("fix", &m1, Some(&m3)),
+            Err(Error::NonFastForward)
+        ));
+        drop(remote);
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&dst).unwrap();
+    }
+
     #[test]
     fn protected_paths_survive_a_private_round_trip() {
         let (root, repo, (alice_sk, alice_pk), _bob) = setup("protpath");

@@ -57,6 +57,19 @@ pub fn is_ancestor(store: &mut Store, anc: ObjectId, desc: ObjectId) -> Result<b
     Ok(ancestors(store, desc)?.contains(&anc))
 }
 
+/// Parents of a snapshot, or of a branch manifest (its `prev` chain plus its
+/// public base); any other kind is refused.
+pub(crate) fn commit_parents(id: &ObjectId, obj: Object) -> Result<Vec<ObjectId>> {
+    match obj {
+        Object::Snapshot(s) => Ok(s.parents),
+        Object::Manifest(m) => Ok(m.prev.into_iter().chain(std::iter::once(m.base)).collect()),
+        other => Err(Error::BadRef(format!(
+            "expected snapshot or manifest at {id}, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
 /// All ancestors of `id`, inclusive. Kind-aware: snapshots contribute their
 /// parents, branch manifests their `prev` chain + public base.
 fn ancestors(store: &mut Store, id: ObjectId) -> Result<BTreeSet<ObjectId>> {
@@ -65,23 +78,43 @@ fn ancestors(store: &mut Store, id: ObjectId) -> Result<BTreeSet<ObjectId>> {
     q.push_back(id);
     set.insert(id);
     while let Some(cur) = q.pop_front() {
-        let parents: Vec<ObjectId> = match store.get(&cur)? {
-            Object::Snapshot(s) => s.parents,
-            Object::Manifest(m) => m.prev.into_iter().chain(std::iter::once(m.base)).collect(),
-            other => {
-                return Err(Error::BadRef(format!(
-                    "expected snapshot or manifest at {cur}, found {}",
-                    other.kind_name()
-                )))
-            }
-        };
-        for p in parents {
+        for p in commit_parents(&cur, store.get(&cur)?)? {
             if set.insert(p) {
                 q.push_back(p);
             }
         }
     }
     Ok(set)
+}
+
+/// The rule every ref-serving [`crate::transport::Transport::update_ref`]
+/// applies under its own lock, so a writer cannot rewind or sideways-move a
+/// branch, or point one at an absent object or a non-commit: `new` must be a
+/// snapshot or manifest, and when the branch exists (`current`) it must be an
+/// ancestor of `new` (the same ancestry as [`is_ancestor`]). `parents_of` reads
+/// one object's parents and must fail for an absent or wrong-kind object, so
+/// an ancestry walk that hits a gap (partial clone) fails closed.
+pub(crate) fn check_ref_move(
+    current: Option<ObjectId>,
+    new: ObjectId,
+    mut parents_of: impl FnMut(&ObjectId) -> Result<Vec<ObjectId>>,
+) -> Result<()> {
+    let Some(cur) = current else {
+        return parents_of(&new).map(|_| ());
+    };
+    let mut seen = BTreeSet::from([new]);
+    let mut q = VecDeque::from([new]);
+    while let Some(id) = q.pop_front() {
+        for p in parents_of(&id)? {
+            if p == cur {
+                return Ok(());
+            }
+            if seen.insert(p) {
+                q.push_back(p);
+            }
+        }
+    }
+    Err(Error::NonFastForward)
 }
 
 /// One merged file in a `FileMerge` working set.

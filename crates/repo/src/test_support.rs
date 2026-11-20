@@ -56,6 +56,21 @@ pub(crate) fn watchdog<'a>(
     });
 }
 
+/// A tiny snapshot with no tree behind it, distinct per `tag`: a stand-in tip
+/// for transport tests that move refs without building a repository. A
+/// `parent` makes it a descendant, so a move to it is a fast-forward.
+pub(crate) fn fake_commit(tag: &str, parent: Option<scl_core::ObjectId>) -> scl_core::Object {
+    scl_core::Object::Snapshot(scl_core::Snapshot {
+        root: scl_core::ObjectId::of(tag.as_bytes()),
+        parents: parent.into_iter().collect(),
+        author: "t".into(),
+        timestamp: 0,
+        message: tag.into(),
+        secrets: Default::default(),
+        protection: Default::default(),
+    })
+}
+
 /// Windows: assert `path` carries exactly one explicit, non-inherited
 /// full-control ACE for the current user, read back with `icacls`.
 #[cfg(windows)]
