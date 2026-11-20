@@ -271,6 +271,15 @@ impl Repo {
                         _ => return Err(Error::NoSuchSecret(format!("{name} is not a secret"))),
                     }
                 };
+                // Re-sealing under the registry key would launder a relabeled
+                // entry into a validly sealed one.
+                if secret.name != name {
+                    return Err(Error::InvalidArgument(format!(
+                        "registry entry {name} points at a secret sealed as {:?}; \
+                         rotate it with --value instead",
+                        secret.name
+                    )));
+                }
                 recovered = scl_crypto::open(&secret, id)?;
                 &recovered[..]
             }
@@ -372,11 +381,17 @@ impl Repo {
         strict: bool,
     ) -> Result<Vec<(String, scl_crypto::Zeroizing<Vec<u8>>)>> {
         // The registry is repository data any writer can edit, so nothing is
-        // decrypted until every entry has a name that may be injected and
-        // points at a secret sealed under that same name.
+        // decrypted until every entry has been vetted. An entry whose name may
+        // not be injected (planted, or registered by an older CLI that took any
+        // name) is skipped with a warning and never opened, so one bad entry
+        // does not block `sc run`; one that points at a secret sealed under a
+        // different name refuses the whole run.
         let mut entries = Vec::new();
         for (name, id) in self.registry()? {
-            check_secret_name(&name)?;
+            if check_secret_name(&name).is_err() {
+                eprintln!("warning: secret name {name:?} is not allowed; skipping");
+                continue;
+            }
             let obj = {
                 let arc = self.store_arc();
                 let o = arc.lock().unwrap().get(&id)?;
@@ -651,10 +666,15 @@ fn feed_pipe(
     }
 }
 
-/// Variables that change how a process loads code or which program runs; a
-/// secret may not be registered or injected under one of these names.
+/// Variables that change how a process loads code, which program runs, or where
+/// a tool reads its config or trust roots; a secret may not be registered or
+/// injected under one of these names. A deny list cannot be complete: the
+/// registry itself is still unauthenticated repository data
+/// (docs/THREAT-MODEL.md). Compared in uppercase (see [`check_secret_name`]).
 const DENIED_NAMES: &[&str] = &[
+    // Shell and program lookup.
     "PATH",
+    "PATHEXT",
     "IFS",
     "ENV",
     "BASH_ENV",
@@ -662,6 +682,32 @@ const DENIED_NAMES: &[&str] = &[
     "BASHOPTS",
     "PS4",
     "PROMPT_COMMAND",
+    "ZDOTDIR",
+    "CDPATH",
+    "SHELL",
+    "COMSPEC",
+    "PSMODULEPATH",
+    // User directories and what the user's tools launch.
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "TMPDIR",
+    "EDITOR",
+    "VISUAL",
+    "PAGER",
+    "BROWSER",
+    "VIMINIT",
+    "EXINIT",
+    // Dynamic loader and libc.
+    "LD",
+    "GCONV_PATH",
+    "GLIBC_TUNABLES",
+    "HOSTALIASES",
+    "LOCALDOMAIN",
+    "RES_OPTIONS",
+    "NLSPATH",
+    // Interpreters.
     "NODE_OPTIONS",
     "NODE_PATH",
     "PYTHONPATH",
@@ -669,55 +715,79 @@ const DENIED_NAMES: &[&str] = &[
     "PYTHONSTARTUP",
     "PYTHONINSPECT",
     "PYTHONUSERBASE",
+    "PYTEST_ADDOPTS",
     "PERL5OPT",
     "PERL5LIB",
     "PERLLIB",
     "RUBYOPT",
     "RUBYLIB",
+    "BUNDLE_GEMFILE",
+    "GEMRC",
+    "PHPRC",
+    "PHP_INI_SCAN_DIR",
     "JAVA_TOOL_OPTIONS",
     "_JAVA_OPTIONS",
     "JDK_JAVA_OPTIONS",
     "CLASSPATH",
+    // Compilers and build tools.
+    "RUSTC",
+    "RUSTDOC",
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
+    "RUSTC_WRAPPER",
+    "CC",
+    "CXX",
+    "AR",
+    "GOFLAGS",
+    "GOPROXY",
+    "GOENV",
+    "GOTOOLCHAIN",
+    "GONOSUMDB",
+    "GOPRIVATE",
+    "MAKEFLAGS",
+    "MFLAGS",
+    "MAKEFILES",
+    "GNUMAKEFLAGS",
+    "CONFIG_SITE",
+    // Git, ssh and other programs a tool spawns.
     "GIT_SSH",
     "GIT_SSH_COMMAND",
     "GIT_EXEC_PATH",
     "GIT_ASKPASS",
     "SSH_ASKPASS",
-    "EDITOR",
-    "VISUAL",
-    "PAGER",
-    "HOME",
-    "SHELL",
-    "TMPDIR",
-    "GCONV_PATH",
-    "GLIBC_TUNABLES",
-    "HOSTALIASES",
-    "LOCALDOMAIN",
-    "RES_OPTIONS",
-    "NLSPATH",
-    "ZDOTDIR",
-    "CDPATH",
-    "BROWSER",
-    "RUSTFLAGS",
-    "RUSTDOCFLAGS",
-    "RUSTC_WRAPPER",
-    "GOFLAGS",
-    "MAKEFLAGS",
-    "MFLAGS",
+    "RSYNC_RSH",
+    "TAR_OPTIONS",
+    "PSQLRC",
+    "MYSQL_HOME",
+    // Network and trust: where a tool connects and whom it trusts.
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "FTP_PROXY",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
+    "CURL_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE",
+    "AWS_CA_BUNDLE",
+    // Cloud and container tooling config.
+    "KUBECONFIG",
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "DOCKER_CONFIG",
+    "DOCKER_HOST",
+    "TF_CLI_CONFIG_FILE",
 ];
 
 /// Prefixes denied for the same reason, plus `SC_` (sc's own knobs, such as
-/// `SC_SSH` and `SC_GIT`). A deny list cannot be complete: it covers the
-/// loader, shell, interpreter and toolchain families; the registry itself is
-/// still unauthenticated repository data (docs/THREAT-MODEL.md).
+/// `SC_SSH` and `SC_GIT`).
 const DENIED_PREFIXES: &[&str] = &[
     "LD_",
     "DYLD_",
+    "MALLOC_",
     "GIT_",
     "SC_",
-    "MALLOC_",
+    "BASH_",
     "PYTHON",
     "PERL",
     "RUBY",
@@ -726,34 +796,44 @@ const DENIED_PREFIXES: &[&str] = &[
     "CARGO_",
     "RUSTC_",
     "JAVA_",
-    "BASH_",
     "NPM_CONFIG_",
+    "XDG_",
+    "OPENSSL_",
+    "DOTNET_",
+    "CORECLR_",
+    "COR_",
+    "GEM_",
+    "LUA_",
+    "PIP_",
+    "UV_",
+    "YARN_",
 ];
 
 /// Names a denied prefix would catch but that are ordinary credentials, not
 /// loader or interpreter knobs.
-const ALLOWED_EXCEPTIONS: &[&str] = &["NODE_AUTH_TOKEN", "CARGO_REGISTRY_TOKEN"];
+const ALLOWED_EXCEPTIONS: &[&str] = &[
+    "NODE_AUTH_TOKEN",
+    "CARGO_REGISTRY_TOKEN",
+    "YARN_NPM_AUTH_TOKEN",
+];
 
-/// Suffixes that name a program a tool runs (`GIT_PAGER`, `SVN_EDITOR`, ...).
-const DENIED_SUFFIXES: &[&str] = &["PAGER", "EDITOR"];
+/// Suffixes that name a program or options a tool runs (`GIT_PAGER`,
+/// `SVN_EDITOR`, `MAVEN_OPTS`, `SUDO_ASKPASS`, ...).
+const DENIED_SUFFIXES: &[&str] = &["PAGER", "EDITOR", "_OPTS", "ASKPASS"];
 
 /// The one secret-name rule: `[A-Za-z_][A-Za-z0-9_]*`, and not a variable that
 /// changes how the child loads code or which program it runs. Applied when a
 /// secret is added and again at injection, because the registry is repository
 /// data a writer can edit without any key (THREAT-MODEL, committed secrets).
-/// Matching is case-sensitive, except on Windows where environment variable
-/// names are not.
+/// Every deny check compares the uppercased name on every platform: some tools
+/// read their variables case-insensitively (`npm_config_*`, `http_proxy`).
 pub(crate) fn check_secret_name(name: &str) -> Result<()> {
     let mut chars = name.chars();
     let shape_ok = chars
         .next()
         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
-    let key = if cfg!(windows) {
-        name.to_ascii_uppercase()
-    } else {
-        name.to_string()
-    };
+    let key = name.to_ascii_uppercase();
     if !shape_ok
         || DENIED_NAMES.contains(&key.as_str())
         || (DENIED_PREFIXES.iter().any(|p| key.starts_with(p))
@@ -762,8 +842,9 @@ pub(crate) fn check_secret_name(name: &str) -> Result<()> {
     {
         return Err(Error::InvalidArgument(format!(
             "secret name {name:?} is not allowed: use [A-Za-z_][A-Za-z0-9_]* and not a \
-             variable that changes how a process loads code or which program runs \
-             (PATH, LD_*, DYLD_*, GIT_*, NODE_*, PYTHON*, *PAGER, *EDITOR, SC_*, ...)"
+             variable that changes how a process loads code or which program runs, in any \
+             letter case (PATH, LD_*, DYLD_*, GIT_*, NODE_*, PYTHON*, *_OPTS, *PAGER, \
+             *EDITOR, SC_*, proxy and CA-bundle variables, ...)"
         )));
     }
     Ok(())
@@ -1195,6 +1276,25 @@ mod tests {
             "PYTHONWARNINGS",
             "MALLOC_CONF",
             "SVN_EDITOR",
+            // Case-insensitive: tools read these in any case.
+            "npm_config_script_shell",
+            "http_proxy",
+            "ld_preload",
+            "Path",
+            "node_options",
+            // Newer families.
+            "RUSTC",
+            "CC",
+            "LD",
+            "KUBECONFIG",
+            "HTTPS_PROXY",
+            "XDG_CONFIG_HOME",
+            "OPENSSL_CONF",
+            "PIP_INDEX_URL",
+            "UV_INDEX_URL",
+            "YARN_RC_FILENAME",
+            "MAVEN_OPTS",
+            "SUDO_ASKPASS",
             "a-b",
             "1X",
             "",
@@ -1215,37 +1315,81 @@ mod tests {
             .unwrap();
         repo.secret_add("NODE_AUTH_TOKEN", b"v", std::slice::from_ref(&pk))
             .unwrap();
-        repo.secret_add("GITHUB_TOKEN", b"v", std::slice::from_ref(&pk))
-            .unwrap();
+        for ok in [
+            "GITHUB_TOKEN",
+            "YARN_NPM_AUTH_TOKEN",
+            "CARGO_REGISTRY_TOKEN",
+        ] {
+            repo.secret_add(ok, b"v", std::slice::from_ref(&pk))
+                .unwrap();
+        }
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
-    fn injection_refuses_a_planted_denied_name_and_starts_no_child() {
+    fn injection_skips_a_planted_or_legacy_bad_name_and_never_opens_it() {
         let root = tmp_root("planted");
         let (sk, pk) = scl_crypto::generate_keypair();
+        let (_other_sk, other_pk) = scl_crypto::generate_keypair();
         let repo = Repo::init(&root).unwrap();
         repo.secret_add("DB_URL", b"v", std::slice::from_ref(&pk))
             .unwrap();
-        plant(&repo, "LD_PRELOAD", "LD_PRELOAD", b"/tmp/evil.so", &pk);
+        // Sealed to someone else: strict mode would fail with "not a
+        // recipient" if injection tried to open any of these.
+        for bad in ["LD_PRELOAD", "npm_config_script_shell", "db-pass"] {
+            plant(&repo, bad, bad, b"/tmp/evil", &other_pk);
+        }
 
+        for strict in [true, false] {
+            let values = repo.secret_values(&sk, strict).unwrap();
+            let names: Vec<&str> = values.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(names, ["DB_URL"], "strict={strict}");
+        }
         let marker = root.join("child-ran");
         let cmd = [
             "sh".to_string(),
             "-c".to_string(),
-            format!("touch {}", marker.display()),
+            format!(
+                "test -z \"$LD_PRELOAD\" && test -z \"$npm_config_script_shell\" \
+                 && test \"$DB_URL\" = v && touch {}",
+                marker.display()
+            ),
         ];
-        let err = repo.run(&sk, &cmd).unwrap_err();
-        assert!(err.to_string().contains("LD_PRELOAD"), "{err}");
-        assert!(!marker.exists(), "no child may start");
-        assert!(repo.secret_values(&sk, false).is_err());
-        assert!(repo.secret_env(&sk, true).is_err());
+        assert_eq!(repo.run(&sk, &cmd).unwrap(), 0);
+        assert!(marker.exists(), "the child ran with only the good secret");
         #[cfg(unix)]
         {
-            assert!(repo.run_with_secrets_fd(&sk, &cmd, 3).is_err());
-            assert!(!marker.exists(), "no child may start (fd mode)");
+            // fd mode: the payload on fd 3 holds exactly the one good record.
+            let fd_cmd = [
+                "sh".to_string(),
+                "-c".to_string(),
+                "out=$(tr '\\0' '\\n' <&3); test \"$out\" = DB_URL=v".to_string(),
+            ];
+            assert_eq!(repo.run_with_secrets_fd(&sk, &fd_cmd, 3).unwrap(), 0);
         }
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rotate_without_value_refuses_a_relabeled_entry() {
+        let root = tmp_root("rot-relabel");
+        let (sk, pk) = scl_crypto::generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        plant(&repo, "A", "B", b"value-of-b", &pk);
+        let err = repo
+            .secret_rotate("A", None, std::slice::from_ref(&pk), Some(&sk))
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+        // The entry is untouched, so injection still refuses it.
+        assert!(repo.secret_values(&sk, false).is_err());
+        // An explicit value is the repair path: sealed afresh under "A".
+        repo.secret_rotate("A", Some(b"fresh"), std::slice::from_ref(&pk), None)
+            .unwrap();
+        let values = repo.secret_values(&sk, false).unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(&values[0].1[..], b"fresh");
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
