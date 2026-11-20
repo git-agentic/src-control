@@ -167,7 +167,12 @@ pub fn list_heads(layout: &Layout) -> Result<Vec<(String, ObjectId)>> {
         if name.contains(".tmp") {
             continue;
         }
-        let text = std::fs::read_to_string(e.path())?;
+        // A ref gone since the directory was read is simply not there.
+        let text = match std::fs::read_to_string(e.path()) {
+            Ok(t) => t,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
         let id = ObjectId::from_str(text.trim())
             .map_err(|_| Error::BadRef(format!("head {name} has bad id")))?;
         out.push((name, id));

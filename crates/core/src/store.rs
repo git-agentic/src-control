@@ -255,6 +255,19 @@ impl Store {
         self.existing_loose_path(id).is_some() || self.pack_index.contains_key(id)
     }
 
+    /// Whether the object is on disk right now, ignoring the resident cache
+    /// and any spill: a loose file, or a pack this store has indexed that
+    /// still exists. A stat per call, so it is cheap enough to confirm each id
+    /// a long check relied on once the repo lock is held (a gc prune can
+    /// delete an unreferenced object a cached read still returns).
+    pub fn contains_on_disk(&self, id: &ObjectId) -> bool {
+        self.existing_loose_path(id).is_some()
+            || self
+                .pack_index
+                .get(id)
+                .is_some_and(|loc| loc.pack_path.is_file())
+    }
+
     /// Return a blob's logical byte length without admitting its contents to
     /// the resident object cache. Persistent payloads are verified while they
     /// are streamed through a fixed-size buffer, allowing callers to enforce

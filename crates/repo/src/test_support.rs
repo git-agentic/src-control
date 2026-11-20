@@ -219,6 +219,27 @@ pub(crate) fn ref_rules_hold<T: crate::transport::Transport>(t: &T) {
         assert!(r.is_err(), "{what} must be refused");
         assert_eq!(tip_of("main"), Some(c2.id()), "{what} moved the ref");
     }
+    // An entry id reused across kinds. `dirx` is a tree whose own file is
+    // absent; naming it as a file in one entry must not make the tree entry
+    // that follows look verified, and a tree entry naming a blob is wrong too.
+    let dirx = tree(&[("gone", EntryKind::Blob, absent_blob.id())]);
+    let reuse = tree(&[
+        ("a", EntryKind::Blob, dirx.id()),
+        ("b", EntryKind::Tree, dirx.id()),
+    ]);
+    let tree_over_blob = tree(&[("a", EntryKind::Tree, b1.id())]);
+    let file_over_tree = tree(&[("a", EntryKind::Blob, dir1.id())]);
+    for (what, objs, root) in [
+        ("file and tree entry share an id", vec![&dirx], &reuse),
+        ("tree entry names a blob", vec![&b1], &tree_over_blob),
+        ("file entry names a tree", vec![&dir1, &b1], &file_over_tree),
+    ] {
+        let c = snap(root.id(), &[c2.id()], what);
+        let mut objs = objs;
+        objs.push(root);
+        assert!(mv(&objs, "main", &c, Some(&c2)).is_err(), "{what}");
+        assert_eq!(tip_of("main"), Some(c2.id()), "{what} moved the ref");
+    }
     // The kind rule answers for the flip itself (the ancestry rules would
     // refuse it too, but as a different error).
     let flip = mv(&[], "main", &m_over_main, Some(&c2)).unwrap_err();

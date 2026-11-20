@@ -680,29 +680,20 @@ impl crate::reachable::ObjectSource for BucketSource<'_> {
     }
 }
 
-/// Objects received but not yet committed to the manifest chain: the structural
-/// ones decoded (the ref rule walks them), every other kind by id only.
+/// Objects received but not yet committed to the manifest chain, as the ref
+/// rule sees them (structure decoded, blobs and the like by kind only).
 #[derive(Default)]
 struct PendingObjects {
     nodes: BTreeMap<ObjectId, crate::ref_guard::Node>,
-    leaves: std::collections::BTreeSet<ObjectId>,
 }
 
 impl PendingObjects {
     fn note(&mut self, id: ObjectId, obj: Object) {
-        match obj {
-            Object::Snapshot(_) | Object::Tree(_) | Object::Manifest(_) => {
-                self.nodes.insert(id, crate::ref_guard::Node::of(obj));
-            }
-            _ => {
-                self.leaves.insert(id);
-            }
-        }
+        self.nodes.insert(id, crate::ref_guard::Node::of(obj));
     }
 
     fn extend(&mut self, other: PendingObjects) {
         self.nodes.extend(other.nodes);
-        self.leaves.extend(other.leaves);
     }
 }
 
@@ -725,9 +716,6 @@ impl crate::ref_guard::RefObjects for RefView<'_> {
         if let Some(n) = self.pending.nodes.get(id) {
             return Ok(Some(n.clone()));
         }
-        if self.pending.leaves.contains(id) {
-            return Ok(Some(crate::ref_guard::Node::Leaf));
-        }
         if !self.on_chain(id) {
             return Ok(None);
         }
@@ -736,9 +724,7 @@ impl crate::ref_guard::RefObjects for RefView<'_> {
     }
 
     fn held(&mut self, id: &ObjectId) -> Result<bool> {
-        Ok(self.pending.nodes.contains_key(id)
-            || self.pending.leaves.contains(id)
-            || self.on_chain(id))
+        Ok(self.pending.nodes.contains_key(id) || self.on_chain(id))
     }
 }
 

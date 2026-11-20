@@ -4,7 +4,6 @@
 
 use std::cell::RefCell;
 use std::io::{Read, Write};
-use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use scl_core::{Object, ObjectId, Store};
@@ -231,26 +230,136 @@ impl LocalTransport {
         &self.layout
     }
 
-    /// The server's own ref-move rule (`ref_guard`), read from a fresh store
-    /// view: this transport's long-lived store can hold an object in its
-    /// resident cache, or an index entry, that `sc gc` has since removed.
-    fn check_ref_move(&self, current: Option<ObjectId>, new: ObjectId) -> Result<()> {
-        struct Fresh(Store);
-        impl crate::ref_guard::RefObjects for Fresh {
-            fn node(&mut self, id: &ObjectId) -> Result<Option<crate::ref_guard::Node>> {
-                if !self.0.contains(id) {
+    /// The server's own ref-move rule (`ref_guard`), judged from the session's
+    /// store without the repo lock (the walk can be long). Returns every object
+    /// the verdict relied on: a cached read can outlive a gc prune, so
+    /// [`LocalTransport::commit_ref_move`] confirms each is still on disk once
+    /// it holds the lock, which gc also takes.
+    fn verify_ref_move(
+        &self,
+        current: Option<ObjectId>,
+        new: ObjectId,
+    ) -> Result<std::collections::BTreeSet<ObjectId>> {
+        use crate::ref_guard::{Node, RefObjects};
+        struct Session<'a> {
+            store: &'a mut Store,
+            relied_on: std::collections::BTreeSet<ObjectId>,
+            reloaded: bool,
+        }
+        impl Session<'_> {
+            /// Held? A miss rescans the pack directory once (a gc repack or
+            /// another connection's ingest may have moved objects since this
+            /// session indexed them), so a rescan costs only a refusal.
+            fn present(&mut self, id: &ObjectId) -> bool {
+                if self.store.contains(id) {
+                    return true;
+                }
+                if !self.reloaded {
+                    self.reloaded = true;
+                    let _ = self.store.reload_packs();
+                    return self.store.contains(id);
+                }
+                false
+            }
+        }
+        impl RefObjects for Session<'_> {
+            fn node(&mut self, id: &ObjectId) -> Result<Option<Node>> {
+                if !self.present(id) {
                     return Ok(None);
                 }
-                Ok(Some(crate::ref_guard::Node::of(self.0.get(id)?)))
+                self.relied_on.insert(*id);
+                Ok(Some(Node::of(self.store.get(id)?)))
+            }
+            fn leaf(&mut self, id: &ObjectId) -> Result<Option<Node>> {
+                if !self.present(id) {
+                    return Ok(None);
+                }
+                self.relied_on.insert(*id);
+                // Measuring streams and hash-checks a blob without loading it.
+                match self.store.blob_size(id) {
+                    Ok(_) => Ok(Some(Node::Blob)),
+                    Err(scl_core::Error::WrongKind(..)) => Ok(Some(Node::of(self.store.get(id)?))),
+                    Err(e) => Err(e.into()),
+                }
             }
             fn held(&mut self, id: &ObjectId) -> Result<bool> {
-                Ok(self.0.contains(id))
+                let held = self.present(id);
+                if held {
+                    self.relied_on.insert(*id);
+                }
+                Ok(held)
             }
         }
         let tips = self.list_refs()?.into_iter().map(|(_, t)| t).collect();
-        let store =
-            Store::open_persistent(self.layout.objects_dir(), crate::repo::default_budget())?;
-        crate::ref_guard::check_ref_move(&mut Fresh(store), &tips, current, new)
+        let mut store = self.store.borrow_mut();
+        let mut session = Session {
+            store: &mut store,
+            relied_on: Default::default(),
+            reloaded: false,
+        };
+        crate::ref_guard::check_ref_move(&mut session, &tips, current, new)?;
+        Ok(session.relied_on)
+    }
+
+    /// The locked half of `update_ref`: with the repo lock held, confirm the
+    /// compare-and-swap, the stopped-operation guard and that everything the
+    /// unlocked walk relied on is still on disk, then move the ref.
+    fn commit_ref_move(
+        &self,
+        branch: &str,
+        id: &ObjectId,
+        expected_old: Option<&ObjectId>,
+        relied_on: &std::collections::BTreeSet<ObjectId>,
+    ) -> Result<()> {
+        let _lock = RepoLock::acquire(&self.layout)?;
+        // Revalidate inside the lock: the checks before it ran unlocked, so the
+        // ref may have moved since (two concurrent pushes).
+        let current = crate::refs::read_branch_tip(&self.layout, branch)?;
+        if current.as_ref() == Some(id) {
+            return Ok(()); // already there — idempotent, nothing moves
+        }
+        // A stopped merge, cherry-pick or rebase here is completed against the
+        // checked-out branch's tip: moving that tip from underneath it would
+        // make the completing commit silently drop what was pushed (the P19-I1
+        // discard shape, reached by a remote writer). Refuse before any
+        // write; other branches are unaffected. HEAD is read only when an op
+        // is stopped, and a failure to read it then fails closed: the op's
+        // state exists, so a push must not guess which branch it belongs to.
+        let stopped = if crate::merge_state::in_progress(&self.layout) {
+            Some(Error::MergeInProgress)
+        } else if crate::pick_state::in_progress(&self.layout) {
+            Some(Error::PickInProgress)
+        } else if crate::rebase_state::in_progress(&self.layout) {
+            Some(Error::RebaseInProgress)
+        } else {
+            None
+        };
+        if let Some(err) = stopped {
+            if crate::refs::current_branch(&self.layout)? == branch {
+                return Err(err);
+            }
+        }
+        if current.as_ref() != expected_old {
+            return Err(Error::NonFastForward);
+        }
+        // A stat per object, under the lock. A miss rescans the pack directory
+        // once before it counts (a repack moves objects between files).
+        let mut store = self.store.borrow_mut();
+        let mut gone: Vec<&ObjectId> = relied_on
+            .iter()
+            .filter(|o| !store.contains_on_disk(o))
+            .collect();
+        if !gone.is_empty() {
+            store.reload_packs()?;
+            gone.retain(|o| !store.contains_on_disk(o));
+        }
+        if let Some(o) = gone.first() {
+            return Err(Error::InvalidArgument(format!(
+                "ref update refused: object {o} is no longer on disk (pruned since it was checked); retry the push"
+            )));
+        }
+        drop(store);
+        crate::refs::write_branch_tip(&self.layout, branch, id)
     }
 
     /// Bounded pack sender (P25): gather the transfer set exactly as before,
@@ -675,23 +784,9 @@ fn ingest_pack_file_impl(
 
 impl Transport for LocalTransport {
     fn list_refs(&self) -> Result<Vec<(String, ObjectId)>> {
-        let mut out = Vec::new();
-        let dir = self.layout.refs_heads_dir();
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(e.into()),
-        };
-        for e in entries {
-            let e = e?;
-            if e.file_type()?.is_file() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                let text = std::fs::read_to_string(e.path())?;
-                let id = ObjectId::from_str(text.trim())
-                    .map_err(|_| Error::BadRef(format!("remote ref {name} has bad id")))?;
-                out.push((name, id));
-            }
-        }
+        // `list_heads` skips a ref's in-flight temp file, which a concurrent
+        // push can have on disk while this runs.
+        let mut out = crate::refs::list_heads(&self.layout)?;
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }
@@ -752,41 +847,10 @@ impl Transport for LocalTransport {
         }
         // The ancestry and connectivity walk can be long, so it runs before
         // the repo-wide lock, from the tip the caller expects; under the lock
-        // only `current == expected_old` has to be confirmed, which makes the
-        // verified relation the one that is applied.
-        self.check_ref_move(expected_old.copied(), *id)?;
-        let _lock = RepoLock::acquire(&self.layout)?;
-        // Revalidate inside the lock: the checks above ran unlocked, so the ref
-        // may have moved since (two concurrent pushes).
-        let current = crate::refs::read_branch_tip(&self.layout, branch)?;
-        if current.as_ref() == Some(id) {
-            return Ok(()); // already there — idempotent, nothing moves
-        }
-        // A stopped merge, cherry-pick or rebase here is completed against the
-        // checked-out branch's tip: moving that tip from underneath it would
-        // make the completing commit silently drop what was pushed (the P19-I1
-        // discard shape, reached by a remote writer). Refuse before any
-        // write; other branches are unaffected. HEAD is read only when an op
-        // is stopped, and a failure to read it then fails closed: the op's
-        // state exists, so a push must not guess which branch it belongs to.
-        let stopped = if crate::merge_state::in_progress(&self.layout) {
-            Some(Error::MergeInProgress)
-        } else if crate::pick_state::in_progress(&self.layout) {
-            Some(Error::PickInProgress)
-        } else if crate::rebase_state::in_progress(&self.layout) {
-            Some(Error::RebaseInProgress)
-        } else {
-            None
-        };
-        if let Some(err) = stopped {
-            if crate::refs::current_branch(&self.layout)? == branch {
-                return Err(err);
-            }
-        }
-        if current.as_ref() != expected_old {
-            return Err(Error::NonFastForward);
-        }
-        crate::refs::write_branch_tip(&self.layout, branch, id)
+        // only `current == expected_old` and the objects' presence have to be
+        // confirmed, which makes the verified relation the one that is applied.
+        let relied_on = self.verify_ref_move(expected_old.copied(), *id)?;
+        self.commit_ref_move(branch, id, expected_old, &relied_on)
     }
 
     /// Bounded sender (P25): builds the transfer set into a temp pack file
@@ -1030,18 +1094,12 @@ mod tests {
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
 
-    /// The check reads what is on disk now: an object this long-lived transport
-    /// still has in memory, but `sc gc` has since removed, does not count.
-    #[test]
-    fn update_ref_does_not_trust_an_object_pruned_from_disk() {
-        let layout = tmp_remote("pruned");
-        let t = LocalTransport::open(&layout.root).unwrap();
-        let c1 = put_commit(&t, "c1", None);
-        let c2 = put_commit(&t, "c2", Some(c1));
-        t.update_ref("main", &c1, None).unwrap();
-        // Delete c2's loose file from under the transport (what a gc prune does).
-        let hex = c2.to_hex();
+    /// Delete an object's loose file, as a gc prune does, and leave the
+    /// transport's own caches alone.
+    fn prune_loose(layout: &Layout, id: &ObjectId) {
+        let hex = id.to_hex();
         let mut stack = vec![layout.objects_dir()];
+        let mut pruned = false;
         while let Some(dir) = stack.pop() {
             for e in std::fs::read_dir(dir).unwrap() {
                 let p = e.unwrap().path();
@@ -1053,11 +1111,77 @@ mod tests {
                     .ends_with(&hex)
                 {
                     std::fs::remove_file(p).unwrap();
+                    pruned = true;
                 }
             }
         }
+        assert!(pruned, "setup: {id} had a loose file");
+    }
+
+    /// An object this long-lived transport still has in memory, but `sc gc`
+    /// has since pruned from disk, does not count.
+    #[test]
+    fn update_ref_does_not_trust_an_object_pruned_from_disk() {
+        let layout = tmp_remote("pruned");
+        let t = LocalTransport::open(&layout.root).unwrap();
+        let c1 = put_commit(&t, "c1", None);
+        let c2 = put_commit(&t, "c2", Some(c1));
+        t.update_ref("main", &c1, None).unwrap();
+        prune_loose(&layout, &c2);
         assert!(t.has_object(&c2).unwrap(), "setup: still resident");
         assert!(t.update_ref("main", &c2, Some(&c1)).is_err());
+        assert_eq!(t.list_refs().unwrap(), vec![("main".to_string(), c1)]);
+        drop(t);
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    /// The walk runs without the repo lock, so a gc can prune an object it
+    /// verified before the lock is taken. The locked half confirms each object
+    /// the walk relied on is still on disk, so that move is refused, and a
+    /// retry (the objects pushed again) lands.
+    #[test]
+    fn an_object_pruned_between_the_walk_and_the_lock_refuses_the_move() {
+        let layout = tmp_remote("race");
+        let t = LocalTransport::open(&layout.root).unwrap();
+        let c1 = put_commit(&t, "c1", None);
+        let c2 = put_commit(&t, "c2", Some(c1));
+        t.update_ref("main", &c1, None).unwrap();
+
+        let relied_on = t.verify_ref_move(Some(c1), c2).unwrap();
+        assert!(relied_on.contains(&c2), "the walk relied on the new tip");
+        prune_loose(&layout, &c2);
+        let err = t
+            .commit_ref_move("main", &c2, Some(&c1), &relied_on)
+            .unwrap_err();
+        assert!(err.to_string().contains("no longer on disk"), "{err}");
+        assert_eq!(t.list_refs().unwrap(), vec![("main".to_string(), c1)]);
+
+        // A new connection's pushing the objects again lands it (this
+        // session still has them cached and would not write them).
+        drop(t);
+        let t = LocalTransport::open(&layout.root).unwrap();
+        let c2 = put_commit(&t, "c2", Some(c1));
+        let relied_on = t.verify_ref_move(Some(c1), c2).unwrap();
+        t.commit_ref_move("main", &c2, Some(&c1), &relied_on)
+            .unwrap();
+        assert_eq!(t.list_refs().unwrap(), vec![("main".to_string(), c2)]);
+        drop(t);
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    /// Enumerating refs while another push writes one must not trip over its
+    /// in-flight temp file.
+    #[test]
+    fn list_refs_skips_a_refs_temp_file() {
+        let layout = tmp_remote("tmpref");
+        let t = LocalTransport::open(&layout.root).unwrap();
+        let c1 = put_commit(&t, "c1", None);
+        t.update_ref("main", &c1, None).unwrap();
+        std::fs::write(
+            layout.refs_heads_dir().join("other.4242.tmp"),
+            b"half a ref",
+        )
+        .unwrap();
         assert_eq!(t.list_refs().unwrap(), vec![("main".to_string(), c1)]);
         drop(t);
         std::fs::remove_dir_all(&layout.root).unwrap();

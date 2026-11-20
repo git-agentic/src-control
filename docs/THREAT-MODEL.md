@@ -509,15 +509,17 @@ too, not just the src-control-side metadata.
   and is escaped only when displayed. Paths are not escaped.
 - **The server decides a ref move itself, not just the client** (`ref_guard`).
   Every `UpdateRef` (all transports, local-path pushes and `sc serve --store`
-  included) is checked against objects read from storage now, before the
-  repo-wide lock is taken, and the compare-and-swap is then confirmed under it.
+  included) is judged before the repo-wide lock is taken, so a long walk does
+  not hold it; under the lock the compare-and-swap is confirmed and every
+  object the verdict relied on is checked to still be on disk (a gc prune
+  cannot slip between the two).
   The new tip must be a snapshot or a private-branch manifest of the **same
   kind** as the branch's current tip, and the current tip must be its ancestor
   (a snapshot's parents, which must be snapshots; a manifest's `prev` chain,
   which must be manifests; a manifest's `base` is not an ancestor link). It
   must also be **connected**: every parent, root tree, nested object, secret,
-  manifest `closure` entry, `base` and `anchor` the push added is held, checked
-  only along what differs from an existing ref tip. Anything absent, of the
+  manifest `closure` entry, `base` and `anchor` the push added is held and of
+  the right kind, checked only along what differs from an existing ref tip. Anything absent, of the
   wrong kind or unreadable is refused. This stops a rewind, a sideways move, a
   public/private kind flip and a tip whose history dangles, which would break
   clone, fetch and gc for everyone. It is not a content check: write access

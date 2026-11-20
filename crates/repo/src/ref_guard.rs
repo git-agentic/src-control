@@ -29,14 +29,17 @@ use scl_core::{BranchManifest, EntryKind, Object, ObjectId, Snapshot, Tree};
 
 use crate::error::{Error, Result};
 
-/// What an object is, as far as the ref rule cares.
+/// What an object is, as far as the ref rule cares. Blobs carry no content:
+/// the rule only needs to know one is there and what it is.
 #[derive(Clone)]
 pub(crate) enum Node {
     Snapshot(Snapshot),
     Tree(Tree),
     Manifest(BranchManifest),
-    /// Any other kind (blob, secret, sealed, signature, transcript).
-    Leaf,
+    Blob,
+    Sealed,
+    /// A secret, signature or transcript.
+    Other,
 }
 
 impl Node {
@@ -45,7 +48,9 @@ impl Node {
             Object::Snapshot(s) => Node::Snapshot(s),
             Object::Tree(t) => Node::Tree(t),
             Object::Manifest(m) => Node::Manifest(m),
-            _ => Node::Leaf,
+            Object::Blob(_) => Node::Blob,
+            Object::Sealed(_) => Node::Sealed,
+            _ => Node::Other,
         }
     }
 
@@ -54,19 +59,34 @@ impl Node {
             Node::Snapshot(_) => "snapshot",
             Node::Tree(_) => "tree",
             Node::Manifest(_) => "manifest",
-            Node::Leaf => "leaf object",
+            Node::Blob => "blob",
+            Node::Sealed => "sealed object",
+            Node::Other => "secret, signature or transcript",
         }
     }
 }
 
-/// Read access to the objects a ref move is judged against. Implementations
-/// must read what is durably held now (not a cache that outlived a gc), and
-/// must include what the same push just uploaded.
+/// Read access to the objects a ref move is judged against; it must include
+/// what the same push just uploaded. A cached read can outlive a gc prune, so
+/// the caller confirms what it relied on is still on disk once it holds the
+/// repo lock.
 pub(crate) trait RefObjects {
     /// The object, or `None` when it is not held.
     fn node(&mut self, id: &ObjectId) -> Result<Option<Node>>;
+    /// Like [`RefObjects::node`], for an object expected to be a file's
+    /// content: an implementation may avoid loading a large blob to say so.
+    fn leaf(&mut self, id: &ObjectId) -> Result<Option<Node>> {
+        self.node(id)
+    }
     /// Whether the object is held, without reading it where that is cheaper.
     fn held(&mut self, id: &ObjectId) -> Result<bool>;
+}
+
+/// Tree and file-content ids already verified in one check.
+#[derive(Default)]
+struct Verified {
+    trees: HashSet<ObjectId>,
+    leaves: HashSet<ObjectId>,
 }
 
 fn refuse<T>(msg: String) -> Result<T> {
@@ -136,7 +156,7 @@ pub(crate) fn check_ref_move<S: RefObjects>(
                     return Err(Error::NonFastForward);
                 }
             }
-            verify_snapshots(src, &boundary, &[new], &mut HashSet::new())
+            verify_snapshots(src, &boundary, &[new], &mut Verified::default())
         }
         Node::Manifest(m) => verify_manifests(src, &boundary, current, new, m),
         _ => unreachable!("kind checked above"),
@@ -166,7 +186,7 @@ fn verify_snapshots<S: RefObjects>(
     src: &mut S,
     boundary: &BTreeSet<ObjectId>,
     starts: &[ObjectId],
-    done: &mut HashSet<ObjectId>,
+    done: &mut Verified,
 ) -> Result<()> {
     let mut seen: HashSet<ObjectId> = starts.iter().copied().collect();
     let mut queue: VecDeque<ObjectId> = seen.iter().copied().collect();
@@ -190,19 +210,22 @@ fn verify_snapshots<S: RefObjects>(
     Ok(())
 }
 
-/// Everything under tree `root` is held, descending only into entries that
-/// differ from the same path under one of `parent_roots`. An explicit stack
-/// keeps a hostile, deeply nested tree from overflowing the call stack, and
-/// `done` keeps a shared-subtree DAG from being walked once per path.
+/// Everything under tree `root` is held, with the right kind, descending only
+/// into entries that differ from the same path under one of `parent_roots`.
+/// An explicit stack keeps a hostile, deeply nested tree from overflowing the
+/// call stack. `trees` and `leaves` memoize what has been verified, apart from
+/// each other: an id is verified as one kind only, so an entry that names it as
+/// the other kind is refused rather than trusted, and a shared-subtree DAG is
+/// not walked once per path.
 fn verify_tree<S: RefObjects>(
     src: &mut S,
     root: ObjectId,
     parent_roots: &[ObjectId],
-    done: &mut HashSet<ObjectId>,
+    seen: &mut Verified,
 ) -> Result<()> {
     let mut stack = vec![(root, parent_roots.to_vec())];
     while let Some((id, parents)) = stack.pop() {
-        if parents.contains(&id) || !done.insert(id) {
+        if parents.contains(&id) || !seen.trees.insert(id) {
             continue;
         }
         let tree = match read(src, &id, "tree")? {
@@ -229,9 +252,22 @@ fn verify_tree<S: RefObjects>(
             match e.kind {
                 EntryKind::Tree => stack.push((e.id, same.iter().map(|pe| pe.id).collect())),
                 EntryKind::Blob => {
-                    if !done.contains(&e.id) {
-                        require_held(src, &e.id, "file content")?;
-                        done.insert(e.id);
+                    if seen.leaves.contains(&e.id) {
+                        continue;
+                    }
+                    match src.leaf(&e.id)? {
+                        Some(Node::Blob | Node::Sealed) => {
+                            seen.leaves.insert(e.id);
+                        }
+                        Some(other) => {
+                            return refuse(format!(
+                                "file entry {} names {}, a {}, not file content",
+                                e.name,
+                                e.id,
+                                other.kind()
+                            ))
+                        }
+                        None => return refuse(format!("file content {} is not held here", e.id)),
                     }
                 }
             }
@@ -275,7 +311,7 @@ fn verify_manifests<S: RefObjects>(
     if current.is_some() && !found {
         return Err(Error::NonFastForward);
     }
-    let mut done = HashSet::new();
+    let mut done = Verified::default();
     for m in &chain {
         let roots: Vec<ObjectId> = std::iter::once(m.base)
             .chain(m.anchors.iter().copied())
