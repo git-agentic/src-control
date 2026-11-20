@@ -1253,7 +1253,11 @@ fn serve_refuses_unusable_settings_at_startup() {
 
 #[test]
 fn a_busy_password_gate_answers_503_and_refunds_the_attempt() {
-    let s = Srv::start();
+    // A budget of one attempt per source: without the refund the second request is a 429.
+    let s = Srv::start_backoff(scl_forge::limits::Backoff::new(
+        1,
+        std::time::Duration::ZERO,
+    ));
     let pw = s.mk_user("alice");
     let body = json!({"name": "t", "scopes": ["all"]});
     // Hold every Argon2 slot (the harness builds the app with 4): the check must give up, not queue.

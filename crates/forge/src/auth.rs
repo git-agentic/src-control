@@ -142,26 +142,26 @@ pub fn by_password(app: &App, conn: &Connection, req: &Req, cred: &Cred) -> Resu
         )
         .with("www-authenticate", "Basic realm=\"sc-forge\"".into()));
     };
-    if !app.backoff.begin(req.source) {
+    let Some(slot) = app.backoff.begin(req.source) else {
         return Err(error(
             &app.base,
             429,
             "too many failed password attempts from this address",
         )
         .with("retry-after", "60".into()));
-    }
+    };
     let found = match store::find_by_login(conn, login) {
         Ok(u) => u.filter(|u| !u.is_org),
         Err(e) => {
-            app.backoff.cancel(req.source);
+            app.backoff.cancel(&slot);
             return Err(app.internal(&e));
         }
     };
     let ok = {
         // Bounded: an unbounded wait would pin a blocking-pool thread per queued login.
-        let Some(_slot) = app.gate.acquire_timeout(VERIFY_WAIT) else {
+        let Some(_permit) = app.gate.acquire_timeout(VERIFY_WAIT) else {
             // Our own load says nothing about the credential: give the reservation back.
-            app.backoff.cancel(req.source);
+            app.backoff.cancel(&slot);
             return Err(error(
                 &app.base,
                 503,
@@ -173,7 +173,7 @@ pub fn by_password(app: &App, conn: &Connection, req: &Req, cred: &Cred) -> Resu
     };
     match (ok, found) {
         (true, Some(user)) => {
-            app.backoff.success(login, req.source);
+            app.backoff.success(login, &slot);
             if user.must_change_password {
                 return Err(error(
                     &app.base,
