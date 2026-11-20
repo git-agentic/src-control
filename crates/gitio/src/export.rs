@@ -60,18 +60,32 @@ impl GitTarget {
     /// Open an existing Git repo at `path`; if `path` does not exist, create a
     /// bare repo there. A path that exists but is not a Git repo is an error.
     pub(crate) fn open_or_init_bare(path: &Path) -> Result<GitTarget> {
-        let (repo, created) = if path.exists() {
+        // Claim the directory with an exclusive create: only a call that made it owns the
+        // repository (and may remove it on failure). Another process that wins the race, or a
+        // directory that already exists, makes this call treat the target as pre-existing.
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let claimed = match std::fs::create_dir(path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!("creating {}", path.display())))
+            }
+        };
+        let (repo, created) = if claimed {
+            (
+                gix::init_bare(path)
+                    .with_context(|| format!("initializing bare git repo at {}", path.display()))?,
+                true,
+            )
+        } else {
             (
                 gix::open(path).with_context(|| {
                     format!("{} exists but is not a git repository", path.display())
                 })?,
                 false,
-            )
-        } else {
-            (
-                gix::init_bare(path)
-                    .with_context(|| format!("initializing bare git repo at {}", path.display()))?,
-                true,
             )
         };
         Ok(GitTarget { repo, created })
