@@ -253,12 +253,27 @@ impl Proxies {
             return peer;
         }
         // Walk from the right: the first address that is not one of our own
-        // trusted proxies is the client as the outermost proxy saw it.
-        v.rsplit(',')
-            .filter_map(|s| s.trim().parse::<IpAddr>().ok())
-            .find(|a| !self.cidrs.iter().any(|c| c.contains(*a)))
-            .unwrap_or(peer)
+        // trusted proxies is the client as the outermost proxy saw it. An entry that
+        // does not parse is client-controlled text: stop there and key on the last
+        // trusted hop, never on anything to its left.
+        let mut hop = peer;
+        for entry in v.rsplit(',') {
+            match hop_addr(entry.trim()) {
+                None => return hop,
+                Some(a) if self.cidrs.iter().any(|c| c.contains(a)) => hop = a,
+                Some(a) => return a,
+            }
+        }
+        peer
     }
+}
+
+/// An address as a proxy may append it: `ip`, `ip:port`, `[v6]` or `[v6]:port`.
+fn hop_addr(s: &str) -> Option<IpAddr> {
+    s.parse::<IpAddr>()
+        .ok()
+        .or_else(|| s.parse::<std::net::SocketAddr>().ok().map(|a| a.ip()))
+        .or_else(|| s.strip_prefix('[')?.strip_suffix(']')?.parse().ok())
 }
 
 #[cfg(test)]
@@ -394,6 +409,39 @@ mod tests {
             Proxies::default().resolve(ip("127.0.0.1"), Some("6.6.6.6")),
             ip("127.0.0.1")
         );
+    }
+
+    #[test]
+    fn forwarded_for_ports_are_parsed_and_junk_stops_the_walk() {
+        let p = Proxies {
+            header: Some("x-forwarded-for".into()),
+            cidrs: vec![Cidr::parse("127.0.0.1/32").unwrap()],
+        };
+        let peer = ip("127.0.0.1");
+        // a proxy that appends ip:port, in either family
+        assert_eq!(
+            p.resolve(peer, Some("6.6.6.6, 5.5.5.5:4711")),
+            ip("5.5.5.5")
+        );
+        assert_eq!(
+            p.resolve(peer, Some("6.6.6.6, [2001:db8::5]:80")),
+            ip("2001:db8::5")
+        );
+        assert_eq!(
+            p.resolve(peer, Some("6.6.6.6, [2001:db8::5]")),
+            ip("2001:db8::5")
+        );
+        assert_eq!(
+            p.resolve(peer, Some("6.6.6.6, 127.0.0.1:9, 5.5.5.5:1")),
+            ip("5.5.5.5")
+        );
+        // an unparsable entry no longer lets the walk fall through to a client-chosen one
+        assert_eq!(p.resolve(peer, Some("6.6.6.6, unknown")), peer);
+        assert_eq!(
+            p.resolve(peer, Some("6.6.6.6, 5.5.5.5, unknown, 127.0.0.1")),
+            peer
+        );
+        assert_eq!(p.resolve(peer, Some("6.6.6.6, junk, 127.0.0.1")), peer);
     }
 
     #[test]
