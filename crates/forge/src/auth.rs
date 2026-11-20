@@ -127,6 +127,9 @@ pub fn by_token(app: &App, conn: &Connection, cred: &Cred, now: i64) -> Result<A
     }
 }
 
+/// How long a password check waits for an Argon2 slot before the forge answers 503.
+const VERIFY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Resolve the user's password (`Basic login:password`). Every failure answers
 /// the same text, runs one full Argon2 verification (against a dummy hash for
 /// an unknown login), is counted for backoff, and is delayed.
@@ -155,7 +158,13 @@ pub fn by_password(app: &App, conn: &Connection, req: &Req, cred: &Cred) -> Resu
         }
     };
     let ok = {
-        let _slot = app.gate.acquire();
+        // Bounded: an unbounded wait would pin a blocking-pool thread per queued login.
+        let Some(_slot) = app.gate.acquire_timeout(VERIFY_WAIT) else {
+            // Our own load says nothing about the credential: give the reservation back.
+            app.backoff.cancel(req.source);
+            return Err(error(&app.base, 503, "too many password checks in flight, try again")
+                .with("retry-after", "5".into()));
+        };
         verify_password(pass, found.as_ref().map(|u| u.password_hash.as_str()))
     };
     match (ok, found) {

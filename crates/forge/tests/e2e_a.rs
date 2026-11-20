@@ -1224,3 +1224,19 @@ fn serve_refuses_unusable_settings_at_startup() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_busy_password_gate_answers_503_and_refunds_the_attempt() {
+    let s = Srv::start();
+    let pw = s.mk_user("alice");
+    let body = json!({"name": "t", "scopes": ["all"]});
+    // Hold every Argon2 slot (the harness builds the app with 4): the check must give up, not queue.
+    let held: Vec<_> = (0..4).map(|_| s.app.gate.acquire()).collect();
+    let r = s.post("/api/v1/users/alice/tokens", &basic("alice", &pw), body.clone());
+    assert_eq!(r.status, 503, "{}", r.msg());
+    assert_eq!(r.headers["retry-after"], "5");
+    drop(held);
+    // The refused attempt left no failure behind and returned its source reservation.
+    let r = s.post("/api/v1/users/alice/tokens", &basic("alice", &pw), body);
+    assert_eq!(r.status, 201, "{}", r.msg());
+}
