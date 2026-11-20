@@ -785,9 +785,13 @@ protected paths, plaintext.
     before any write, to lay a file or directory onto an untracked or ignored
     one (`refuse_untracked_overwrite`), including a path outside the sparse
     view that the result adds (#248, #251). A refusal changes nothing; move the
-    file away and retry. Not guarded: merging into an unborn branch, and the
-    conflict stop of a merge into a private branch (it checks only out-of-view
-    paths, and refuses a `.theirs` sidecar onto an existing file).
+    file away and retry. Not guarded: merging into an unborn branch (and a
+    clone), except that every `materialize` refuses, before its first write, a
+    path with a symlink among its parent directories, so a remote entry
+    `link/x` cannot write through a user's `link -> .sc` or out of the
+    checkout; and the conflict stop of a merge into a private branch (it checks
+    only out-of-view paths, and refuses a `.theirs` sidecar onto an existing
+    file).
   - A stop's `materialize` deletes or overwrites a path only if the tree it
     replaces tracks it and the disk copy is a regular file with exactly the
     tracked bytes, or the stop itself recorded the path (`.sc/CONFLICT_PLAINTEXT`,

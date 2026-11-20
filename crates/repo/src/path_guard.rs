@@ -292,6 +292,54 @@ fn a_dot_sc_we_did_not_create_is_never_removed() {
     std::fs::remove_dir_all(&dst).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn unborn_merge_refuses_a_write_through_a_symlinked_parent() {
+    let root = tmp_root("symlink-parent");
+    let outside = tmp_root("symlink-outside");
+    let repo = Repo::init(&root).unwrap();
+    // The user's own untracked symlink; the remote tree has `link/x`.
+    std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+    let theirs = {
+        let store = repo.vfs_handle().store();
+        let mut s = store.lock().unwrap();
+        let blob = s.put(Object::blob(b"planted".to_vec())).unwrap();
+        let sub = s
+            .put(Object::Tree(Tree::new(vec![entry(
+                "x",
+                EntryKind::Blob,
+                blob,
+            )])))
+            .unwrap();
+        let tree = s
+            .put(Object::Tree(Tree::new(vec![entry(
+                "link",
+                EntryKind::Tree,
+                sub,
+            )])))
+            .unwrap();
+        s.put(Object::Snapshot(Snapshot {
+            root: tree,
+            parents: vec![],
+            author: "t".into(),
+            timestamp: 0,
+            message: "theirs".into(),
+            secrets: Default::default(),
+            protection: Protection::default(),
+        }))
+        .unwrap()
+    };
+    crate::refs::write_branch_tip(repo.layout(), "other", &theirs).unwrap();
+    assert_eq!(repo.head_tip().unwrap(), None, "main is unborn");
+    let err = repo.merge("other", "me").unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+    assert!(!outside.join("x").exists(), "nothing written outside");
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    assert_eq!(repo.head_tip().unwrap(), None, "the ref did not move");
+    cleanup(repo, &root);
+    std::fs::remove_dir_all(&outside).unwrap();
+}
+
 #[test]
 fn plain_init_never_enters_a_dot_sc_it_did_not_create() {
     // A clone's freshly made `.sc/` must not be adopted by `sc init`.

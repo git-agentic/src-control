@@ -1265,6 +1265,18 @@ fn materialize_impl(
     // clone never fetched out-of-filter subtrees at all, so an unfiltered
     // walk here would `NotFound` on them.
     let target = tree_file_entries_with_perms_sparse(store, target_root, sparse)?;
+    // Before the first write, whatever `old_root` is (an unborn merge or a clone
+    // has none, so the obstruction checks below do not run): a symlink among a
+    // written path's parents would carry the write out of its directory, e.g.
+    // `link -> .sc` or a directory outside the checkout. Never followed.
+    for path in target.keys().filter(|p| sparse.matches(p)) {
+        if under_symlink(&layout.root, path) {
+            return Err(Error::InvalidArgument(format!(
+                "cannot write {path}: a parent directory is a symlink; \
+                 move it away, then retry"
+            )));
+        }
+    }
     // Set when an interrupted `sparse set`'s marker widened the removal bound;
     // cleared once this call has finished laying the tree out under `sparse`.
     let mut prev_marker_used = false;
