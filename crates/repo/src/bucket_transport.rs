@@ -74,12 +74,10 @@ pub struct BucketTransport {
     /// (possibly long-lived, e.g. `wire::serve`-hosted) transport regardless
     /// of whether this call succeeds or fails.
     pending_packs: RefCell<Vec<String>>,
-    /// Parents of every snapshot and manifest received since the last
-    /// `update_ref`, which is not yet on the manifest chain and so not in
-    /// `view.index`; lets `update_ref` check fast-forward over objects that
-    /// are only in a pending pack. Taken, like `pending_packs`, at the top of
-    /// each `update_ref`.
-    pending_commits: RefCell<BTreeMap<ObjectId, Vec<ObjectId>>>,
+    /// What was received since the last `update_ref`: not yet on the manifest
+    /// chain, so not in `view.index`, but what the ref rule must be able to
+    /// read. Taken, like `pending_packs`, at the top of each `update_ref`.
+    pending_objects: RefCell<PendingObjects>,
     /// Signature and transcript objects found in each scanned pack, keyed by
     /// pack hash (#229). Packs are immutable, so an entry never goes stale;
     /// it spares a long-lived `serve --store` session from re-reading every
@@ -239,7 +237,7 @@ impl BucketTransport {
             pack_cache: RefCell::new(None),
             staged: RefCell::new(Vec::new()),
             pending_packs: RefCell::new(Vec::new()),
-            pending_commits: RefCell::new(BTreeMap::new()),
+            pending_objects: RefCell::new(PendingObjects::default()),
             leaf_cache: RefCell::new(BTreeMap::new()),
             saw_absent: Cell::new(false),
             attempt_tag: RefCell::new(None),
@@ -682,14 +680,65 @@ impl crate::reachable::ObjectSource for BucketSource<'_> {
     }
 }
 
-/// The parents of `obj` if it is a snapshot or a manifest (what `update_ref`
-/// may point a branch at), else `None`.
-fn commit_parents_of(id: &ObjectId, obj: &Object) -> Option<Vec<ObjectId>> {
-    match obj {
-        Object::Snapshot(_) | Object::Manifest(_) => {
-            crate::merge::commit_parents(id, obj.clone()).ok()
+/// Objects received but not yet committed to the manifest chain: the structural
+/// ones decoded (the ref rule walks them), every other kind by id only.
+#[derive(Default)]
+struct PendingObjects {
+    nodes: BTreeMap<ObjectId, crate::ref_guard::Node>,
+    leaves: std::collections::BTreeSet<ObjectId>,
+}
+
+impl PendingObjects {
+    fn note(&mut self, id: ObjectId, obj: Object) {
+        match obj {
+            Object::Snapshot(_) | Object::Tree(_) | Object::Manifest(_) => {
+                self.nodes.insert(id, crate::ref_guard::Node::of(obj));
+            }
+            _ => {
+                self.leaves.insert(id);
+            }
         }
-        _ => None,
+    }
+
+    fn extend(&mut self, other: PendingObjects) {
+        self.nodes.extend(other.nodes);
+        self.leaves.extend(other.leaves);
+    }
+}
+
+/// The objects a ref move is judged against: this call's pending ones, then
+/// what the manifest chain names.
+struct RefView<'a> {
+    bucket: &'a BucketTransport,
+    pending: &'a PendingObjects,
+}
+
+impl RefView<'_> {
+    fn on_chain(&self, id: &ObjectId) -> bool {
+        let view = self.bucket.view.borrow();
+        view.as_ref().is_some_and(|v| v.index.contains_key(id))
+    }
+}
+
+impl crate::ref_guard::RefObjects for RefView<'_> {
+    fn node(&mut self, id: &ObjectId) -> Result<Option<crate::ref_guard::Node>> {
+        if let Some(n) = self.pending.nodes.get(id) {
+            return Ok(Some(n.clone()));
+        }
+        if self.pending.leaves.contains(id) {
+            return Ok(Some(crate::ref_guard::Node::Leaf));
+        }
+        if !self.on_chain(id) {
+            return Ok(None);
+        }
+        let obj = Object::decode(&self.bucket.object_bytes(id)?)?;
+        Ok(Some(crate::ref_guard::Node::of(obj)))
+    }
+
+    fn held(&mut self, id: &ObjectId) -> Result<bool> {
+        Ok(self.pending.nodes.contains_key(id)
+            || self.pending.leaves.contains(id)
+            || self.on_chain(id))
     }
 }
 
@@ -793,9 +842,11 @@ impl Transport for BucketTransport {
         if ObjectId::of(bytes) != *id {
             return Err(Error::CorruptObject(*id));
         }
-        if let Some(parents) = commit_parents_of(id, &Object::decode(bytes)?) {
-            self.pending_commits.borrow_mut().insert(*id, parents);
+        let obj = Object::decode(bytes)?;
+        if obj.id() != *id {
+            return Err(Error::CorruptObject(*id)); // decodes, but not canonically
         }
+        self.pending_objects.borrow_mut().note(*id, obj);
         self.staged.borrow_mut().push((*id, bytes.to_vec()));
         Ok(())
     }
@@ -808,18 +859,25 @@ impl Transport for BucketTransport {
         // pinned byte-stable for a given object set (core), so the rebuilt
         // pack still content-addresses identically for identical input.
         let mut objects: Vec<(ObjectId, Vec<u8>)> = Vec::new();
-        let mut commits = BTreeMap::new();
+        let mut received = PendingObjects::default();
         scl_core::pack::parse_pack_reader(src, |id, obj| {
-            if let Some(parents) = commit_parents_of(&id, &obj) {
-                commits.insert(id, parents);
+            // The upload below re-encodes each object; bytes that decode but
+            // are not canonical would be stored under an id they do not hash
+            // to, and every later read would fail verification.
+            let bytes = obj.encode();
+            if ObjectId::of(&bytes) != id {
+                return Err(scl_core::Error::PackCorrupt(format!(
+                    "object {id} is not in canonical encoding"
+                )));
             }
-            objects.push((id, obj.encode()));
+            received.note(id, obj);
+            objects.push((id, bytes));
             Ok(())
         })?;
         let (hash, ids) = self.upload_pack(&objects)?;
         self.pending_packs.borrow_mut().push(hash);
         // Only after the upload: a failed one must not leave ids that no pack holds.
-        self.pending_commits.borrow_mut().extend(commits);
+        self.pending_objects.borrow_mut().extend(received);
         Ok(ids)
     }
 
@@ -848,7 +906,10 @@ impl Transport for BucketTransport {
         // the bucket regardless (content-addressed, inert orphan garbage if
         // never referenced — correct per spec; `compact` sweeps it later, ADR-0057).
         let pending: Vec<String> = std::mem::take(&mut *self.pending_packs.borrow_mut());
-        let pending_commits = std::mem::take(&mut *self.pending_commits.borrow_mut());
+        let pending_objects = std::mem::take(&mut *self.pending_objects.borrow_mut());
+        // The ref rule's verdict for one current tip; a CAS retry that finds the
+        // same tip need not repeat the walk (objects only accumulate).
+        let mut checked_against: Option<Option<ObjectId>> = None;
         for attempt in 0..MAX_CAS_RETRIES {
             if attempt > 0 {
                 std::thread::sleep(cas_backoff(attempt));
@@ -878,25 +939,22 @@ impl Transport for BucketTransport {
             }
             // The pushing client checks fast-forward too, but a writer need not
             // be our client (`sc serve --store`, or a direct bucket writer):
-            // refuse a rewind, a sideways move, or a target that is absent or
-            // not a snapshot or manifest. Objects only in a pending pack are
-            // not in the view yet, so their parents come from `pending_commits`.
-            crate::merge::check_ref_move(current, *id, |o| {
-                if let Some(parents) = pending_commits.get(o) {
-                    return Ok(parents.clone());
-                }
-                let on_chain = self
+            // the shared ref rule (kind, ancestry, connectivity) runs here,
+            // over this call's pending objects and the chain.
+            if checked_against != Some(current) {
+                let tips = self
                     .view
                     .borrow()
                     .as_ref()
-                    .is_some_and(|v| v.index.contains_key(o));
-                if !on_chain {
-                    return Err(Error::InvalidArgument(format!(
-                        "object {o} is not a snapshot or manifest held here, so the ref update cannot be verified"
-                    )));
-                }
-                crate::merge::commit_parents(o, Object::decode(&self.object_bytes(o)?)?)
-            })?;
+                    .map(|v| v.refs.values().copied().collect())
+                    .unwrap_or_default();
+                let mut objects = RefView {
+                    bucket: self,
+                    pending: &pending_objects,
+                };
+                crate::ref_guard::check_ref_move(&mut objects, &tips, current, *id)?;
+                checked_against = Some(current);
+            }
             // Claim a log slot for this attempt. `put_new` on `log/<seq>` is
             // the claim: if another writer already landed that seq, we didn't
             // win it and try the next one — the entry we didn't win becomes
@@ -981,7 +1039,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::test_support::fake_commit;
+    use crate::test_support::{fake_commit, put_fake};
     use crate::transport::Transport;
     use crate::walfmt::{
         checkpoint_key, idx_key, log_key, pack_key, Checkpoint, LogEntry, Manifest, RefUpdate,
@@ -1230,59 +1288,64 @@ mod tests {
     }
 
     /// `sc serve --store` and direct bucket writers get the same server-side
-    /// rule as `LocalTransport`: no rewind, no sideways move, and a target that
-    /// is a held snapshot (including one only in the pending pack).
+    /// ref rules as `LocalTransport` (`ref_guard`), including over objects that
+    /// are only in a pending pack.
     #[test]
-    fn update_ref_enforces_fast_forward_and_target_kind() {
+    fn update_ref_enforces_the_ref_rules() {
         let broot = std::env::temp_dir().join(format!("scl-bt-ff-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&broot);
         let t = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
-        let put = |c: &Object| t.put_object(&c.id(), &c.encode()).unwrap();
-        let c1 = fake_commit("c1", None);
-        let c2 = fake_commit("c2", Some(c1.id()));
-        let c3 = fake_commit("c3", Some(c2.id()));
-        let unrelated = fake_commit("unrelated", None);
-        let blob = Object::blob(b"a blob".to_vec());
-        let absent = ObjectId::of(b"never stored");
+        crate::test_support::ref_rules_hold(&t);
+        drop(t);
+        std::fs::remove_dir_all(&broot).unwrap();
+    }
 
-        // Creation, then a two-step fast-forward whose objects are all pending.
-        put(&c1);
-        t.update_ref("main", &c1.id(), None).unwrap();
-        put(&c2);
-        put(&c3);
-        t.update_ref("main", &c3.id(), Some(&c1.id())).unwrap();
-        let tip_is = |want: ObjectId| {
-            assert_eq!(t.list_refs().unwrap(), vec![("main".to_string(), want)]);
+    /// A pack record that decodes but is not in canonical encoding would be
+    /// re-encoded by the upload and stored under an id it does not hash to, so
+    /// later reads fail verification. The whole pack is refused instead.
+    #[test]
+    fn put_pack_refuses_a_non_canonical_record() {
+        let broot = std::env::temp_dir().join(format!("scl-bt-noncanon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&broot);
+        let t = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        // A snapshot whose secrets registry is written out of order: it decodes
+        // into a sorted map, so re-encoding gives different bytes.
+        let (id_a, id_b) = (ObjectId::of(b"a"), ObjectId::of(b"b"));
+        let mut snap = scl_core::Snapshot {
+            root: ObjectId::of(b"root"),
+            parents: vec![],
+            author: "t".into(),
+            timestamp: 0,
+            message: "m".into(),
+            secrets: Default::default(),
+            protection: Default::default(),
         };
-        tip_is(c3.id());
+        snap.secrets.insert("a".into(), id_a);
+        snap.secrets.insert("b".into(), id_b);
+        let canonical = Object::Snapshot(snap).encode();
+        let entry = |name: &[u8], id: &ObjectId| {
+            let mut e = (name.len() as u32).to_be_bytes().to_vec();
+            e.extend_from_slice(name);
+            e.extend_from_slice(id.as_bytes());
+            e
+        };
+        let (ea, eb) = (entry(b"a", &id_a), entry(b"b", &id_b));
+        let pos = canonical
+            .windows(ea.len() + eb.len())
+            .position(|w| w[..ea.len()] == ea[..] && w[ea.len()..] == eb[..])
+            .expect("secrets section in the encoding");
+        let mut raw = canonical.clone();
+        raw[pos..pos + ea.len()].copy_from_slice(&eb);
+        raw[pos + ea.len()..pos + ea.len() + eb.len()].copy_from_slice(&ea);
+        assert_ne!(raw, canonical);
+        let decoded = Object::decode(&raw).expect("non-canonical bytes still decode");
+        assert_eq!(decoded.encode(), canonical, "setup: decoding normalizes");
 
-        // Each refused call takes the pending pack with it, so stage the
-        // pending-only objects (an unrelated snapshot, a blob) again before it.
-        let stage = || {
-            put(&unrelated);
-            put(&blob);
-        };
-        // Rewind and sideways moves: on-chain targets and a pending one.
-        for target in [c1.id(), c2.id(), unrelated.id()] {
-            stage();
-            assert!(
-                matches!(
-                    t.update_ref("main", &target, Some(&c3.id())),
-                    Err(Error::NonFastForward)
-                ),
-                "{target} must be refused"
-            );
-            tip_is(c3.id());
-        }
-        // Absent and wrong-kind targets, for an existing branch and a new one.
-        for branch in ["main", "fresh"] {
-            let old = (branch == "main").then(|| c3.id());
-            for target in [absent, blob.id()] {
-                stage();
-                assert!(t.update_ref(branch, &target, old.as_ref()).is_err());
-            }
-        }
-        tip_is(c3.id());
+        let (pack, _) = scl_core::pack::build_pack(&[(ObjectId::of(&raw), raw)]).unwrap();
+        let err = t.put_pack(&mut std::io::Cursor::new(pack)).unwrap_err();
+        assert!(err.to_string().contains("canonical"), "{err}");
+        // Nothing was uploaded for it.
+        assert!(t.pending_packs.borrow().is_empty());
         drop(t);
         std::fs::remove_dir_all(&broot).unwrap();
     }
@@ -1455,10 +1518,7 @@ mod tests {
         // without it, the OS could simply run racer-a to completion before
         // racer-b's thread is even scheduled, and the (1, 1) result below
         // would hold trivially with the manifest CAS never actually contended.
-        let mk_tip = |tag: &[u8]| {
-            let obj = fake_commit(std::str::from_utf8(tag).unwrap(), Some(base));
-            (obj.id(), obj.encode())
-        };
+        let mk_tip = |tag: &[u8]| fake_commit(std::str::from_utf8(tag).unwrap(), Some(base));
         let gate = std::sync::Barrier::new(2);
         let finished = std::sync::atomic::AtomicBool::new(false);
         let status = crate::test_support::Status::default();
@@ -1481,8 +1541,9 @@ mod tests {
                             DirBucket::open(&broot).unwrap(),
                         ))
                         .unwrap();
-                        let (tip, bytes) = mk_tip(tag);
-                        t.put_object(&tip, &bytes).unwrap();
+                        let obj = mk_tip(tag);
+                        let tip = obj.id();
+                        put_fake(&t, &obj);
                         gate.wait();
                         t.update_ref("main", &tip, Some(&base))
                     })
@@ -1537,7 +1598,7 @@ mod tests {
                         ))
                         .unwrap();
                         let obj = fake_commit(&format!("agent-{i}"), None);
-                        t.put_object(&obj.id(), &obj.encode()).unwrap();
+                        put_fake(&t, &obj);
                         note(status, format!("writer-{i:03}"), "at the gate".into());
                         gate.wait();
                         note(status, format!("writer-{i:03}"), "update_ref".into());
@@ -1639,7 +1700,7 @@ mod tests {
             }))
             .unwrap();
             let obj = fake_commit("budget", None);
-            t.put_object(&obj.id(), &obj.encode()).unwrap();
+            put_fake(&t, &obj);
             let res = t.update_ref("main", &obj.id(), None);
             if lands {
                 res.unwrap();
@@ -1720,7 +1781,7 @@ mod tests {
         assert!(!t2.has_object(&orphan_obj.id()).unwrap());
         // …and a live push steps over the claimed seq 2 (lands at 3+) and works.
         let next = fake_commit("after crash", None);
-        t2.put_object(&next.id(), &next.encode()).unwrap();
+        put_fake(&t2, &next);
         t2.update_ref("recovered", &next.id(), None).unwrap();
         let t3 = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
         let refs = t3.list_refs().unwrap();
@@ -2042,8 +2103,8 @@ mod tests {
 
         let t = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
         let obj = fake_commit("carry-push", None);
-        let (tip, bytes) = (obj.id(), obj.encode());
-        t.put_object(&tip, &bytes).unwrap();
+        let tip = obj.id();
+        put_fake(&t, &obj);
         t.update_ref("carried", &tip, None).unwrap();
         drop(t);
 
@@ -2069,7 +2130,7 @@ mod tests {
         let n = CHECKPOINT_INTERVAL + 2;
         for i in 0..n {
             let obj = fake_commit(&format!("fold-{i}"), None);
-            t.put_object(&obj.id(), &obj.encode()).unwrap();
+            put_fake(&t, &obj);
             t.update_ref(&format!("w-{i}"), &obj.id(), None).unwrap();
         }
         // the bucket now carries a manifest whose checkpoint_seq > 0 and the
@@ -2146,7 +2207,7 @@ mod tests {
         .unwrap();
         for i in 0..(CHECKPOINT_INTERVAL + 2) {
             let obj = fake_commit(&format!("foldfail-{i}"), None);
-            t.put_object(&obj.id(), &obj.encode()).unwrap();
+            put_fake(&t, &obj);
             t.update_ref(&format!("w-{i}"), &obj.id(), None).unwrap(); // must all be Ok
         }
         // no checkpoint could land; manifest still says 0 and reads still work

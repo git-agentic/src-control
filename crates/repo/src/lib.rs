@@ -43,6 +43,7 @@ pub mod protect;
 pub mod protect_ops;
 pub mod reachable;
 pub mod rebase_state;
+mod ref_guard;
 pub mod refs;
 pub mod remote;
 pub mod replay;

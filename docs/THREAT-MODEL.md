@@ -203,6 +203,12 @@ too, not just the src-control-side metadata.
   Publish re-runs the P5 secret scanner over all decrypted content **before**
   writing any public object, so a secret committed under seal cannot sail into
   plaintext history at release.
+- **A writer without a key can roll a private branch back (tracked
+  follow-on).** The server only checks that a pushed manifest chains to the
+  current one through `prev`, so a keyless writer can push a manifest that
+  reuses an older manifest's index and key wraps under a new `prev`. The index
+  AAD does not bind `prev`, so recipients decrypt it as the branch's content at
+  that older point. Binding `prev` into the AAD closes it.
 - **Does NOT defend:** a malicious *recipient* (any key-holder can read,
   commit, grant, or publish); the git bridge carries private branches **not at
   all** (export/push refuse unconditionally — `--include-encrypted` does not
@@ -501,16 +507,21 @@ too, not just the src-control-side metadata.
   unchanged; the diagnostic text is now sent raw (not as escaped `Display`
   output) and without the doubled prefix `Protocol` and `Remote` used to carry,
   and is escaped only when displayed. Paths are not escaped.
-- **The server enforces fast-forward and ref-target kind, not just the client.**
-  `UpdateRef` (every transport, local-path pushes and `sc serve --store`
-  included) is checked under the remote's own lock: the new tip must be a held
-  snapshot or private-branch manifest, and an existing branch's tip must be an
-  ancestor of it (a manifest's ancestry is its `prev` chain plus its base).
-  A writer therefore cannot rewind or sideways-move a branch, or point one at
-  an absent object or a blob, whatever its client does; an ancestry walk that
-  hits an object the repository does not hold fails closed. Write access can
-  still add history and fast-forward any branch, so it stays full authority
-  over new commits.
+- **The server decides a ref move itself, not just the client** (`ref_guard`).
+  Every `UpdateRef` (all transports, local-path pushes and `sc serve --store`
+  included) is checked against objects read from storage now, before the
+  repo-wide lock is taken, and the compare-and-swap is then confirmed under it.
+  The new tip must be a snapshot or a private-branch manifest of the **same
+  kind** as the branch's current tip, and the current tip must be its ancestor
+  (a snapshot's parents, which must be snapshots; a manifest's `prev` chain,
+  which must be manifests; a manifest's `base` is not an ancestor link). It
+  must also be **connected**: every parent, root tree, nested object, secret,
+  manifest `closure` entry, `base` and `anchor` the push added is held, checked
+  only along what differs from an existing ref tip. Anything absent, of the
+  wrong kind or unreadable is refused. This stops a rewind, a sideways move, a
+  public/private kind flip and a tip whose history dangles, which would break
+  clone, fetch and gc for everyone. It is not a content check: write access
+  still adds any history and fast-forwards any branch it can name.
 
 ## Bucket remotes (`sc+wal://` / `sc+s3://`) — ADR-0046/0057
 

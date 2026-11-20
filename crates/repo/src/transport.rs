@@ -231,6 +231,28 @@ impl LocalTransport {
         &self.layout
     }
 
+    /// The server's own ref-move rule (`ref_guard`), read from a fresh store
+    /// view: this transport's long-lived store can hold an object in its
+    /// resident cache, or an index entry, that `sc gc` has since removed.
+    fn check_ref_move(&self, current: Option<ObjectId>, new: ObjectId) -> Result<()> {
+        struct Fresh(Store);
+        impl crate::ref_guard::RefObjects for Fresh {
+            fn node(&mut self, id: &ObjectId) -> Result<Option<crate::ref_guard::Node>> {
+                if !self.0.contains(id) {
+                    return Ok(None);
+                }
+                Ok(Some(crate::ref_guard::Node::of(self.0.get(id)?)))
+            }
+            fn held(&mut self, id: &ObjectId) -> Result<bool> {
+                Ok(self.0.contains(id))
+            }
+        }
+        let tips = self.list_refs()?.into_iter().map(|(_, t)| t).collect();
+        let store =
+            Store::open_persistent(self.layout.objects_dir(), crate::repo::default_budget())?;
+        crate::ref_guard::check_ref_move(&mut Fresh(store), &tips, current, new)
+    }
+
     /// Bounded pack sender (P25): gather the transfer set exactly as before,
     /// but instead of collecting every object's encoded bytes into one
     /// `Vec<(ObjectId, Vec<u8>)>` (unbounded RAM) and calling `build_pack`,
@@ -716,9 +738,26 @@ impl Transport for LocalTransport {
         id: &ObjectId,
         expected_old: Option<&ObjectId>,
     ) -> Result<()> {
+        crate::refs::validate_branch_name(branch)?;
+        // Setting the ref to the value it already has is a no-op, whatever the
+        // caller expected (re-checked under the lock).
+        let seen = crate::refs::read_branch_tip(&self.layout, branch)?;
+        if seen.as_ref() == Some(id) {
+            return Ok(());
+        }
+        // A stale expectation is the common, cheap refusal: say so before
+        // walking anything.
+        if seen.as_ref() != expected_old {
+            return Err(Error::NonFastForward);
+        }
+        // The ancestry and connectivity walk can be long, so it runs before
+        // the repo-wide lock, from the tip the caller expects; under the lock
+        // only `current == expected_old` has to be confirmed, which makes the
+        // verified relation the one that is applied.
+        self.check_ref_move(expected_old.copied(), *id)?;
         let _lock = RepoLock::acquire(&self.layout)?;
-        // Revalidate inside the lock: the caller's fast-forward check ran
-        // unlocked, so the ref may have moved since (two concurrent pushes).
+        // Revalidate inside the lock: the checks above ran unlocked, so the ref
+        // may have moved since (two concurrent pushes).
         let current = crate::refs::read_branch_tip(&self.layout, branch)?;
         if current.as_ref() == Some(id) {
             return Ok(()); // already there — idempotent, nothing moves
@@ -746,19 +785,6 @@ impl Transport for LocalTransport {
         }
         if current.as_ref() != expected_old {
             return Err(Error::NonFastForward);
-        }
-        // The pushing client checks fast-forward too, but a writer need not be
-        // our client: enforce it here, under the lock.
-        {
-            let mut store = self.store.borrow_mut();
-            crate::merge::check_ref_move(current, *id, |o| {
-                if !store.contains(o) {
-                    return Err(Error::InvalidArgument(format!(
-                        "object {o} is not a snapshot or manifest held here, so the ref update cannot be verified"
-                    )));
-                }
-                crate::merge::commit_parents(o, store.get(o)?)
-            })?;
         }
         crate::refs::write_branch_tip(&self.layout, branch, id)
     }
@@ -989,63 +1015,52 @@ mod tests {
     /// Store a stand-in snapshot (see `fake_commit`) and return its id.
     fn put_commit(t: &LocalTransport, tag: &str, parent: Option<ObjectId>) -> ObjectId {
         let o = crate::test_support::fake_commit(tag, parent);
-        t.put_object(&o.id(), &o.encode()).unwrap();
+        crate::test_support::put_fake(t, &o);
         o.id()
     }
 
-    /// The server, not the pushing client, enforces fast-forward and the
-    /// target's kind: a writer with a ref-update verb must not be able to
-    /// rewind or sideways-move a branch, or point it at something that is not
-    /// a held snapshot (which would break clone, fetch and gc for everyone).
+    /// The server, not the pushing client, enforces kind, fast-forward and
+    /// connectivity (`ref_guard`); see `test_support::ref_rules_hold`.
     #[test]
-    fn update_ref_enforces_fast_forward_and_target_kind() {
+    fn update_ref_enforces_the_ref_rules() {
         let layout = tmp_remote("ff");
+        let t = LocalTransport::open(&layout.root).unwrap();
+        crate::test_support::ref_rules_hold(&t);
+        drop(t);
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    /// The check reads what is on disk now: an object this long-lived transport
+    /// still has in memory, but `sc gc` has since removed, does not count.
+    #[test]
+    fn update_ref_does_not_trust_an_object_pruned_from_disk() {
+        let layout = tmp_remote("pruned");
         let t = LocalTransport::open(&layout.root).unwrap();
         let c1 = put_commit(&t, "c1", None);
         let c2 = put_commit(&t, "c2", Some(c1));
-        let c3 = put_commit(&t, "c3", Some(c2));
-        let unrelated = put_commit(&t, "unrelated", None);
-        let blob = Object::blob(b"a blob".to_vec());
-        t.put_object(&blob.id(), &blob.encode()).unwrap();
-        let absent = Object::blob(b"never stored".to_vec()).id();
-        let tip_is = |want: ObjectId| {
-            assert_eq!(t.list_refs().unwrap(), vec![("main".to_string(), want)]);
-        };
-
-        // Creation to a held snapshot; a fast-forward over more than one step.
         t.update_ref("main", &c1, None).unwrap();
-        t.update_ref("main", &c3, Some(&c1)).unwrap();
-        tip_is(c3);
-
-        // Rewind and sideways moves are refused even with a correct
-        // expected_old, and nothing moves.
-        for target in [c1, c2, unrelated] {
-            assert!(
-                matches!(
-                    t.update_ref("main", &target, Some(&c3)),
-                    Err(Error::NonFastForward)
-                ),
-                "{target} must be refused"
-            );
-            tip_is(c3);
+        // Delete c2's loose file from under the transport (what a gc prune does).
+        let hex = c2.to_hex();
+        let mut stack = vec![layout.objects_dir()];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "")
+                    .ends_with(&hex)
+                {
+                    std::fs::remove_file(p).unwrap();
+                }
+            }
         }
-
-        // An absent object, a blob, and a blob as a branch creation.
-        assert!(t.update_ref("main", &absent, Some(&c3)).is_err());
-        assert!(matches!(
-            t.update_ref("main", &blob.id(), Some(&c3)),
-            Err(Error::BadRef(_))
-        ));
-        assert!(t.update_ref("fresh", &absent, None).is_err());
-        assert!(matches!(
-            t.update_ref("fresh", &blob.id(), None),
-            Err(Error::BadRef(_))
-        ));
-        tip_is(c3);
-
-        // A new branch may point at any held snapshot, and an unrelated one
-        // is a fresh history, not a sideways move.
-        t.update_ref("fresh", &unrelated, None).unwrap();
+        assert!(t.has_object(&c2).unwrap(), "setup: still resident");
+        assert!(t.update_ref("main", &c2, Some(&c1)).is_err());
+        assert_eq!(t.list_refs().unwrap(), vec![("main".to_string(), c1)]);
+        drop(t);
+        std::fs::remove_dir_all(&layout.root).unwrap();
     }
 
     #[test]
@@ -1448,6 +1463,10 @@ mod tests {
         repo.branch("other").unwrap();
         std::fs::write(root.join("x.txt"), b"a\nMAIN\nc\n").unwrap();
         let main_tip = repo.commit("t", "main").unwrap();
+        repo.branch("ahead").unwrap();
+        repo.switch("ahead").unwrap();
+        std::fs::write(root.join("y.txt"), b"y\n").unwrap();
+        let pushed = repo.commit("t", "ahead").unwrap();
         repo.switch("other").unwrap();
         std::fs::write(root.join("x.txt"), b"a\nOTHER\nc\n").unwrap();
         repo.commit("t", "other").unwrap();
@@ -1457,7 +1476,6 @@ mod tests {
         drop(repo);
 
         let t = LocalTransport::open(&root).unwrap();
-        let pushed = Object::blob(b"pushed".to_vec()).id();
         assert!(matches!(
             t.update_ref("main", &pushed, Some(&main_tip)),
             Err(Error::PickInProgress)

@@ -3213,7 +3213,11 @@ mod tests {
 
         // PutPack + UpdateRef land a second commit through the same session.
         let second = crate::test_support::fake_commit("second commit", Some(tip));
-        let (tip2, objects2) = (second.id(), vec![(second.id(), second.encode())]);
+        let tree = crate::test_support::empty_tree();
+        let (tip2, objects2) = (
+            second.id(),
+            vec![(tree.id(), tree.encode()), (second.id(), second.encode())],
+        );
         let (pack2, _idx2) = scl_core::pack::build_pack(&objects2).unwrap();
         let ids2 = client.put_pack(&mut std::io::Cursor::new(pack2)).unwrap();
         assert_eq!(ids2.len(), objects2.len());
