@@ -1270,3 +1270,84 @@ fn a_busy_password_gate_answers_503_and_refunds_the_attempt() {
     let r = s.post("/api/v1/users/alice/tokens", &basic("alice", &pw), body);
     assert_eq!(r.status, 201, "{}", r.msg());
 }
+
+#[test]
+fn admin_passwords_can_come_from_stdin_but_not_both_ways() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!("scl-forge-stdin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let run = |args: &[&str], stdin: &str| {
+        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_sc-forge"))
+            .args(args)
+            .arg("--data-dir")
+            .arg(&dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        c.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+        let o = c.wait_with_output().unwrap();
+        (
+            o.status.success(),
+            String::from_utf8_lossy(&o.stderr).to_string(),
+        )
+    };
+    let create = |extra: &[&str], stdin: &str| {
+        let mut a = vec![
+            "admin",
+            "user",
+            "create",
+            "--username",
+            "eng",
+            "--email",
+            "e@example.invalid",
+        ];
+        a.extend_from_slice(extra);
+        run(&a, stdin)
+    };
+    // The trailing newline is not part of the password; an empty line is refused.
+    assert!(!create(&["--password-stdin"], "\n").0, "empty password");
+    assert!(!create(&["--password-stdin"], "").0, "no line at all");
+    let (ok, err) = create(
+        &["--password-stdin", "--must-change-password=false"],
+        "stdin-pw-1\r\n",
+    );
+    assert!(ok, "{err}");
+    let (ok, err) = create(&["--password", "x", "--password-stdin"], "y\n");
+    assert!(
+        !ok && err.contains("cannot be used with"),
+        "exclusive: {err}"
+    );
+    let (ok, err) = create(&[], "y\n");
+    assert!(
+        !ok && err.contains("--password"),
+        "one of them is required: {err}"
+    );
+    let (ok, err) = run(
+        &[
+            "admin",
+            "user",
+            "change-password",
+            "--username",
+            "eng",
+            "--password-stdin",
+            "--must-change-password=false",
+        ],
+        "stdin-pw-2\n",
+    );
+    assert!(ok, "{err}");
+    let hash_of = |pw: &str| {
+        let conn = scl_forge::db::open_for_admin(&dir).unwrap();
+        let u = scl_forge::store::find_by_login(&conn, "eng")
+            .unwrap()
+            .unwrap();
+        scl_crypto::verify_password(pw, Some(&u.password_hash))
+    };
+    assert!(
+        hash_of("stdin-pw-2"),
+        "the stdin password was stored, without its newline"
+    );
+    assert!(!hash_of("stdin-pw-1"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -22,6 +22,14 @@ sc-forge admin user create --data-dir /data --username <admin> --password <pw> -
 sc-forge admin user generate-access-token --data-dir /data --username <admin> --token-name bootstrap --scopes all --raw
 ```
 
+`--password <pw>` puts the password on the command line, where the process list and shell history show it. `admin user create` and
+`admin user change-password` also take `--password-stdin` (one line on standard input, the trailing newline stripped, an empty line
+refused; under `docker run` add `-i`), which cannot be combined with `--password`:
+
+```sh
+printf '%s\n' "$ADMIN_PASSWORD" | sc-forge admin user create --data-dir /data --username <admin> --password-stdin --email <mail> --admin --must-change-password=false
+```
+
 Migrating a repository from another forge: after pushing its branches and tags, retire its old pull request numbers so
 references to them answer 404 instead of naming a new pull request (works while the server runs):
 
