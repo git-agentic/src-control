@@ -111,29 +111,33 @@ fn cleanup(repo: Repo, root: &Path) {
 fn clone_of_a_planted_control_file_fails_and_removes_what_it_created() {
     for nested in [true, false] {
         let (src, src_root) = source_with_planted_tip(&format!("clone-src-{nested}"), nested);
-        let dst = tmp_root(&format!("clone-dst-{nested}"));
-        std::fs::remove_dir_all(&dst).unwrap();
+        // A nested destination: the parents the clone made go too.
+        let base = tmp_root(&format!("clone-dst-{nested}"));
+        let dst = base.join("deep/er/victim");
         let err = Repo::clone_to(&src_root, &dst)
             .err()
             .expect("clone must fail");
         assert_unsafe(&err);
-        assert!(!dst.exists(), "a destination the clone created is removed");
+        assert!(
+            !base.join("deep").exists(),
+            "the destination and the parents the clone created are removed"
+        );
+        assert!(base.exists(), "the directory that was already there stays");
+        std::fs::remove_dir_all(&base).unwrap();
         cleanup(src, &src_root);
     }
 }
 
 #[test]
-fn failed_clone_into_an_existing_directory_leaves_that_directory_alone() {
+fn failed_clone_into_an_existing_empty_directory_keeps_the_directory() {
     let (src, src_root) = source_with_planted_tip("clone-existing-src", true);
     let dst = tmp_root("clone-existing-dst");
-    std::fs::write(dst.join("mine.txt"), "keep me").unwrap();
     let err = Repo::clone_to(&src_root, &dst)
         .err()
         .expect("clone must fail");
     assert_unsafe(&err);
-    assert_eq!(std::fs::read(dst.join("mine.txt")).unwrap(), b"keep me");
-    assert!(!dst.join(".sc").exists(), "the clone's own .sc is removed");
-    assert_nothing_planted(&dst);
+    assert!(dst.exists(), "an existing directory is not ours to remove");
+    assert_eq!(std::fs::read_dir(&dst).unwrap().count(), 0, "nor to fill");
     std::fs::remove_dir_all(&dst).unwrap();
     cleanup(src, &src_root);
 }
@@ -229,25 +233,77 @@ fn sc_work_on_a_planted_tip_refuses_before_creating_the_session() {
 
 #[test]
 fn discard_failed_clone_removes_only_what_the_clone_made() {
-    // A missing destination (with a missing parent) is claimed, so it is ours.
+    // A missing destination with missing parents is claimed: the destination
+    // and every parent the claim made go, the directory that was there stays.
     let parent = tmp_root("discard-parent");
-    let created = parent.join("deep/dst");
-    assert!(crate::sync::claim_clone_dir(&created));
+    let created = parent.join("deep/er/dst");
+    let claim = crate::sync::claim_clone_dir(&created).unwrap();
     Repo::init(&created).unwrap();
-    crate::sync::discard_failed_clone(&created, true);
-    assert!(!created.exists());
+    crate::sync::discard_failed_clone(&claim);
+    assert!(!parent.join("deep").exists(), "claimed parents are removed");
+    assert!(parent.exists(), "a pre-existing parent is not");
     std::fs::remove_dir_all(&parent).unwrap();
 
-    // An existing directory is never claimed, so only its `.sc/` goes.
+    // A claimed destination that gained a file is left, and so are its parents.
+    let parent = tmp_root("discard-nonempty");
+    let created = parent.join("deep/dst");
+    let claim = crate::sync::claim_clone_dir(&created).unwrap();
+    Repo::init(&created).unwrap();
+    std::fs::write(created.join("stray"), "x").unwrap();
+    crate::sync::discard_failed_clone(&claim);
+    assert!(!created.join(".sc").exists());
+    assert!(created.join("stray").exists(), "remove_dir only, never all");
+    std::fs::remove_dir_all(&parent).unwrap();
+
+    // An existing empty directory is accepted and kept; only its `.sc/` goes.
     let existing = tmp_root("discard-existing");
-    std::fs::write(existing.join("mine.txt"), "keep").unwrap();
-    assert!(!crate::sync::claim_clone_dir(&existing));
+    let claim = crate::sync::claim_clone_dir(&existing).unwrap();
     Repo::init(&existing).unwrap();
-    crate::sync::discard_failed_clone(&existing, false);
-    assert!(!existing.join(".sc").exists());
-    assert_eq!(std::fs::read(existing.join("mine.txt")).unwrap(), b"keep");
+    crate::sync::discard_failed_clone(&claim);
+    assert!(existing.exists() && !existing.join(".sc").exists());
     std::fs::remove_dir_all(&existing).unwrap();
     assert!(!existing.exists());
+}
+
+#[test]
+fn a_repo_exists_race_during_clone_removes_nothing() {
+    // The destination is claimed while empty, then another process makes `.sc/`.
+    let parent = tmp_root("race");
+    let dst = parent.join("deep/dst");
+    let claim = crate::sync::claim_clone_dir(&dst).unwrap();
+    std::fs::create_dir_all(dst.join(".sc")).unwrap();
+    std::fs::write(dst.join(".sc/precious"), "theirs").unwrap();
+    let err = Repo::init(&dst).err().expect("init must refuse");
+    assert!(matches!(err, Error::RepoExists(_)), "{err:?}");
+    crate::sync::discard_after_init_error(&claim, &err);
+    assert_eq!(std::fs::read(dst.join(".sc/precious")).unwrap(), b"theirs");
+    std::fs::remove_dir_all(&parent).unwrap();
+}
+
+#[test]
+fn clone_into_a_non_empty_directory_is_refused_and_changes_nothing() {
+    let (src, src_root) = source_with_planted_tip("clone-nonempty-src", true);
+    let dst = tmp_root("clone-nonempty-dst");
+    std::fs::write(dst.join("mine.txt"), "keep me").unwrap();
+    let err = Repo::clone_to(&src_root, &dst)
+        .err()
+        .expect("clone must fail");
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+    assert_eq!(std::fs::read(dst.join("mine.txt")).unwrap(), b"keep me");
+    assert!(!dst.join(".sc").exists());
+    // A symlink already inside the destination could redirect checkout writes.
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(dst.join("mine.txt")).unwrap();
+        std::os::unix::fs::symlink("/nonexistent-sc-target", dst.join("link")).unwrap();
+        let err = Repo::clone_to(&src_root, &dst)
+            .err()
+            .expect("clone must fail");
+        assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+        assert!(!dst.join(".sc").exists());
+    }
+    std::fs::remove_dir_all(&dst).unwrap();
+    cleanup(src, &src_root);
 }
 
 #[test]

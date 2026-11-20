@@ -3996,14 +3996,12 @@ fn run_clone_git(url: &str, dst: &std::path::Path) -> Result<()> {
         );
     }
 
-    let created = scl_repo::sync::claim_clone_dir(dst);
-    std::fs::create_dir_all(dst)?;
+    // An existing destination must be an empty directory (git parity).
+    let claim = scl_repo::sync::claim_clone_dir(dst)?;
     let repo = match scl_repo::Repo::init(dst) {
         Ok(r) => r,
         Err(e) => {
-            if created {
-                scl_repo::sync::discard_failed_clone(dst, true);
-            }
+            scl_repo::sync::discard_after_init_error(&claim, &e);
             return Err(e.into());
         }
     };
@@ -4028,7 +4026,7 @@ fn run_clone_git(url: &str, dst: &std::path::Path) -> Result<()> {
     let default = match adopted {
         Ok(default) => default,
         Err(e) => {
-            scl_repo::sync::discard_failed_clone(dst, created);
+            scl_repo::sync::discard_failed_clone(&claim);
             return Err(e);
         }
     };
@@ -5455,6 +5453,24 @@ mod tests {
         );
         assert!(!dst.exists(), "the failed clone removes its directory");
 
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Git parity: `sc clone` into a non-empty directory is refused before any
+    /// network or write, so a symlink already in it cannot redirect the checkout.
+    #[test]
+    fn clone_git_into_a_non_empty_directory_is_refused() {
+        let root = std::env::temp_dir().join(format!("scl-cli-nonempty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("mine.txt"), "keep me").unwrap();
+        let err = run_clone_git("file:///nonexistent/hub.git", &root).unwrap_err();
+        assert!(
+            err.to_string().contains("not an empty directory"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(std::fs::read(root.join("mine.txt")).unwrap(), b"keep me");
+        assert!(!root.join(".sc").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

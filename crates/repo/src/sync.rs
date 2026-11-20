@@ -17,36 +17,98 @@ use crate::stdio_transport::open_transport;
 use crate::transport::Transport;
 use crate::worktree;
 
-/// Take a failed clone back out of `dst`: the whole directory when the clone
-/// created it (`created`, as [`claim_clone_dir`] reported), otherwise only the
-/// `.sc/` it made, so a directory that was already there is never removed.
-/// Best effort; the caller must have dropped its [`Repo`] (the repo lock lives
-/// in `.sc/`) and reports the clone's own error, not this one. Call it only
-/// after `Repo::init` succeeded, since `init` refuses a directory that already
-/// holds a `.sc/`.
-pub fn discard_failed_clone(dst: &Path, created: bool) {
-    let _ = if created {
-        std::fs::remove_dir_all(dst)
-    } else {
-        std::fs::remove_dir_all(dst.join(".sc"))
-    };
+/// What a clone destination is, as [`claim_clone_dir`] found or made it: the
+/// directories this invocation created (missing parents first, then the
+/// destination itself), so a failed clone can remove exactly those.
+#[derive(Debug)]
+pub struct CloneClaim {
+    dst: std::path::PathBuf,
+    made: Vec<std::path::PathBuf>,
 }
 
-/// Claim the clone destination: `true` only if this call created `dst` (its
-/// missing parents are made first), so the clone owns it and may remove it on
-/// failure. Anything else, an existing directory included, or an error we
-/// cannot interpret, is `false`: the directory is the user's, and a failed
-/// clone removes only the `.sc/` it made. It never decides ownership from
+/// Claim the clone destination. An existing destination must be an empty
+/// directory (as `git clone` requires): a non-empty one is refused, which also
+/// keeps a symlink or junction already inside it from redirecting the
+/// checkout's writes. A missing one is created, parents included, one
+/// `create_dir` at a time, and each directory that call made is recorded.
+/// Ownership comes from a `create_dir` that returned `Ok`, never from
 /// `exists()`, which a race or a metadata error can get wrong.
-pub fn claim_clone_dir(dst: &Path) -> bool {
-    match std::fs::create_dir(dst) {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            dst.parent()
-                .is_some_and(|p| std::fs::create_dir_all(p).is_ok())
-                && std::fs::create_dir(dst).is_ok()
+pub fn claim_clone_dir(dst: &Path) -> Result<CloneClaim> {
+    let not_empty = || {
+        Error::InvalidArgument(format!(
+            "destination path '{}' already exists and is not an empty directory",
+            dst.display()
+        ))
+    };
+    let mut claim = CloneClaim {
+        dst: dst.to_path_buf(),
+        made: Vec::new(),
+    };
+    match std::fs::metadata(dst) {
+        Ok(m) if m.is_dir() => {
+            return if std::fs::read_dir(dst)?.next().is_none() {
+                Ok(claim)
+            } else {
+                Err(not_empty())
+            };
         }
-        Err(_) => false,
+        Ok(_) => return Err(not_empty()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    // Missing ancestors, outermost first.
+    let mut missing: Vec<&Path> = dst
+        .ancestors()
+        .take_while(|p| {
+            !p.as_os_str().is_empty()
+                && matches!(p.symlink_metadata(), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        })
+        .collect();
+    missing.reverse();
+    for dir in missing {
+        match std::fs::create_dir(dir) {
+            Ok(()) => claim.made.push(dir.to_path_buf()),
+            // Someone else made it between our look and now: theirs, not ours.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                discard_failed_clone(&claim);
+                return Err(e.into());
+            }
+        }
+    }
+    Ok(claim)
+}
+
+/// Take a failed clone back out of the claimed destination, removing only what
+/// this invocation made: its own `.sc/`, then the destination and any parents
+/// the claim created, deepest first, each only while empty (`remove_dir`, never
+/// `remove_dir_all`). A directory that is not empty is left in place and named
+/// on stderr. Best effort; the caller must have dropped its [`Repo`] (the repo
+/// lock lives in `.sc/`) and reports the clone's own error, not this one. Do
+/// not call it when `Repo::init` failed with `RepoExists`: that `.sc/` is
+/// another process's. See [`discard_after_init_error`].
+pub fn discard_failed_clone(claim: &CloneClaim) {
+    let _ = std::fs::remove_dir_all(claim.dst.join(".sc"));
+    for dir in claim.made.iter().rev() {
+        if let Err(e) = std::fs::remove_dir(dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "sc: clone failed; left {} in place (not empty)",
+                    dir.display()
+                );
+                // A parent of a directory we could not remove cannot be empty.
+                break;
+            }
+        }
+    }
+}
+
+/// [`discard_failed_clone`] for a failed `Repo::init`: if `init` refused with
+/// `RepoExists`, another process made the `.sc/` after the claim, so nothing is
+/// removed at all; any other `init` failure left only what this call wrote.
+pub fn discard_after_init_error(claim: &CloneClaim, err: &Error) {
+    if !matches!(err, Error::RepoExists(_)) {
+        discard_failed_clone(claim);
     }
 }
 
@@ -106,8 +168,9 @@ impl Repo {
     /// gapped (never-transferred) out-of-filter blobs and fail with
     /// `NotFound` — the sparse spec is what tells `materialize` to skip them.
     ///
-    /// On `Err` the clone is taken back out ([`discard_failed_clone`]): the
-    /// destination directory if this call created it, else only its `.sc/`.
+    /// An existing destination must be an empty directory. On `Err` the clone
+    /// is taken back out ([`discard_failed_clone`]): its `.sc/`, and the
+    /// destination and parents this call created while they are empty.
     pub fn clone_url_filtered(
         src_url: &str,
         dst: impl AsRef<Path>,
@@ -155,15 +218,11 @@ impl Repo {
         let remote_refs = transport.list_refs()?;
         let head_branch = transport.head_branch()?;
 
-        let created = claim_clone_dir(dst.as_ref());
+        let claim = claim_clone_dir(dst.as_ref())?;
         let dst_repo = match Repo::init(dst.as_ref()) {
             Ok(r) => r,
             Err(e) => {
-                // `init` refuses an existing `.sc/`, which is not ours to
-                // remove; only a directory this call made goes.
-                if created {
-                    discard_failed_clone(dst.as_ref(), true);
-                }
+                discard_after_init_error(&claim, &e);
                 return Err(e);
             }
         };
@@ -288,7 +347,7 @@ impl Repo {
             Ok(dst_repo)
         })();
         if result.is_err() {
-            discard_failed_clone(dst.as_ref(), created);
+            discard_failed_clone(&claim);
         }
         result
     }

@@ -48,35 +48,29 @@ fn hfs_ignorable(c: char) -> bool {
 /// Whether `component` is `.sc` on any filesystem a checkout may live on:
 /// mirrors `is_alias` in `crates/forge/src/gitwrite.rs` (HFS-ignorable code
 /// points dropped, an NTFS `:stream` suffix cut, trailing dots and spaces
-/// trimmed) but folds case with Unicode uppercase, not ASCII: a case-insensitive
-/// APFS volume resolves `.\u{17f}c` (LATIN SMALL LETTER LONG S) to `.sc`, and
-/// `'\u{17f}'.to_uppercase()` is `S`. The folded name is then compared against
-/// `.SC`, the first-six style 8.3 names `SC~1` to `SC~4`, and NTFS's checksum
-/// short name `SC` + four hex digits + `~1` to `~9` (the base of `.sc` is only
-/// two characters once the dot is stripped, so NTFS may use that form).
+/// trimmed). The `.sc` and `SC~1` to `SC~4` names are compared after Unicode
+/// uppercase folding, not ASCII: a case-insensitive APFS volume resolves
+/// `.\u{17f}c` (LATIN SMALL LETTER LONG S) to `.sc`, and
+/// `'\u{17f}'.to_uppercase()` is `S`. NTFS's checksum short name, `SC` + four
+/// hex digits + `~1` to `~9` (the base of `.sc` is only two characters once the
+/// dot is stripped, so NTFS may use that form), is matched on the original
+/// characters with ASCII folding only: full Unicode uppercase would turn an
+/// ordinary name such as `sc\u{fb00}12~1` (ff ligature) into `SCFF12~1`.
 fn is_control_dir(component: &str) -> bool {
     let c: String = component.chars().filter(|c| !hfs_ignorable(*c)).collect();
     let c = c.split(':').next().unwrap_or("");
-    let c: String = c
-        .trim_end_matches([' ', '.'])
-        .chars()
-        .flat_map(char::to_uppercase)
-        .collect();
-    if c == ".SC" {
+    let c = c.trim_end_matches([' ', '.']);
+    let upper: String = c.chars().flat_map(char::to_uppercase).collect();
+    if matches!(upper.as_str(), ".SC" | "SC~1" | "SC~2" | "SC~3" | "SC~4") {
         return true;
     }
-    let Some(tail) = c.strip_prefix("SC") else {
+    let ascii = c.to_ascii_uppercase();
+    let Some((hex, n)) = ascii.strip_prefix("SC").and_then(|t| t.split_once('~')) else {
         return false;
     };
-    match tail.split_once('~') {
-        Some(("", n)) => matches!(n, "1" | "2" | "3" | "4"),
-        Some((hex, n)) => {
-            hex.len() == 4
-                && hex.bytes().all(|b| b.is_ascii_hexdigit())
-                && matches!(n.as_bytes(), [b'1'..=b'9'])
-        }
-        None => false,
-    }
+    hex.len() == 4
+        && hex.bytes().all(|b| b.is_ascii_hexdigit())
+        && matches!(n.as_bytes(), [b'1'..=b'9'])
 }
 
 /// Refuse a `/`-separated tree path that must never be written under a
@@ -184,6 +178,9 @@ mod tests {
             "sc1234~0",
             "sc1234~10",
             "\u{17f}x",
+            "SC\u{fb00}12~1",
+            "sc\u{fb00}12~1",
+            "sc\u{17f}123~1",
             "..a",
             "a..",
         ] {
