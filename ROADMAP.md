@@ -946,6 +946,16 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
   fetch-time freshness attestation so a hostile remote can't re-serve a
   stale pre-revoke manifest — the same gittuf-shaped signed-ref effort the
   P22 provenance boundary already defers.
+- **Accepted-recipient follow-ons (ADR-0059).** Deferred rather than built:
+  (1) binding protected ciphertext to its path (a format change), so a file
+  relocated under an accepted prefix cannot gain recipients through that
+  prefix's rewrap; (2) pinning the private-branch KEK generation, since `sc undo`
+  can restore a pre-revoke manifest and reuse a retired KEK; (3)
+  authenticating the secret registry, since a writer can replace a value under
+  an allowed name (`sc verify --require` before `sc run` is the mitigation);
+  (4) `sc policy status` and `sc policy accept --all`; (5) a refused `sc work`
+  harvest discards the agent's checkout with the session (a preflight that
+  refuses to start would avoid it).
 - **Leases (P36a follow-on).** The only cross-writer coordination today is
   the manifest's compare-and-swap; there is no lease/TTL primitive for
   operations that need to hold exclusive intent across more than one bucket

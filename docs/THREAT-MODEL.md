@@ -54,7 +54,9 @@ too, not just the src-control-side metadata.
   first), and before decrypting anything. An entry whose name fails the rule
   (planted, or added by an older CLI that took any name such as `db-pass`) is
   skipped with a stderr warning, never opened and never injected, in strict and
-  non-strict mode alike. An entry whose key differs from the `name` the secret
+  non-strict mode alike. A wrap label is repository data too: `sc secret rotate`
+  without `--to` and `sc rewrap` seal only to recipients accepted for
+  `secret:<NAME>` in this clone (ADR-0059, see Protected paths). An entry whose key differs from the `name` the secret
   was sealed under (the AEAD binds that name) refuses the whole run, and
   `sc secret rotate` without `--value` refuses it too (`--value` re-seals it
   afresh). **Residual:** a writer can still replace the value of an allowed name
@@ -120,6 +122,41 @@ too, not just the src-control-side metadata.
   `sc protect`, or, while a merge, pick or rebase is stopped, to abort it,
   restore the rule and retry. Case aliases of the other parent's protected
   paths are not checked.
+- **A seal wraps only to recipients you accepted (ADR-0059):** protection rules,
+  secret wrap lists and private-branch KEK wrap labels are repository data, so a
+  writer with no key could add a rule (or a narrower one under your prefix)
+  granting their key and wait for your next commit, merge or replay reseal,
+  `sc rewrap`, `sc secret rotate` without `--to` or `sc branch revoke` to wrap a
+  DEK to them. `.sc/accepted-recipients` (local; written atomically under the
+  repo lock; never committed, packed, transferred or read by gc; `sc ws` and
+  `sc work` use the host's) lists what you accepted per scope: the full public
+  key for `path:<prefix>`, the recipient id for `secret:<NAME>` and
+  `branch:<name>`; local `[escrow]` keys count in every scope. The gate is
+  `encrypt_protected`, the one function that turns a rule into wraps, plus
+  `sc protect` (it checks the rule it changes and builds its sealing commit
+  before either ref moves), `secret_rotate`, `rewrap` (an entry with an
+  unaccepted key is skipped, the rest commits, the exit code is non-zero) and
+  `branch_revoke`. A carry that copies
+  existing wraps is not a seal and is not gated. A refusal writes nothing and
+  names the scope, the id, the local `[recipients]` name or `UNKNOWN`, the
+  `sc policy accept` command and the revoke command. Only keys you name on the
+  command line are accepted automatically (`sc protect --to`, `sc grant`,
+  `sc secret add|grant|rotate`, `sc branch --private --to`, `sc branch grant`);
+  a key found in the data never is, and a key listed in `recipients.toml` is
+  still not accepted. `sc policy accept|forget` edit the file and work while a
+  merge, pick or rebase is stopped. The record starts empty in every clone (not
+  seeded from the tip, which would accept what an attacker merged), so the first
+  affected seal lists the pairs and refuses; CI provisions the file from trusted
+  configuration. **Residual:** any writer can still make your seals refuse by
+  adding keys (denial of service); history already sealed to a writer's key
+  stays readable; binaries from before ADR-0059 do not enforce it; protected
+  ciphertext is not bound to its path, so a file relocated under an accepted
+  prefix can gain recipients through that prefix's rewrap (a format change,
+  deferred). A spurious reseal of unchanged content (a lost cache) is a seal and
+  refuses like any other. The printed revoke command can itself refuse (`sc revoke`
+  will not remove a rule's last recipient, and will not run while a merge, pick or
+  rebase is stopped), and a refused `sc work` harvest discards that agent's
+  temporary checkout with the session; accept first, or use `sc ws`.
 - **Local cache key, `sc keygen` identity and TLS serve key are owner-only on
   unix and Windows (P33, #214, #281):** the
   unchanged-detection cache is keyed by `.sc/local-key`, created owner-only from
@@ -192,6 +229,11 @@ too, not just the src-control-side metadata.
   keeps the old manifest reachable in any clone that has it). The rotation
   guarantees they can read nothing sealed *after*. Real cutover of already-
   disclosed content also means rotating the underlying credential.
+- **A KEK wrap label is repository data:** `sc branch revoke` rewraps the fresh
+  KEK only to keys accepted for `branch:<name>` in this clone (ADR-0059, see
+  Protected paths); `sc branch grant` and the creator's key accept themselves.
+  The KEK generation is not pinned, so `sc undo` can restore a pre-revoke
+  manifest and reuse a retired KEK (deferred).
 - **Escrow holders can read pre-publish:** the branch KEK is wrapped to the
   configured escrow set at creation (and re-wrapped on every membership
   change), so break-glass holders can open an embargoed branch — the standing

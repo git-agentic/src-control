@@ -1,6 +1,6 @@
 # ADR-0027: Bulk re-wrap and multiple escrow keys
 
-- **Status:** Accepted
+- **Status:** Accepted; an entry whose target set holds a key the clone never accepted is skipped, by [ADR-0059](0059-locally-accepted-recipients.md)
 - **Date:** 2026-07-07
 - **Phase:** 17
 - **Builds on:** ADR-0019 (secret lifecycle), ADR-0009 (key management), ADR-0026 (revocation tombstones)
