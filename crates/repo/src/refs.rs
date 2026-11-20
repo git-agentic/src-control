@@ -233,15 +233,12 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+    let (Some(parent), Some(_)) = (path.parent(), path.file_name()) else {
         return Err(Error::BadRef(format!("bad ref path {}", path.display())));
     };
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!(
-        ".{}.{}.{n}.tmp",
-        name.to_string_lossy(),
-        std::process::id()
-    ));
+    // Bounded and independent of the branch name, so a long name still fits NAME_MAX.
+    let tmp = parent.join(format!(".tmp.{}.{n}", std::process::id()));
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(bytes)?;
@@ -393,7 +390,7 @@ mod tests {
             write_branch_tip(&layout, name, &id).unwrap();
         }
         let dir = layout.refs_heads_dir();
-        std::fs::write(dir.join(".main.4242.1.tmp"), b"half a ref").unwrap();
+        std::fs::write(dir.join(".tmp.4242.1"), b"half a ref").unwrap();
         let mut names: Vec<String> = list_heads(&layout)
             .unwrap()
             .into_iter()
@@ -406,7 +403,7 @@ mod tests {
             .unwrap()
             .filter(|e| {
                 let n = e.as_ref().unwrap().file_name();
-                n.to_string_lossy() != ".main.4242.1.tmp" && n.to_string_lossy().starts_with('.')
+                n.to_string_lossy() != ".tmp.4242.1" && n.to_string_lossy().starts_with('.')
             })
             .count();
         assert_eq!(leftovers, 0);
