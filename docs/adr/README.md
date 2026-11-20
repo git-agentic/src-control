@@ -35,9 +35,9 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0022](0022-ssh-native-transport.md) | sc-native network transport over SSH (trait-mirror wire protocol) | Accepted | 12 |
 | [0023](0023-agent-workspaces.md) | Agent workspaces — vfs-backed sessions over the persistent store | Accepted | 13 |
 | [0024](0024-history-editing.md) | History editing via replay + operation log | Accepted | 14 |
-| [0025](0025-protected-merge-and-replay.md) | Protected merge & replay — perms-aware three-way with decrypt-on-demand | Accepted | 15 |
+| [0025](0025-protected-merge-and-replay.md) | Protected merge & replay — perms-aware three-way with decrypt-on-demand | Accepted; reseal recipients gated by 0059 | 15 |
 | [0026](0026-revocation-tombstones.md) | Revocation tombstones — durable prefix-rule revocation | Accepted | 16 |
-| [0027](0027-bulk-rewrap-and-multi-escrow.md) | Bulk re-wrap and multiple escrow keys | Accepted | 17 |
+| [0027](0027-bulk-rewrap-and-multi-escrow.md) | Bulk re-wrap and multiple escrow keys | Accepted; unaccepted targets skipped by 0059 | 17 |
 | [0028](0028-network-git-remotes.md) | Network Git remotes (GitHub over https/ssh) | Accepted | 18 |
 | [0029](0029-history-editing-polish.md) | History-editing polish — amend, resumable rebase, pick abort, merge replay | Accepted | 19 |
 | [0030](0030-agent-sessions-and-automerge.md) | Agent sessions and auto-merge of clean results | Accepted; one-session rule superseded by 0056 | 20 |
@@ -69,6 +69,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0056](0056-named-concurrent-ws-sessions.md) | Named and concurrent `sc ws` sessions and `sc ws refresh` | Accepted (built, including `sc ws refresh`) | 20 |
 | [0057](0057-bucket-compaction.md) | Bucket remote compaction and gc (`sc remote compact`) | Accepted | 36 |
 | [0058](0058-sc-forge-gitea-compatible-git-forge.md) | sc-forge: a Gitea-compatible Git forge (bare Git, recorded API subset) | Proposed | 38 |
+| [0059](0059-locally-accepted-recipients.md) | Locally accepted recipients: a seal wraps only to keys this clone accepted (`sc policy`) | Accepted | hardening |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are
 assigned in creation order, so 0017 — the secret scanner — sequences as phase P5,

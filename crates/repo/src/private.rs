@@ -331,6 +331,11 @@ impl Repo {
                 wrap_keys.push(pk.clone());
             }
         }
+        // The creator and the keys named for this branch are accepted for it;
+        // the escrow keys are not recorded (they count from `[escrow]`).
+        let mut named = vec![creator.public()];
+        named.extend(recipients.iter().cloned());
+        self.accept_keys(&crate::accepted::branch_scope(name), &named)?;
         let kek_wraps: Vec<WrappedKey> = wrap_keys
             .iter()
             .map(|pk| scl_crypto::wrap_kek_for(&kek, pk))
@@ -1234,6 +1239,11 @@ impl Repo {
     ) -> Result<ObjectId> {
         self.guard_states()?;
         let ctx = self.open_private_branch(name, Some(identity))?;
+        // The caller named `new`, so it is accepted for this branch.
+        self.accept_keys(
+            &crate::accepted::branch_scope(name),
+            std::slice::from_ref(new),
+        )?;
         let mut kek_wraps = ctx.manifest.kek_wraps.clone();
         let new_id = new.recipient_id().to_string();
         kek_wraps.retain(|w| w.recipient_id != new_id);
@@ -1293,6 +1303,11 @@ impl Repo {
             )));
         }
 
+        // `remaining` was resolved from the manifest's own wrap labels
+        // (repository data): the fresh KEK may only go to keys this clone
+        // accepted for the branch (ADR-0059).
+        self.accepted()?
+            .require(&crate::accepted::branch_scope(name), remaining)?;
         let new_kek = scl_crypto::generate_kek();
         let kek_wraps: Vec<WrappedKey> = remaining
             .iter()
@@ -1306,6 +1321,8 @@ impl Repo {
             index_ct: ctx.index.encrypt(&new_kek),
             kek_wraps,
         };
+        // Drop the local approval before the ref moves (see `Repo::revoke`).
+        self.forget_recipient(&crate::accepted::branch_scope(name), revoked)?;
         self.replace_manifest(name, &ctx, manifest, &format!("branch revoke {name}"))
     }
 
@@ -1857,9 +1874,13 @@ impl Repo {
                 }
                 let bytes = self.inner_blob(&mut store, &ctx, id)?;
                 match crate::protect::matching_prefix(&snap.protection, path) {
-                    Some(rule) => {
-                        to_encrypt.push((path.clone(), bytes, *mode, rule.granted_keys()))
-                    }
+                    Some(rule) => to_encrypt.push((
+                        path.clone(),
+                        bytes,
+                        *mode,
+                        rule.granted_keys(),
+                        rule.prefix.clone(),
+                    )),
                     None => plain.push((path.clone(), bytes, *mode)),
                 }
             }
@@ -1873,12 +1894,13 @@ impl Repo {
             let seal_plaintexts: BTreeMap<String, Vec<u8>> = if *inner_id == inner_tip {
                 to_encrypt
                     .iter()
-                    .map(|(p, b, _, _)| (p.clone(), b.clone()))
+                    .map(|(p, b, ..)| (p.clone(), b.clone()))
                     .collect()
             } else {
                 BTreeMap::new()
             };
-            let (encrypted, fresh) = crate::protect::encrypt_protected(to_encrypt)?;
+            let (encrypted, fresh) =
+                crate::protect::encrypt_protected(to_encrypt, || self.accepted())?;
             for (path, ct, mode, perms) in encrypted {
                 let blob = Object::blob(ct.clone());
                 let bid = blob.id();

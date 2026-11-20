@@ -147,6 +147,12 @@ cargo run --bin sc -- rewrap [--identity <key>] [--dry-run] [--rotate]   # one-c
 cargo run --bin sc -- escrow add <pubkey-or-name>    # append a break-glass key (list)
 cargo run --bin sc -- escrow remove <id-or-name>
 cargo run --bin sc -- escrow show                    # lists all escrow keys
+cargo run --bin sc -- policy accept <scope> --key <scl-pk|id>[,...] [--allow-unknown]
+                                              # accept recipients for path:<prefix>, secret:<NAME> or
+                                              # branch:<name> (local .sc/accepted-recipients; a seal
+                                              # refuses a key you never accepted, ADR-0059; works
+                                              # while a merge/pick/rebase is stopped)
+cargo run --bin sc -- policy forget <scope> <scl-pk|id>   # stop accepting one
 bash demo/run_rewrap_demo.sh                          # bulk rewrap + escrow-list proof
 bash demo/run_randomized_demo.sh                      # randomized protected-encryption proof
                                               # (P33): same plaintext → different ciphertext ids

@@ -84,6 +84,12 @@ impl Repo {
         let tip = self.head_tip()?.ok_or(Error::Unborn)?;
         let snap = self.snapshot(&tip)?;
         let mut skipped: Vec<(String, String)> = Vec::new();
+        // Wraps minted here come from repository data (wrap labels, rules), so
+        // an entry whose target set holds a key this clone never accepted is
+        // skipped, not sealed (ADR-0059). The escrow set passed in is local. The
+        // record loads at the first entry that wraps anything, so a rewrap with
+        // nothing to wrap does not depend on it being readable.
+        let mut accepted: Option<crate::accepted::Accepted> = None;
 
         // ---- Secrets half: fresh-DEK reseal to current set + escrow. ----
         let mut registry = snap.secrets.clone();
@@ -104,6 +110,21 @@ impl Repo {
                     }
                 }
             };
+            // The secret is sealed under its own name and the AEAD binds it. An
+            // entry registered under another name would be approved here by the
+            // registry name and resealed under the sealed one, so it is skipped
+            // (as `secret_rotate` refuses it) before anything is opened.
+            if secret.name != name {
+                skipped.push((
+                    format!("secret {name}"),
+                    format!(
+                        "registry entry points at a secret sealed as {:?}; \
+                         rotate it with --value instead",
+                        secret.name
+                    ),
+                ));
+                continue;
+            }
             // Resolve current recipient ids to pubkeys from the known pool.
             let mut targets: Vec<PublicKey> = Vec::new();
             let mut unresolvable = None;
@@ -144,6 +165,22 @@ impl Repo {
                     continue;
                 }
             };
+            // A secret opens, so it gets a fresh seal: that is a wrap to every
+            // target, and the record is read now.
+            if accepted.is_none() {
+                accepted = Some(self.accepted()?.with_escrow(escrows));
+            }
+            let pending = accepted
+                .as_ref()
+                .expect("loaded above")
+                .unaccepted(&crate::accepted::secret_scope(&name), &targets);
+            if !pending.is_empty() {
+                skipped.push((
+                    format!("secret {name}"),
+                    crate::accepted::describe_inline(&pending),
+                ));
+                continue;
+            }
             crate::secrets::require_recipients(&targets)?;
             if dry_run {
                 secrets_rewrapped.push(name);
@@ -200,6 +237,7 @@ impl Repo {
                 continue;
             };
             let granted = rule.granted_keys();
+            let scope = crate::accepted::path_scope(&rule.prefix);
             if granted.is_empty() {
                 skipped.push((
                     format!("path {path}"),
@@ -243,6 +281,25 @@ impl Repo {
                 }
             }
             let convergent = perms & scl_core::RANDOMIZED == 0;
+            // An entry mints a wrap when it is re-sealed under a fresh DEK, or
+            // when a target has no wrap yet. Reusing every existing wrap copies
+            // them and needs no approval, so the record is not read.
+            let wrap_missing = target_pks.iter().any(|pk| {
+                !wks.iter()
+                    .any(|w| w.recipient_id == pk.recipient_id().as_str())
+            });
+            // The record is read at the last moment: a re-seal checks it after
+            // its ciphertext has opened, so a corrupt blob is skipped as that
+            // even when the record is unreadable.
+            let unaccepted = |accepted: &mut Option<crate::accepted::Accepted>| -> Result<_> {
+                if accepted.is_none() {
+                    *accepted = Some(self.accepted()?.with_escrow(escrows));
+                }
+                Ok(accepted
+                    .as_ref()
+                    .expect("loaded above")
+                    .unaccepted(&scope, &target_pks))
+            };
             if convergent || rotate {
                 // Convergent (pre-P33): eager upgrade. Randomized with
                 // `rotate`: a genuine cutover to a fresh DEK. Either way:
@@ -272,6 +329,14 @@ impl Repo {
                         continue;
                     }
                 };
+                let pending = unaccepted(&mut accepted)?;
+                if !pending.is_empty() {
+                    skipped.push((
+                        format!("path {path}"),
+                        crate::accepted::describe_inline(&pending),
+                    ));
+                    continue;
+                }
                 if dry_run {
                     if convergent {
                         blobs_resealed += 1;
@@ -314,6 +379,16 @@ impl Repo {
                     blobs_rotated += 1;
                 }
                 continue;
+            }
+            if wrap_missing {
+                let pending = unaccepted(&mut accepted)?;
+                if !pending.is_empty() {
+                    skipped.push((
+                        format!("path {path}"),
+                        crate::accepted::describe_inline(&pending),
+                    ));
+                    continue;
+                }
             }
             if dry_run {
                 blobs_rewrapped += 1;
@@ -722,6 +797,9 @@ mod tests {
         rule_pk: &scl_crypto::PublicKey,
         entries: &[(&str, &[u8], &scl_crypto::PublicKey, bool)],
     ) {
+        // The test names the rule's key, like `protect --to` does.
+        repo.accept_keys("path:secret/", std::slice::from_ref(rule_pk))
+            .unwrap();
         let mut prot = Protection::default();
         prot.prefixes.push(ProtectPrefix {
             prefix: "secret/".into(),

@@ -105,21 +105,30 @@ fn split_for_encryption(
     union_prot: &Protection,
 ) -> Result<(
     Vec<(String, Vec<u8>, FileMode, u8)>,
-    Vec<(String, Vec<u8>, FileMode, Vec<[u8; 32]>)>,
+    Vec<protect::SealInput>,
 )> {
     let mut carried: Vec<(String, Vec<u8>, FileMode, u8)> = Vec::new();
-    let mut to_encrypt: Vec<(String, Vec<u8>, FileMode, Vec<[u8; 32]>)> = Vec::new();
+    let mut to_encrypt: Vec<protect::SealInput> = Vec::new();
     for f in files {
         if f.needs_encrypt {
-            let recipients = protect::matching_prefix(union_prot, &f.path)
-                .map(|r| r.granted_keys())
+            let rule = protect::matching_prefix(union_prot, &f.path)
                 .ok_or_else(|| Error::NotProtected(f.path.clone()))?;
-            to_encrypt.push((f.path.clone(), f.bytes.clone(), f.mode, recipients));
+            to_encrypt.push((
+                f.path.clone(),
+                f.bytes.clone(),
+                f.mode,
+                rule.granted_keys(),
+                rule.prefix.clone(),
+            ));
         } else if f.perms & scl_core::PROTECTED == 0 {
             match protect::matching_prefix(union_prot, &f.path) {
-                Some(rule) => {
-                    to_encrypt.push((f.path.clone(), f.bytes.clone(), f.mode, rule.granted_keys()))
-                }
+                Some(rule) => to_encrypt.push((
+                    f.path.clone(),
+                    f.bytes.clone(),
+                    f.mode,
+                    rule.granted_keys(),
+                    rule.prefix.clone(),
+                )),
                 None => carried.push((f.path.clone(), f.bytes.clone(), f.mode, 0)),
             }
         } else {
@@ -241,7 +250,7 @@ pub(crate) fn replay_commit(
     };
 
     let (mut all, to_encrypt) = split_for_encryption(&fm.files, &union_prot)?;
-    let (encrypted, fresh_wrapped) = protect::encrypt_protected(to_encrypt)?;
+    let (encrypted, fresh_wrapped) = protect::encrypt_protected(to_encrypt, || repo.accepted())?;
     all.extend(encrypted);
     let root = match &tree_carried {
         Some((crate::merge_tree::Carried::Root(id), _)) => *id,

@@ -260,6 +260,21 @@ transport-adjacent. The rest, imperatively:
   `sc keygen` identity and the TLS serve key use the same primitive (#281); `tlsio` is a leaf, so
   `load_or_mint` takes the creator from `repo` (`load_or_mint_serve_identity`) and never calls
   core. `windows-sys` and the sole Windows `unsafe` live in `scl-core` only.
+- **A seal wraps only to recipients this clone accepted (ADR-0059).** Rules,
+  secret wrap labels and private-branch KEK labels are repository data, so
+  `.sc/accepted-recipients` (local like `.sc/local-key`: atomic write under the
+  repo lock, never committed, packed or transferred, ignored by gc; ws/work use
+  the host's) lists the keys accepted per scope (full key for `path:<prefix>`,
+  id for `secret:<NAME>` and `branch:<name>`; local `[escrow]` counts everywhere).
+  `protect::encrypt_protected` (commit, merge, replay, publish), `sc protect`
+  (before either of its ref moves), `secret_rotate`, `rewrap` (skip, non-zero exit)
+  and `branch_revoke` refuse before writing when a key is not accepted; a carry
+  that copies existing wraps is not a seal. Only keys named on the command line
+  auto-accept (`protect --to`, `grant`, `secret add|grant|rotate`, `branch
+  --private --to|grant`); the record starts empty per clone; `sc policy
+  accept|forget` work while a merge/pick/rebase is stopped. A new seal site must
+  go through the gate. A test or demo that seals in a clone to a key it did not
+  name accepts it first.
 - **Revoke is standing-only.** A revoked recipient keeps decrypting ciphertext
   sealed before the revoke (they hold the old wraps); cryptographic cutover is
   `sc rewrap --rotate` at the tip (fresh key per protected blob; a plain

@@ -772,6 +772,11 @@ fn keyless_protected_merge_refuses_before_fetching_the_ciphertext() {
         before
     );
 
+    // Resealing the merged content wraps to the rule's key, which this fresh
+    // clone has not accepted yet (ADR-0059).
+    clone
+        .accept_keys("path:vault/", std::slice::from_ref(&pk))
+        .unwrap();
     let (merged, _) = clone
         .merge_with_identity("origin/b2", "t", Some(&sk))
         .unwrap();

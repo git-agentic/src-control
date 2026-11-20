@@ -1,6 +1,6 @@
 # ADR-0025: Protected merge & replay — perms-aware three-way with decrypt-on-demand
 
-- **Status:** Accepted
+- **Status:** Accepted; a reseal under a union rule wraps only to recipients the clone accepted, by [ADR-0059](0059-locally-accepted-recipients.md)
 - **Date:** 2026-07-06
 - **Phase:** 15
 - **Builds on:** ADR-0012 (three-way merge), ADR-0014 (encrypted paths),

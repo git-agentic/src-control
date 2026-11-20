@@ -3,6 +3,7 @@
 
 #[cfg(test)]
 mod abort_transitions;
+pub mod accepted;
 pub mod bucket_transport;
 pub(crate) mod cache;
 pub(crate) mod conflict_plaintext;
