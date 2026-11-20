@@ -150,7 +150,15 @@ too, not just the src-control-side metadata.
   network mounts; Windows FAT, exFAT, some SMB shares) is not detected. For an
   identity file or TLS serve key the fallback is not small: it leaves the
   unencrypted private key under inherited permissions, so other local users may
-  be able to read it.
+  be able to read it. On unix, `sc` warns once on stderr (it does not refuse)
+  when an identity file passed with `--identity` is accessible to group or others
+  (`mode & 0o077`), as ssh does for keys.
+- **Sealed blobs bind no path or position (decision):** sealed protected blobs
+  and private-branch objects use constant associated data, so a writer can move
+  a sealed blob to another path or roll a path back to an older sealed version.
+  Accepted: binding the path would force a reseal on every rename and break
+  carry-by-id. Integrity of placement comes from signed commits
+  (`sc verify --require`).
 
 ## Private branches (`sc branch --private` / `sc branch publish`) — ADR-0044
 
@@ -480,6 +488,19 @@ too, not just the src-control-side metadata.
   not authentication: any peer that speaks version 6 and passes the access gates
   is served. An `ssh://` remote runs the remote host's own `sc`, so that binary
   must match too.
+- **`.sc/serve-tokens.toml` is owner-only.** Created and rewritten (add, rotate,
+  remove) through a `0600` staging file on unix (protected DACL on Windows), so a
+  default umask does not expose the token hashes and scopes.
+- **Remote-controlled text is escaped before printing.** A server's error string
+  and a commit's author and message may carry ANSI or OSC escapes, so the CLI
+  prints C0 controls (other than newline and tab), DEL and C1 controls as visible
+  escapes (`\x1b`) when displaying those errors and the ref-name diagnostics.
+  `sc log` and `sc transcript` rows are escaped as one line (newlines and bidi
+  controls too); remote, protocol and ref diagnostics print on one line as well.
+  Stored data and `--json` output are unchanged. Wire framing and error codes are
+  unchanged; the diagnostic text is now sent raw (not as escaped `Display`
+  output) and without the doubled prefix `Protocol` and `Remote` used to carry,
+  and is escaped only when displayed. Paths are not escaped.
 
 ## Bucket remotes (`sc+wal://` / `sc+s3://`) — ADR-0046/0057
 
@@ -893,6 +914,24 @@ protected paths, plaintext.
     constants, and the spools bound disk, not RAM.
   - The ceiling (1 GiB) is compile-time, so no configuration can make a length
     claim unbounded.
+- **Git export refuses unsafe tree names.** `sc export` and a push to a git
+  remote check every entry name at the one place export builds a Git tree from an
+  sc tree: `.git`, `.gitmodules` and their HFS/NTFS aliases (git's own rules, via
+  `gix::validate`), `.`, `..`, empty names and names containing `/`, `\` or NUL
+  are refused. The check runs before the branch ref (and the mirror push) moves;
+  blobs and subtrees written before the refusal stay in the target as
+  unreferenced objects, and a repository the export created stays, with no refs
+  (it is never removed, since another export may be writing into it; a retry
+  points its unborn `HEAD` at the exported ref). A commit reused through a mark is never rewritten, so it
+  is not judged, while anything export writes is, including a commit
+  re-synthesized after its mark went stale. **Residual:** commits an older client
+  already wrote into the mirror are pushed as they are, subject only to the
+  receiver's own `fsck` rules, which are not export's policy (they accept a
+  regular `.gitmodules`, which export refuses). An entry recorded with symlink mode still
+  exports as a Git symlink (changing that would change re-synthesized tree ids),
+  and a symlinked `.gitattributes`, `.gitignore` or `.mailmap` stays exportable
+  (git treats them as informational); a Git symlink is ordinary Git content that
+  git's own checkout and `fsck` handle.
 
 ## sc-forge: authentication, tenancy, transport, resources — P38 F1/F2
 

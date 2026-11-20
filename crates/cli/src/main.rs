@@ -2700,19 +2700,7 @@ fn run_log(json: bool, identity: Option<PathBuf>) -> Result<()> {
         return Ok(());
     }
     for ((id, snap), status) in entries.iter().zip(&statuses) {
-        let merge = if snap.parents.len() > 1 {
-            " (merge)"
-        } else {
-            ""
-        };
-        print_line(&format!(
-            "{} {} {} — {}{}",
-            id.short(),
-            fmt_utc(snap.timestamp),
-            snap.author,
-            snap.message,
-            merge
-        ));
+        print_line(&render_log_line(id, snap));
         if let Some(line) = render_sig_status_line(status) {
             print_line(&line);
         }
@@ -2732,6 +2720,23 @@ fn run_log(json: bool, identity: Option<PathBuf>) -> Result<()> {
 /// themselves, but that needs `libc`; catching `BrokenPipe` at the point of
 /// writing gets the same externally-visible result (clean exit, no panic)
 /// without a new dependency.
+fn render_log_line(id: &scl_core::ObjectId, snap: &scl_core::Snapshot) -> String {
+    let merge = if snap.parents.len() > 1 {
+        " (merge)"
+    } else {
+        ""
+    };
+    // Author and message are authored by whoever made the commit, not by this user: no raw escapes.
+    format!(
+        "{} {} {} — {}{}",
+        id.short(),
+        fmt_utc(snap.timestamp),
+        scl_core::sanitize_display_line(&snap.author),
+        scl_core::sanitize_display_line(&snap.message),
+        merge
+    )
+}
+
 fn print_line(line: &str) {
     use std::io::Write;
     if let Err(e) = writeln!(std::io::stdout(), "{line}") {
@@ -3145,9 +3150,16 @@ fn run_transcript(op: TranscriptOp) -> Result<()> {
                 return Ok(());
             }
             for (tid, t) in &transcripts {
-                println!("--- {} (agent: {}) ---", tid.short(), t.agent);
+                println!(
+                    "--- {} (agent: {}) ---",
+                    tid.short(),
+                    scl_core::sanitize_display_line(&t.agent)
+                );
                 let body = repo.open_transcript(tid, &sk)?;
-                print!("{}", String::from_utf8_lossy(&body));
+                print!(
+                    "{}",
+                    scl_core::sanitize_display(&String::from_utf8_lossy(&body))
+                );
                 println!();
             }
             Ok(())
@@ -3194,7 +3206,7 @@ fn run_transcript(op: TranscriptOp) -> Result<()> {
                     "{}  {}  agent={}  {}",
                     snap.short(),
                     tid.short(),
-                    agent,
+                    scl_core::sanitize_display_line(agent),
                     transcript_sig_label(status)
                 ));
             }
@@ -3729,8 +3741,38 @@ fn run_ws(op: WsOp) -> Result<()> {
 /// is this function with `.enc` projected out — same file format handling,
 /// same errors, just a narrower return type so none of those call sites had
 /// to change shape.
+/// Whether a unix file mode lets group or others read or write the file (ssh's test for a private key).
+#[cfg(unix)]
+fn mode_open_to_group_or_others(mode: u32) -> bool {
+    mode & 0o077 != 0
+}
+
+/// Warn once on stderr when the identity file is accessible to group or others, as ssh does for keys.
+/// A warning only: an existing setup keeps working.
+#[cfg(unix)]
+fn warn_if_identity_too_open(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    if mode_open_to_group_or_others(mode)
+        && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        eprintln!(
+            "warning: identity file {} is accessible to other users (mode {mode:04o}); \
+             run `chmod 600 {}`",
+            path.display(),
+            path.display()
+        );
+    }
+}
+
 fn load_identity_full(flag: Option<PathBuf>) -> Result<scl_crypto::Identity> {
     let path = resolve_identity_path(flag);
+    #[cfg(unix)]
+    warn_if_identity_too_open(&path);
     let contents = scl_crypto::Zeroizing::new(
         std::fs::read_to_string(&path)
             .with_context(|| format!("reading identity {}", path.display()))?,
@@ -4878,6 +4920,37 @@ fn run_rewrap(identity: Option<PathBuf>, dry_run: bool, rotate: bool) -> Result<
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_mode_predicate_flags_group_and_other_access() {
+        for open in [0o644, 0o640, 0o604, 0o660, 0o666, 0o700 | 0o001, 0o620] {
+            assert!(mode_open_to_group_or_others(open), "{open:o}");
+        }
+        for private in [0o600, 0o400, 0o700, 0o500] {
+            assert!(!mode_open_to_group_or_others(private), "{private:o}");
+        }
+    }
+
+    #[test]
+    fn log_line_escapes_terminal_controls_from_author_and_message() {
+        let snap = scl_core::Snapshot {
+            root: scl_core::ObjectId::of(b"r"),
+            parents: vec![],
+            author: "evil\x1b]0;x\x07".into(),
+            timestamp: 0,
+            message: "a\x1b[2J\u{9b}b\nsecond line".into(),
+            secrets: Default::default(),
+            protection: Default::default(),
+        };
+        let line = render_log_line(&scl_core::ObjectId::of(b"s"), &snap);
+        assert!(
+            line.contains("evil\\x1b]0;x\\x07") && line.contains("a\\x1b[2J\\u{9b}b\\x0asecond"),
+            "{line}"
+        );
+        // One line: a message cannot start a line that looks like a signature status.
+        assert!(!line.chars().any(|c| c.is_control()));
+    }
 
     #[test]
     fn default_budget_warning_logic() {

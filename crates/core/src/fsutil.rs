@@ -29,6 +29,17 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// directory so the rename itself is durable. The parent directory must
 /// exist.
 pub fn atomic_write_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_durable(path, bytes, false)
+}
+
+/// Like [`atomic_write_durable`], but the staging file (and so the final file, even when it replaces
+/// a wider one) is readable by its owner only from the first byte. For files holding credential
+/// material, such as `.sc/serve-tokens.toml`.
+pub fn atomic_write_durable_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_durable(path, bytes, true)
+}
+
+fn write_durable(path: &Path, bytes: &[u8], owner_only: bool) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -38,7 +49,11 @@ pub fn atomic_write_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_extension(format!("{}.{n}.tmp", std::process::id()));
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = if owner_only {
+            crate::owner_only::create_new_owner_only_or_warn(&tmp)?
+        } else {
+            std::fs::File::create(&tmp)?
+        };
         f.write_all(bytes)?;
         f.sync_all()?;
     }
@@ -92,6 +107,27 @@ mod tests {
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
         );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_only_write_is_0600_on_create_and_on_rewrite_of_a_wider_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("scl-fsutil-oo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tokens");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        atomic_write_durable_owner_only(&path, b"one").unwrap();
+        assert_eq!(mode(&path), 0o600);
+        // A pre-existing world-readable file (written by an older build) is replaced by a 0600 one.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        atomic_write_durable_owner_only(&path, b"two").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        assert_eq!(mode(&path), 0o600);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

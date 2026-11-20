@@ -4,6 +4,7 @@
 //! BLAKE3-addressed objects (blobs, trees, snapshots, secrets) and a [`Store`]
 //! that bounds resident blob memory with LRU eviction and optional spill.
 
+pub mod display;
 pub mod error;
 pub mod fsutil;
 pub mod id;
@@ -171,6 +172,7 @@ pub fn read_exact_vec(r: &mut impl std::io::Read, len: usize) -> std::io::Result
     Ok(buf)
 }
 
+pub use display::{sanitize_display, sanitize_display_line};
 pub use error::{Error, Result};
 pub use id::ObjectId;
 pub use object::{

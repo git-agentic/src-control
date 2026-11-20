@@ -14,9 +14,9 @@ use scl_core::{EntryKind, FileMode, Object, ObjectId, Snapshot, Store, PROTECTED
 /// A Git repository we write objects and refs into.
 pub(crate) struct GitTarget {
     repo: gix::Repository,
-    /// True if THIS call created the repo (so we own its `HEAD`). We only point
-    /// `HEAD` at the exported ref when we created the repo — never clobber the
-    /// `HEAD` of a pre-existing repo (it may be someone's working checkout).
+    /// True if THIS call created the repo, or it holds no refs at all (so its `HEAD`
+    /// is unborn and we may point it at the exported ref). Never clobber the `HEAD`
+    /// of a repo that has refs (it may be someone's working checkout).
     pub(crate) created: bool,
 }
 
@@ -60,25 +60,48 @@ impl GitTarget {
     /// Open an existing Git repo at `path`; if `path` does not exist, create a
     /// bare repo there. A path that exists but is not a Git repo is an error.
     pub(crate) fn open_or_init_bare(path: &Path) -> Result<GitTarget> {
-        let (repo, created) = if path.exists() {
-            (
-                gix::open(path).with_context(|| {
-                    format!("{} exists but is not a git repository", path.display())
-                })?,
-                false,
-            )
-        } else {
+        // Claim the directory with an exclusive create: only a call that made it initializes the
+        // repository. Another process that wins the race, or a directory that already exists,
+        // makes this call treat the target as pre-existing. Nothing here ever removes a target.
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let claimed = match std::fs::create_dir(path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!("creating {}", path.display())))
+            }
+        };
+        let (repo, created) = if claimed {
             (
                 gix::init_bare(path)
                     .with_context(|| format!("initializing bare git repo at {}", path.display()))?,
                 true,
             )
+        } else {
+            let repo = gix::open(path).with_context(|| {
+                format!("{} exists but is not a git repository", path.display())
+            })?;
+            // A bare repo with no refs and a symbolic, unborn HEAD (what a refused export leaves
+            // behind) gets the HEAD a fresh repo would. A checkout, or a detached HEAD, keeps its own.
+            let no_refs = repo
+                .references()
+                .context("listing refs")?
+                .all()
+                .context("listing refs")?
+                .next()
+                .is_none();
+            let symbolic_head = matches!(repo.head_name(), Ok(Some(_)));
+            let adopt = no_refs && repo.is_bare() && symbolic_head;
+            (repo, adopt)
         };
         Ok(GitTarget { repo, created })
     }
 
     /// Point `HEAD` at `ref_name` (a symbolic ref). Only meaningful on a repo we
-    /// created — a fresh `init_bare` HEAD may name `main`/`master` regardless of
+    /// created or a bare one with no refs — a fresh `init_bare` HEAD may name `main`/`master` regardless of
     /// our branch, so a mirror needs HEAD pointed at the ref we actually wrote or
     /// `git log`/`import_head` (which resolve HEAD) see nothing.
     pub(crate) fn set_head(&self, ref_name: &str) -> Result<()> {
@@ -253,6 +276,14 @@ fn map_tree(
         return Ok(g);
     }
     let tree = store.get_tree(&id)?;
+    // The one place a new Git tree is built from an sc tree, so every name export writes is judged
+    // here, including a commit re-synthesized after its mark went stale. A commit reused through a
+    // mark is never rewritten and so never reaches this. The refusal comes before the branch ref
+    // (and any mirror push) moves; blobs and subtrees already written stay in the target as
+    // unreferenced objects, which is harmless.
+    for e in &tree.entries {
+        check_entry_name(&e.name)?;
+    }
     let mut git_entries = Vec::with_capacity(tree.entries.len());
     for e in &tree.entries {
         if e.perms & PROTECTED != 0 {
@@ -447,6 +478,28 @@ fn count_transcripts(
     Ok(count)
 }
 
+/// Refuse a tree entry name git's `fsck` would refuse (or that a checkout would resolve into `.git`
+/// or `.gitmodules`), so a hostile sc tree cannot become a hostile Git tree. The `.git`, HFS and NTFS
+/// alias rules are git's own, via `gix::validate`; the Windows-only rules (reserved names, `:`, `?`)
+/// are left off because they are legal on Unix, which a repository may target. `.gitmodules` is
+/// refused for any entry kind (the validator only does so for symlinks, so it is told it is one).
+fn check_entry_name(name: &str) -> anyhow::Result<()> {
+    use gix::validate::path::component::{Mode, Options};
+    let opts = Options {
+        protect_windows: false,
+        protect_hfs: true,
+        protect_ntfs: true,
+    };
+    let bad = name.contains(['\\', '\0'])
+        || gix::validate::path::component(name.as_bytes().into(), Some(Mode::Symlink), opts)
+            .is_err();
+    anyhow::ensure!(
+        !bad,
+        "refusing to export: tree entry name {name:?} is not a safe Git path component"
+    );
+    Ok(())
+}
+
 /// Record PROTECTED entry paths under `prefix`, recursing into subtrees. Uses an
 /// explicit stack so deep trees can't overflow. Deduplicates subtree object ids
 /// via `seen` so shared subtrees (identical content at multiple paths in a
@@ -510,8 +563,9 @@ pub fn export_branch(
     // Git-native equivalent either, always counted, exported or not.
     let transcripts_dropped = count_transcripts(store, &seen_snaps)?;
 
+    // A refused export may leave the bare repository it created, with no refs. It is never removed:
+    // another export may already be writing into it. A retry finds it ref-less and sets its HEAD.
     let target = GitTarget::open_or_init_bare(opts.to)?;
-
     let mut commit_memo: HashMap<ObjectId, gix::ObjectId> = HashMap::new();
     // Seed with commits already on the target (marks map): these are reused, not
     // rewritten. A bad hex here is a corrupt marks file — surface it. Verify each
@@ -1444,5 +1498,262 @@ mod tests {
 
         std::fs::remove_dir_all(&gsrc).unwrap();
         std::fs::remove_dir_all(&dst).unwrap();
+    }
+
+    fn one_entry_snapshot(
+        store: &mut scl_core::Store,
+        name: &str,
+        mode: FileMode,
+        nested: bool,
+    ) -> ObjectId {
+        use scl_core::{Snapshot, Tree, TreeEntry};
+        let blob = store.put(Object::blob(b"x".to_vec())).unwrap();
+        let entry = |name: &str, kind, id, mode| TreeEntry {
+            name: name.into(),
+            kind,
+            id,
+            mode,
+            perms: 0,
+        };
+        let mut root = store
+            .put(Object::Tree(Tree::new(vec![entry(
+                name,
+                EntryKind::Blob,
+                blob,
+                mode,
+            )])))
+            .unwrap();
+        if nested {
+            root = store
+                .put(Object::Tree(Tree::new(vec![
+                    entry("a.txt", EntryKind::Blob, blob, FileMode::FILE),
+                    entry("sub", EntryKind::Tree, root, FileMode::FILE),
+                ])))
+                .unwrap();
+        }
+        store
+            .put(Object::Snapshot(Snapshot {
+                root,
+                parents: vec![],
+                author: "t".into(),
+                timestamp: 1,
+                message: "m".into(),
+                secrets: Default::default(),
+                protection: Default::default(),
+            }))
+            .unwrap()
+    }
+
+    #[test]
+    fn check_entry_name_refuses_git_special_and_malformed_names() {
+        for bad in [
+            "",
+            ".",
+            "..",
+            ".git",
+            ".GIT",
+            ".git.",
+            ".git ",
+            "git~1",
+            ".g\u{200c}it",
+            ".git:x",
+            ".gitmodules",
+            ".GitModules",
+            "gitmod~1",
+            "gi7eba~1",
+            "gi7eba~9",
+            "gi7eb~10",
+            "gi7eb~12",
+            "a/b",
+            "a\\b",
+            "a\0b",
+        ] {
+            assert!(check_entry_name(bad).is_err(), "{bad:?} must be refused");
+        }
+        for ok in [
+            ".gitignore",
+            ".gitattributes",
+            "gitmodules",
+            "main.rs",
+            ".github",
+            "..a",
+            // Legal on Unix, refused only by the Windows rules, which are off.
+            "a:b",
+            "what?.txt",
+            "con",
+        ] {
+            assert!(check_entry_name(ok).is_ok(), "{ok:?} must be allowed");
+        }
+    }
+
+    #[test]
+    fn export_refuses_hostile_name_before_any_ref_moves() {
+        for name in [".git", ".gitmodules", "GIT~1"] {
+            let mut store = scl_core::Store::new(scl_core::StoreConfig::default());
+            // Nested, so the walk must reach it past a clean sibling blob.
+            let snap = one_entry_snapshot(&mut store, name, FileMode::FILE, true);
+            let dir = std::env::temp_dir().join(format!(
+                "scl-hostile-{}-{}",
+                std::process::id(),
+                name.replace('~', "_")
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let empty = HashMap::new();
+            let opts = |ref_name| ExportOptions {
+                to: &dir,
+                ref_name,
+                include_encrypted: false,
+                known_git_commits: &empty,
+            };
+            // A non-default ref: HEAD of a repo left behind would not name it.
+            let topic = "refs/heads/topic";
+            let err = export_branch(&mut store, snap, &opts(topic)).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("not a safe Git path"),
+                "{err:#}"
+            );
+            // No ref moved in the repository the refused export created.
+            assert_eq!(read_ref(&dir, topic).unwrap(), None);
+
+            // A clean retry to the same ref succeeds and leaves a repo `git log` can read.
+            let clean = commit_with(&mut store, "a.txt", None, "clean");
+            export_branch(&mut store, clean, &opts(topic)).unwrap();
+            let out = Command::new("git")
+                .args([
+                    "--git-dir",
+                    dir.to_str().unwrap(),
+                    "log",
+                    "--format=%s",
+                    "topic",
+                ])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "clean");
+            let head = Command::new("git")
+                .args(["--git-dir", dir.to_str().unwrap(), "log", "--format=%s"])
+                .output()
+                .unwrap();
+            assert!(
+                head.status.success(),
+                "HEAD must name the exported ref: {head:?}"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+
+            // A pre-existing repo is never removed, and no ref moves in it.
+            GitTarget::open_or_init_bare(&dir).unwrap();
+            assert!(export_branch(&mut store, snap, &opts(topic)).is_err());
+            assert!(dir.exists());
+            assert_eq!(read_ref(&dir, topic).unwrap(), None);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn export_keeps_a_recorded_symlink_mode_as_a_git_symlink() {
+        // Changing this would change re-synthesized tree ids for repos imported from git with
+        // symlinks, and break the round trip.
+        let mut store = scl_core::Store::new(scl_core::StoreConfig::default());
+        let snap = one_entry_snapshot(&mut store, "link", FileMode(0o120000), false);
+        let dir = std::env::temp_dir().join(format!("scl-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let empty = HashMap::new();
+        let opts = ExportOptions {
+            to: &dir,
+            ref_name: "refs/heads/main",
+            include_encrypted: false,
+            known_git_commits: &empty,
+        };
+        export_branch(&mut store, snap, &opts).unwrap();
+        let out = Command::new("git")
+            .args(["--git-dir", dir.to_str().unwrap(), "ls-tree", "main"])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8(out.stdout).unwrap();
+        assert!(listing.starts_with("120000 blob"), "{listing}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A snapshot whose root holds one blob named `name`, on top of `parent` if given.
+    fn commit_with(
+        store: &mut scl_core::Store,
+        name: &str,
+        parent: Option<ObjectId>,
+        msg: &str,
+    ) -> ObjectId {
+        use scl_core::{Snapshot, Tree, TreeEntry};
+        let blob = store.put(Object::blob(msg.as_bytes().to_vec())).unwrap();
+        let root = store
+            .put(Object::Tree(Tree::new(vec![TreeEntry {
+                name: name.into(),
+                kind: EntryKind::Blob,
+                id: blob,
+                mode: FileMode::FILE,
+                perms: 0,
+            }])))
+            .unwrap();
+        store
+            .put(Object::Snapshot(Snapshot {
+                root,
+                parents: parent.into_iter().collect(),
+                author: "t".into(),
+                timestamp: 1,
+                message: msg.into(),
+                secrets: Default::default(),
+                protection: Default::default(),
+            }))
+            .unwrap()
+    }
+
+    #[test]
+    fn only_snapshots_that_will_be_written_are_name_checked() {
+        let mut store = scl_core::Store::new(scl_core::StoreConfig::default());
+        // `old` (with .gitmodules) is already on the destination; `fixed` removed it.
+        let old = commit_with(&mut store, ".gitmodules", None, "old");
+        let fixed = commit_with(&mut store, "a.txt", Some(old), "fixed");
+        let bad_new = commit_with(&mut store, ".gitmodules", Some(fixed), "readded");
+
+        // Put `old` on the destination as a Git commit, as an earlier push (before the check) would have.
+        let dir = std::env::temp_dir().join(format!("scl-pending-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let target = GitTarget::open_or_init_bare(&dir).unwrap();
+        let snap = store.get_snapshot(&old).unwrap();
+        // Its tree is irrelevant to reuse (and map_tree would refuse the name): an empty one will do.
+        let tree = target.write_tree(vec![]).unwrap();
+        let old_git = map_commit(&target, &snap, tree, &[]).unwrap();
+        let known: HashMap<ObjectId, String> = HashMap::from([(old, old_git.to_hex().to_string())]);
+        let export = |store: &mut scl_core::Store, tip, known| {
+            export_branch(
+                store,
+                tip,
+                &ExportOptions {
+                    to: &dir,
+                    ref_name: "refs/heads/main",
+                    include_encrypted: false,
+                    known_git_commits: known,
+                },
+            )
+        };
+
+        // Old, already-pushed history is not judged; the new clean commit goes through.
+        let rep = export(&mut store, fixed, &known).unwrap();
+        // A new commit that adds it again is refused.
+        let err = export(&mut store, bad_new, &known).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not a safe Git path"),
+            "{err:#}"
+        );
+        assert_eq!(
+            read_ref(&dir, "refs/heads/main").unwrap().as_deref(),
+            Some(rep.git_commit.as_str()),
+            "the ref must not move on refusal"
+        );
+        // Without the mark the old commit is re-synthesized, so it is checked.
+        let none = HashMap::new();
+        assert!(export(&mut store, fixed, &none).is_err());
+        // A stale mark (commit pruned from the destination) is also re-synthesized and checked.
+        let stale = HashMap::from([(old, "1".repeat(40))]);
+        assert!(export(&mut store, fixed, &stale).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
