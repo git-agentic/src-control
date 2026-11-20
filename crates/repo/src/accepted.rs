@@ -1257,7 +1257,6 @@ mod tests {
     // list also counts as accepted) must not be able to write them on clone.
     // That is the working-tree path guard's job (PR #367).
     #[test]
-    #[ignore = "needs PR #367"]
     fn a_cloned_tree_cannot_plant_the_record_or_the_recipients_file() {
         for (i, planted) in [".sc/accepted-recipients", ".sc/recipients.toml"]
             .into_iter()
@@ -1270,23 +1269,40 @@ mod tests {
             put(&s_root, "readme.txt", "hello\n");
             let tip = src.commit("me", "base").unwrap();
             let snap = src.snapshot(&tip).unwrap();
-            let root = src
-                .vfs()
-                .write_tree_with_perms(&[
-                    (
-                        "readme.txt".to_string(),
-                        b"hello\n".to_vec(),
-                        scl_core::FileMode::FILE,
-                        0,
-                    ),
-                    (
-                        planted.to_string(),
-                        b"planted".to_vec(),
-                        scl_core::FileMode::FILE,
-                        0,
-                    ),
-                ])
-                .unwrap();
+            // Built through the store: a commit now refuses a `.sc` path itself.
+            let root = {
+                use scl_core::{EntryKind, FileMode, Object, Tree, TreeEntry};
+                let store = src.vfs_handle().store();
+                let mut st = store.lock().unwrap();
+                let blob = st.put(Object::blob(b"planted".to_vec())).unwrap();
+                let leaf = planted.trim_start_matches(".sc/").to_string();
+                let sub = st
+                    .put(Object::Tree(Tree::new(vec![TreeEntry {
+                        name: leaf,
+                        kind: EntryKind::Blob,
+                        id: blob,
+                        mode: FileMode::FILE,
+                        perms: 0,
+                    }])))
+                    .unwrap();
+                st.put(Object::Tree(Tree::new(vec![
+                    TreeEntry {
+                        name: ".sc".into(),
+                        kind: EntryKind::Tree,
+                        id: sub,
+                        mode: FileMode::FILE,
+                        perms: 0,
+                    },
+                    TreeEntry {
+                        name: "readme.txt".into(),
+                        kind: EntryKind::Blob,
+                        id: blob,
+                        mode: FileMode::FILE,
+                        perms: 0,
+                    },
+                ])))
+                .unwrap()
+            };
             src.commit_snapshot(root, vec![tip], snap.secrets, snap.protection, "w", "plant")
                 .unwrap();
             drop(src);
