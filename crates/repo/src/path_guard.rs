@@ -1,0 +1,226 @@
+//! A tree from a peer may name any path, but a checkout must never write into
+//! the `.sc/` control directory (or out of the working tree). These tests plant
+//! such a tree through the store API (a commit now refuses it) and check that
+//! clone, switch and fast-forward refuse before the first write, and that a
+//! failed clone takes itself back out.
+
+use std::path::{Path, PathBuf};
+
+use scl_core::{EntryKind, FileMode, Object, ObjectId, Protection, Snapshot, Tree, TreeEntry};
+
+use crate::error::Error;
+use crate::repo::Repo;
+
+fn tmp_root(tag: &str) -> PathBuf {
+    let p = std::env::temp_dir().join(format!("scl-pg-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&p);
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+fn entry(name: &str, kind: EntryKind, id: ObjectId) -> TreeEntry {
+    TreeEntry {
+        name: name.into(),
+        kind,
+        id,
+        mode: FileMode::FILE,
+        perms: 0,
+    }
+}
+
+/// Store a snapshot whose tree holds `ok.txt` and the planted
+/// `.sc/recipients.toml`, either as a real `.sc` directory (`nested`) or as a
+/// single entry whose name contains the slash. Returns the snapshot id.
+fn plant(repo: &Repo, parent: Option<ObjectId>, nested: bool) -> ObjectId {
+    let store = repo.vfs_handle().store();
+    let mut s = store.lock().unwrap();
+    let blob = s.put(Object::blob(b"planted".to_vec())).unwrap();
+    let planted = if nested {
+        let sub = s
+            .put(Object::Tree(Tree::new(vec![entry(
+                "recipients.toml",
+                EntryKind::Blob,
+                blob,
+            )])))
+            .unwrap();
+        entry(".sc", EntryKind::Tree, sub)
+    } else {
+        entry(".sc/recipients.toml", EntryKind::Blob, blob)
+    };
+    let root = s
+        .put(Object::Tree(Tree::new(vec![
+            planted,
+            entry("ok.txt", EntryKind::Blob, blob),
+        ])))
+        .unwrap();
+    s.put(Object::Snapshot(Snapshot {
+        root,
+        parents: parent.into_iter().collect(),
+        author: "t".into(),
+        timestamp: 0,
+        message: "planted".into(),
+        secrets: Default::default(),
+        protection: Protection::default(),
+    }))
+    .unwrap()
+}
+
+fn assert_unsafe(err: &Error) {
+    assert!(
+        matches!(err, Error::Core(scl_core::Error::UnsafePath { .. })),
+        "wanted UnsafePath, got {err:?}"
+    );
+}
+
+/// No file under `root` (the `.sc` dir included) holds the planted bytes.
+fn assert_nothing_planted(root: &Path) {
+    fn walk(dir: &Path, hits: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, hits);
+            } else if std::fs::read(&p).is_ok_and(|b| b == b"planted") {
+                hits.push(p);
+            }
+        }
+    }
+    let mut hits = Vec::new();
+    walk(root, &mut hits);
+    assert!(hits.is_empty(), "planted bytes were written: {hits:?}");
+    assert!(!root.join(".sc/recipients.toml").exists());
+}
+
+fn source_with_planted_tip(tag: &str, nested: bool) -> (Repo, PathBuf) {
+    let root = tmp_root(tag);
+    let src = Repo::init(&root).unwrap();
+    let tip = plant(&src, None, nested);
+    crate::refs::write_branch_tip(src.layout(), "main", &tip).unwrap();
+    (src, root)
+}
+
+fn cleanup(repo: Repo, root: &Path) {
+    drop(repo);
+    std::fs::remove_dir_all(root).unwrap();
+    assert!(!root.exists(), "test root must be removed");
+}
+
+#[test]
+fn clone_of_a_planted_control_file_fails_and_removes_what_it_created() {
+    for nested in [true, false] {
+        let (src, src_root) = source_with_planted_tip(&format!("clone-src-{nested}"), nested);
+        let dst = tmp_root(&format!("clone-dst-{nested}"));
+        std::fs::remove_dir_all(&dst).unwrap();
+        let err = Repo::clone_to(&src_root, &dst)
+            .err()
+            .expect("clone must fail");
+        assert_unsafe(&err);
+        assert!(!dst.exists(), "a destination the clone created is removed");
+        cleanup(src, &src_root);
+    }
+}
+
+#[test]
+fn failed_clone_into_an_existing_directory_leaves_that_directory_alone() {
+    let (src, src_root) = source_with_planted_tip("clone-existing-src", true);
+    let dst = tmp_root("clone-existing-dst");
+    std::fs::write(dst.join("mine.txt"), "keep me").unwrap();
+    let err = Repo::clone_to(&src_root, &dst)
+        .err()
+        .expect("clone must fail");
+    assert_unsafe(&err);
+    assert_eq!(std::fs::read(dst.join("mine.txt")).unwrap(), b"keep me");
+    assert!(!dst.join(".sc").exists(), "the clone's own .sc is removed");
+    assert_nothing_planted(&dst);
+    std::fs::remove_dir_all(&dst).unwrap();
+    cleanup(src, &src_root);
+}
+
+#[test]
+fn switch_onto_a_planted_tip_refuses_before_writing_anything() {
+    let root = tmp_root("switch");
+    let repo = Repo::init(&root).unwrap();
+    std::fs::write(root.join("a.txt"), "a\n").unwrap();
+    let c1 = repo.commit("me", "base").unwrap();
+    let evil = plant(&repo, Some(c1), true);
+    crate::refs::write_branch_tip(repo.layout(), "evil", &evil).unwrap();
+    let err = repo.switch("evil").unwrap_err();
+    assert_unsafe(&err);
+    assert_eq!(repo.head_tip().unwrap(), Some(c1), "HEAD did not move");
+    assert!(!root.join("ok.txt").exists(), "no file was laid");
+    assert!(root.join("a.txt").exists(), "the old tree is untouched");
+    assert_nothing_planted(&root);
+    cleanup(repo, &root);
+}
+
+#[test]
+fn fast_forward_onto_a_planted_tip_refuses_before_writing_anything() {
+    let root = tmp_root("ff");
+    let repo = Repo::init(&root).unwrap();
+    std::fs::write(root.join("a.txt"), "a\n").unwrap();
+    let c1 = repo.commit("me", "base").unwrap();
+    let evil = plant(&repo, Some(c1), true);
+    crate::refs::write_branch_tip(repo.layout(), "evil", &evil).unwrap();
+    let err = repo.merge("evil", "me").unwrap_err();
+    assert_unsafe(&err);
+    assert_eq!(
+        repo.head_tip().unwrap(),
+        Some(c1),
+        "the branch did not move"
+    );
+    assert!(!root.join("ok.txt").exists(), "no file was laid");
+    assert_nothing_planted(&root);
+    cleanup(repo, &root);
+}
+
+#[test]
+fn discard_failed_clone_removes_only_what_the_clone_made() {
+    let created = tmp_root("discard-created");
+    Repo::init(&created).unwrap();
+    crate::sync::discard_failed_clone(&created, false);
+    assert!(!created.exists());
+
+    let existing = tmp_root("discard-existing");
+    std::fs::write(existing.join("mine.txt"), "keep").unwrap();
+    Repo::init(&existing).unwrap();
+    crate::sync::discard_failed_clone(&existing, true);
+    assert!(!existing.join(".sc").exists());
+    assert_eq!(std::fs::read(existing.join("mine.txt")).unwrap(), b"keep");
+    std::fs::remove_dir_all(&existing).unwrap();
+    assert!(!existing.exists());
+}
+
+#[test]
+fn commit_refuses_a_control_dir_alias() {
+    let root = tmp_root("commit");
+    let repo = Repo::init(&root).unwrap();
+    std::fs::write(root.join("a.txt"), "a\n").unwrap();
+    let c1 = repo.commit("me", "base").unwrap();
+    std::fs::create_dir_all(root.join("sub/.SC")).unwrap();
+    std::fs::write(root.join("sub/.SC/x"), "x").unwrap();
+    let err = repo.commit("me", "alias").unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            Error::Vfs(scl_vfs::Error::Core(scl_core::Error::UnsafePath { .. }))
+        ),
+        "{err:?}"
+    );
+    assert_eq!(repo.head_tip().unwrap(), Some(c1), "no ref moved");
+    cleanup(repo, &root);
+}
+
+#[test]
+fn private_tree_builder_refuses_a_control_dir_alias() {
+    let blob = Object::blob(b"x".to_vec()).id();
+    let map = |p: &str| std::iter::once((p.to_string(), (blob, FileMode::FILE, 0u8))).collect();
+    for bad in [".sc/x", "a/.Sc/b", "sc~1"] {
+        assert!(
+            crate::private::build_tree_objects(&map(bad)).is_err(),
+            "{bad}"
+        );
+    }
+    assert!(crate::private::build_tree_objects(&map("a/.scignore")).is_ok());
+}

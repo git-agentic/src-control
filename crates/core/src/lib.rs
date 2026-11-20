@@ -11,6 +11,7 @@ pub mod id;
 pub mod object;
 pub mod owner_only;
 pub mod pack;
+pub mod pathname;
 pub mod store;
 #[cfg(windows)]
 mod winacl;
@@ -180,6 +181,7 @@ pub use object::{
     RecipientState, SealedObj, Secret, SignatureObj, Snapshot, Transcript, Tree, TreeEntry,
     WrappedKey, PROTECTED, RANDOMIZED,
 };
+pub use pathname::{check_tree_path, PathRefusal};
 pub use store::{Backend, SpillPolicy, Store, StoreConfig, StoreStats};
 
 #[cfg(test)]

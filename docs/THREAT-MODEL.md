@@ -813,6 +813,16 @@ protected paths, plaintext.
     private-branch) refuse it with `FileDirCollision` before any tree is written,
     for commit, merge completion, `sc ws harvest` and `sc ws refresh`. Remove the
     directory and retry.
+  - A tree path is never written if it could reach the `.sc/` control directory
+    or leave the checkout. A tree comes from a peer and decode accepts any entry
+    name, so `scl_core::check_tree_path` refuses, per component, an empty, `.`,
+    `..` or NUL name, `.sc` at any depth under its filesystem aliases (HFS
+    ignorable code points, NTFS `:stream`, trailing dots and spaces, case, the
+    short name `sc~1`), and on Windows any `\` or `:`. The tree flatteners and
+    `safe_join` apply it before the first write, so clone, switch, merge, undo and
+    `scl_vfs::Worktree::checkout` refuse with `UnsafePath` and change nothing; both
+    tree builders refuse to commit such a path. A clone that fails removes the
+    directory it created (only its `.sc/` if the directory already existed).
 - **Not enforced (known limits):**
   - A user file whose bytes equal the tracked or laid ones cannot be told from
     the stop's own write, so it is removed.

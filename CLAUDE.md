@@ -375,6 +375,11 @@ transport-adjacent. The rest, imperatively:
   makes the commit, merge completion, `sc ws harvest` or `sc ws refresh` fail
   until the directory is removed (ADR-0034 refinement 9). Across commits a path
   may still change kind (#247).
+- **Tree paths go through `scl_core::check_tree_path` before any write.** Tree
+  decode accepts any entry name, so the flatteners in `worktree.rs`, `safe_join`
+  and `Worktree::checkout` refuse `.sc` (any depth, any alias), traversal, NUL
+  and, on Windows, `\` and `:`; both tree builders refuse to commit them. A new
+  write-out path must flatten through those walkers or call it itself.
 - **Every ref-moving or commit-creating op (including all secret/protect
   policy ops) is guarded against an in-progress merge/pick/rebase** — finish
   or abort the in-progress op first. A push into a repo with a stopped op is
