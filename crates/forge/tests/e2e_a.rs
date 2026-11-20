@@ -151,13 +151,18 @@ fn users_orgs_and_visibility() {
         nf.json()["errors"],
         json!(["user redirect does not exist [name: nobody-org]"])
     );
-    // Private org: owner and admin see it, others get the recorded 404.
+    // Private org: owner and admin see it, others get exactly what a missing organization gets
+    // (a recorded departure from Gitea's `HasOrgOrUserVisible`, which told the two apart).
     let hidden = s.get("/api/v1/orgs/acme", &token(&bob));
     assert_eq!(
         (hidden.status, hidden.msg().as_str()),
-        (404, "HasOrgOrUserVisible")
+        (404, "GetOrgByName")
     );
-    assert_eq!(hidden.json()["errors"], serde_json::Value::Null);
+    let missing = s.get("/api/v1/orgs/acmf", &token(&bob));
+    assert_eq!(
+        (hidden.status, hidden.s_text().replace("acme", "<o>")),
+        (missing.status, missing.s_text().replace("acmf", "<o>"))
+    );
     let perms = s.get("/api/v1/users/siteadmin/orgs/acme/permissions", &adm);
     assert_eq!(
         perms.json(),
@@ -963,11 +968,32 @@ fn private_org_permissions_are_hidden_from_outsiders() {
         "/api/v1/users/siteadmin/orgs/secret/permissions",
         &token(&eve),
     );
-    assert_eq!(
-        (r.status, r.msg().as_str()),
-        (404, "HasOrgOrUserVisible"),
-        "no membership oracle for outsiders"
-    );
+    // An outsider cannot tell a private organization from a missing one on any org route.
+    for (hidden, missing) in [
+        (
+            "/api/v1/users/siteadmin/orgs/secret/permissions",
+            "/api/v1/users/siteadmin/orgs/secrex/permissions",
+        ),
+        ("/api/v1/orgs/secret", "/api/v1/orgs/secrex"),
+        ("/api/v1/orgs/secret/repos", "/api/v1/orgs/secrex/repos"),
+    ] {
+        let (h, m) = (s.get(hidden, &token(&eve)), s.get(missing, &token(&eve)));
+        assert_eq!(h.status, 404, "{hidden}");
+        assert_eq!(
+            (
+                h.status,
+                h.s_text().replace("secret", "<o>"),
+                h.header("content-type")
+            ),
+            (
+                m.status,
+                m.s_text().replace("secrex", "<o>"),
+                m.header("content-type")
+            ),
+            "{hidden}"
+        );
+    }
+    assert_eq!(r.status, 404, "no membership oracle for outsiders");
     assert_eq!(
         s.get("/api/v1/users/siteadmin/orgs/secret/permissions", &adm)
             .status,
@@ -1232,7 +1258,11 @@ fn a_busy_password_gate_answers_503_and_refunds_the_attempt() {
     let body = json!({"name": "t", "scopes": ["all"]});
     // Hold every Argon2 slot (the harness builds the app with 4): the check must give up, not queue.
     let held: Vec<_> = (0..4).map(|_| s.app.gate.acquire()).collect();
-    let r = s.post("/api/v1/users/alice/tokens", &basic("alice", &pw), body.clone());
+    let r = s.post(
+        "/api/v1/users/alice/tokens",
+        &basic("alice", &pw),
+        body.clone(),
+    );
     assert_eq!(r.status, 503, "{}", r.msg());
     assert_eq!(r.headers["retry-after"], "5");
     drop(held);

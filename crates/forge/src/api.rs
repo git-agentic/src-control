@@ -297,7 +297,9 @@ pub fn get_org(ctx: &mut Ctx) -> Resp {
     };
     match org_visible(ctx, &org) {
         Ok(true) => Resp::json(200, &org_json(&ctx.app.base, &org)),
-        Ok(false) => not_found(&ctx.app.base, "HasOrgOrUserVisible", None),
+        // Not Gitea's `HasOrgOrUserVisible`: that text tells a private organization from a missing
+        // one (recorded departure).
+        Ok(false) => no_such_org(ctx, &name),
         Err(e) => ctx.app.internal(&e),
     }
 }
@@ -326,7 +328,7 @@ pub fn org_permissions(ctx: &mut Ctx) -> Resp {
     // hidden like on `GET /users/{u}`.
     match org_visible(ctx, &org) {
         Ok(true) => {}
-        Ok(false) => return not_found(&ctx.app.base, "HasOrgOrUserVisible", None),
+        Ok(false) => return no_such_org(ctx, &oname),
         Err(e) => return ctx.app.internal(&e),
     }
     let full = match store::is_org_owner(ctx.conn, org.id, subject.id) {

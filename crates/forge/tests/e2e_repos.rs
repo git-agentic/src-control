@@ -455,11 +455,9 @@ fn a_public_only_token_sees_and_creates_nothing() {
     );
     let r = w.s.get("/api/v1/repos/acme/ghost", &po);
     assert_eq!(r.status, 403, "refused before existence is looked at");
-    for path in [
-        "/api/v1/repos/search?limit=50",
-        "/api/v1/user/repos",
-        "/api/v1/orgs/acme/repos",
-    ] {
+    // acme is private and `pat` is no member: with nothing readable it is a missing organization
+    assert_eq!(w.s.get("/api/v1/orgs/acme/repos", &po).status, 404);
+    for path in ["/api/v1/repos/search?limit=50", "/api/v1/user/repos"] {
         let l = w.s.get(path, &po);
         assert_eq!(l.status, 200, "{path}");
         assert_eq!(l.headers["x-total-count"], "0", "{path}");
@@ -508,14 +506,20 @@ fn listings_are_filtered_by_access_with_visible_counts() {
         list(&t["bob"], "/api/v1/user/repos"),
         (vec!["acme/a2".to_string()], "1".to_string())
     );
-    // an invisible org still answers 200 with only what the caller can read (recorded K#55)
+    // an invisible org still answers 200 with what the caller can read, once there is any (recorded K#55)
     assert_eq!(
         list(&t["bob"], "/api/v1/orgs/acme/repos"),
         (vec!["acme/a2".to_string()], "1".to_string())
     );
+    // dave can read nothing in acme and cannot see it: the answer is a missing organization's
+    let (hidden, missing) = (
+        w.s.get("/api/v1/orgs/acme/repos", &token(&t["dave"])),
+        w.s.get("/api/v1/orgs/acmf/repos", &token(&t["dave"])),
+    );
+    assert_eq!(hidden.status, 404);
     assert_eq!(
-        list(&t["dave"], "/api/v1/orgs/acme/repos"),
-        (vec![], "0".to_string())
+        (hidden.status, hidden.s_text().replace("acme", "<o>")),
+        (missing.status, missing.s_text().replace("acmf", "<o>"))
     );
     assert_eq!(
         w.s.get("/api/v1/orgs/ghost/repos", &token(&t["bob"]))
