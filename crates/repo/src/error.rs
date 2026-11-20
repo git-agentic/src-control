@@ -127,11 +127,11 @@ pub enum Error {
     RemoteExists(String),
     #[error("no common ancestor between the branches")]
     NoCommonAncestor,
-    #[error("wire protocol error: {0}")]
+    #[error("wire protocol error: {}", scl_core::sanitize_display(.0))]
     Protocol(String),
-    #[error("connection to remote lost: {0}")]
+    #[error("connection to remote lost: {}", scl_core::sanitize_display(.0))]
     ConnectionLost(String),
-    #[error("remote error: {0}")]
+    #[error("remote error: {}", scl_core::sanitize_display(.0))]
     Remote(String),
     #[error("TLS: {0}")]
     Tls(#[from] scl_tlsio::Error),
@@ -184,13 +184,13 @@ pub enum Error {
     /// The server aborted an incoming pack mid-stream because it exceeded the
     /// operator's `--max-pack-size` cap (P31). Payload is the server's own
     /// human-readable limit text, carried verbatim across the wire.
-    #[error("pack exceeds the server's --max-pack-size limit: {0}")]
+    #[error("pack exceeds the server's --max-pack-size limit: {}", scl_core::sanitize_display(.0))]
     PackTooLarge(String),
     /// The server closed the connection because the bytes it wrote for this
     /// peer (`PutObject` + `PutPack`) exceeded the operator's
     /// `--max-conn-bytes` budget (#233). Payload is the server's own
     /// human-readable limit text, carried verbatim across the wire.
-    #[error("connection write budget exceeded: {0}")]
+    #[error("connection write budget exceeded: {}", scl_core::sanitize_display(.0))]
     ConnectionBudgetExceeded(String),
     /// The server refused the connection at accept time because
     /// `--max-connections` was reached (P31). Retryable.
@@ -224,5 +224,30 @@ fn repair_command(prefix: &str) -> String {
         "`sc backfill --all`".to_string()
     } else {
         format!("`sc backfill {prefix}`")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    #[test]
+    fn remote_text_is_escaped_when_displayed_but_kept_in_the_value() {
+        let raw = "boom\x1b]0;pwn\x07\x1b[2J";
+        for e in [
+            Error::Remote(raw.into()),
+            Error::Protocol(raw.into()),
+            Error::ConnectionLost(raw.into()),
+            Error::PackTooLarge(raw.into()),
+            Error::ConnectionBudgetExceeded(raw.into()),
+        ] {
+            let shown = e.to_string();
+            assert!(
+                !shown.contains('\x1b') && !shown.contains('\x07'),
+                "{shown:?}"
+            );
+            assert!(shown.contains("boom\\x1b]0;pwn\\x07\\x1b[2J"), "{shown:?}");
+        }
+        assert!(matches!(Error::Remote(raw.into()), Error::Remote(m) if m == raw));
     }
 }

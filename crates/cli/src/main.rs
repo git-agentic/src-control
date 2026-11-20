@@ -2700,19 +2700,7 @@ fn run_log(json: bool, identity: Option<PathBuf>) -> Result<()> {
         return Ok(());
     }
     for ((id, snap), status) in entries.iter().zip(&statuses) {
-        let merge = if snap.parents.len() > 1 {
-            " (merge)"
-        } else {
-            ""
-        };
-        print_line(&format!(
-            "{} {} {} — {}{}",
-            id.short(),
-            fmt_utc(snap.timestamp),
-            snap.author,
-            snap.message,
-            merge
-        ));
+        print_line(&render_log_line(id, snap));
         if let Some(line) = render_sig_status_line(status) {
             print_line(&line);
         }
@@ -2732,6 +2720,23 @@ fn run_log(json: bool, identity: Option<PathBuf>) -> Result<()> {
 /// themselves, but that needs `libc`; catching `BrokenPipe` at the point of
 /// writing gets the same externally-visible result (clean exit, no panic)
 /// without a new dependency.
+fn render_log_line(id: &scl_core::ObjectId, snap: &scl_core::Snapshot) -> String {
+    let merge = if snap.parents.len() > 1 {
+        " (merge)"
+    } else {
+        ""
+    };
+    // Author and message are authored by whoever made the commit, not by this user: no raw escapes.
+    format!(
+        "{} {} {} — {}{}",
+        id.short(),
+        fmt_utc(snap.timestamp),
+        scl_core::sanitize_display(&snap.author),
+        scl_core::sanitize_display(&snap.message),
+        merge
+    )
+}
+
 fn print_line(line: &str) {
     use std::io::Write;
     if let Err(e) = writeln!(std::io::stdout(), "{line}") {
@@ -3145,9 +3150,16 @@ fn run_transcript(op: TranscriptOp) -> Result<()> {
                 return Ok(());
             }
             for (tid, t) in &transcripts {
-                println!("--- {} (agent: {}) ---", tid.short(), t.agent);
+                println!(
+                    "--- {} (agent: {}) ---",
+                    tid.short(),
+                    scl_core::sanitize_display(&t.agent)
+                );
                 let body = repo.open_transcript(tid, &sk)?;
-                print!("{}", String::from_utf8_lossy(&body));
+                print!(
+                    "{}",
+                    scl_core::sanitize_display(&String::from_utf8_lossy(&body))
+                );
                 println!();
             }
             Ok(())
@@ -3194,7 +3206,7 @@ fn run_transcript(op: TranscriptOp) -> Result<()> {
                     "{}  {}  agent={}  {}",
                     snap.short(),
                     tid.short(),
-                    agent,
+                    scl_core::sanitize_display(agent),
                     transcript_sig_label(status)
                 ));
             }
@@ -4878,6 +4890,22 @@ fn run_rewrap(identity: Option<PathBuf>, dry_run: bool, rotate: bool) -> Result<
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn log_line_escapes_terminal_controls_from_author_and_message() {
+        let snap = scl_core::Snapshot {
+            root: scl_core::ObjectId::of(b"r"),
+            parents: vec![],
+            author: "evil\x1b]0;x\x07".into(),
+            timestamp: 0,
+            message: "a\x1b[2J\u{9b}b\nsecond line".into(),
+            secrets: Default::default(),
+            protection: Default::default(),
+        };
+        let line = render_log_line(&scl_core::ObjectId::of(b"s"), &snap);
+        assert!(line.contains("evil\\x1b]0;x\\x07") && line.contains("a\\x1b[2J\\u{9b}b\nsecond"));
+        assert!(!line.chars().any(|c| c.is_control() && c != '\n'));
+    }
 
     #[test]
     fn default_budget_warning_logic() {
