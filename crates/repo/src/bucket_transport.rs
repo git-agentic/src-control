@@ -722,10 +722,6 @@ impl crate::ref_guard::RefObjects for RefView<'_> {
         let obj = Object::decode(&self.bucket.object_bytes(id)?)?;
         Ok(Some(crate::ref_guard::Node::of(obj)))
     }
-
-    fn held(&mut self, id: &ObjectId) -> Result<bool> {
-        Ok(self.pending.nodes.contains_key(id) || self.on_chain(id))
-    }
 }
 
 /// Attempts `update_ref` makes at the manifest CAS before it gives up (the

@@ -38,7 +38,8 @@ pub(crate) enum Node {
     Manifest(BranchManifest),
     Blob,
     Sealed,
-    /// A secret, signature or transcript.
+    Secret,
+    /// A signature or transcript.
     Other,
 }
 
@@ -50,18 +51,52 @@ impl Node {
             Object::Manifest(m) => Node::Manifest(m),
             Object::Blob(_) => Node::Blob,
             Object::Sealed(_) => Node::Sealed,
+            Object::Secret(_) => Node::Secret,
             _ => Node::Other,
         }
     }
 
-    fn kind(&self) -> &'static str {
+    fn kind(&self) -> Kind {
         match self {
-            Node::Snapshot(_) => "snapshot",
-            Node::Tree(_) => "tree",
-            Node::Manifest(_) => "manifest",
-            Node::Blob => "blob",
-            Node::Sealed => "sealed object",
-            Node::Other => "secret, signature or transcript",
+            Node::Blob => Kind::Blob,
+            Node::Sealed => Kind::Sealed,
+            Node::Secret => Kind::Secret,
+            Node::Snapshot(_) => Kind::Other("snapshot"),
+            Node::Tree(_) => Kind::Other("tree"),
+            Node::Manifest(_) => Kind::Other("manifest"),
+            Node::Other => Kind::Other("signature or transcript"),
+        }
+    }
+}
+
+/// An object's kind, for the places the rule only needs that and not the
+/// content (file content, sealed closure entries, secrets).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Blob,
+    Sealed,
+    Secret,
+    /// Anything else, by name.
+    Other(&'static str),
+}
+
+impl Kind {
+    /// From a kind name as [`Object::kind_name`] spells it.
+    pub(crate) fn of_name(name: &'static str) -> Kind {
+        match name {
+            "blob" => Kind::Blob,
+            "sealed" => Kind::Sealed,
+            "secret" => Kind::Secret,
+            other => Kind::Other(other),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Kind::Blob => "blob",
+            Kind::Sealed => "sealed object",
+            Kind::Secret => "secret",
+            Kind::Other(n) => n,
         }
     }
 }
@@ -73,13 +108,12 @@ impl Node {
 pub(crate) trait RefObjects {
     /// The object, or `None` when it is not held.
     fn node(&mut self, id: &ObjectId) -> Result<Option<Node>>;
-    /// Like [`RefObjects::node`], for an object expected to be a file's
-    /// content: an implementation may avoid loading a large blob to say so.
-    fn leaf(&mut self, id: &ObjectId) -> Result<Option<Node>> {
-        self.node(id)
+    /// The kind of an object expected to be file content, a sealed closure
+    /// entry or a secret, or `None` when it is not held. An implementation
+    /// that can say so without loading the object should (a blob can be large).
+    fn leaf(&mut self, id: &ObjectId) -> Result<Option<Kind>> {
+        Ok(self.node(id)?.map(|n| n.kind()))
     }
-    /// Whether the object is held, without reading it where that is cheaper.
-    fn held(&mut self, id: &ObjectId) -> Result<bool>;
 }
 
 /// Tree and file-content ids already verified in one check.
@@ -103,22 +137,33 @@ fn read<S: RefObjects>(src: &mut S, id: &ObjectId, what: &str) -> Result<Node> {
 fn read_snapshot<S: RefObjects>(src: &mut S, id: &ObjectId, what: &str) -> Result<Snapshot> {
     match read(src, id, what)? {
         Node::Snapshot(s) => Ok(s),
-        other => refuse(format!("{what} {id} is a {}, not a snapshot", other.kind())),
+        other => refuse(format!(
+            "{what} {id} is a {}, not a snapshot",
+            other.kind().name()
+        )),
     }
 }
 
 fn read_manifest<S: RefObjects>(src: &mut S, id: &ObjectId, what: &str) -> Result<BranchManifest> {
     match read(src, id, what)? {
         Node::Manifest(m) => Ok(m),
-        other => refuse(format!("{what} {id} is a {}, not a manifest", other.kind())),
+        other => refuse(format!(
+            "{what} {id} is a {}, not a manifest",
+            other.kind().name()
+        )),
     }
 }
 
-fn require_held<S: RefObjects>(src: &mut S, id: &ObjectId, what: &str) -> Result<()> {
-    if src.held(id)? {
-        Ok(())
-    } else {
-        refuse(format!("{what} {id} is not held here"))
+/// `id` must be held and be of kind `want`.
+fn require_kind<S: RefObjects>(src: &mut S, id: &ObjectId, want: Kind, what: &str) -> Result<()> {
+    match src.leaf(id)? {
+        Some(k) if k == want => Ok(()),
+        Some(k) => refuse(format!(
+            "{what} {id} is a {}, not a {}",
+            k.name(),
+            want.name()
+        )),
+        None => refuse(format!("{what} {id} is not held here")),
     }
 }
 
@@ -134,7 +179,7 @@ pub(crate) fn check_ref_move<S: RefObjects>(
     if !matches!(new_node, Node::Snapshot(_) | Node::Manifest(_)) {
         return refuse(format!(
             "ref target {new} is a {}, not a snapshot or manifest",
-            new_node.kind()
+            new_node.kind().name()
         ));
     }
     if let Some(cur) = current {
@@ -142,8 +187,8 @@ pub(crate) fn check_ref_move<S: RefObjects>(
         if std::mem::discriminant(&cur_node) != std::mem::discriminant(&new_node) {
             return refuse(format!(
                 "branch tip {cur} is a {} but {new} is a {}; a branch cannot change kind",
-                cur_node.kind(),
-                new_node.kind()
+                cur_node.kind().name(),
+                new_node.kind().name()
             ));
         }
     }
@@ -196,14 +241,22 @@ fn verify_snapshots<S: RefObjects>(
         }
         let snap = read_snapshot(src, &id, "commit")?;
         let mut parent_roots = Vec::with_capacity(snap.parents.len());
+        let mut parent_secrets = Vec::with_capacity(snap.parents.len());
         for p in &snap.parents {
-            parent_roots.push(read_snapshot(src, p, "parent commit")?.root);
+            let parent = read_snapshot(src, p, "parent commit")?;
+            parent_roots.push(parent.root);
+            parent_secrets.push(parent.secrets);
             if seen.insert(*p) {
                 queue.push_back(*p);
             }
         }
-        for sid in snap.secrets.values() {
-            require_held(src, sid, "secret")?;
+        // Secret registry entries must be secrets; one a parent already has
+        // is inside its verified closure.
+        for (name, sid) in &snap.secrets {
+            if parent_secrets.iter().any(|m| m.get(name) == Some(sid)) {
+                continue;
+            }
+            require_kind(src, sid, Kind::Secret, "secret registry entry")?;
         }
         verify_tree(src, snap.root, &parent_roots, done)?;
     }
@@ -230,7 +283,12 @@ fn verify_tree<S: RefObjects>(
         }
         let tree = match read(src, &id, "tree")? {
             Node::Tree(t) => t,
-            other => return refuse(format!("tree {id} is a {}, not a tree", other.kind())),
+            other => {
+                return refuse(format!(
+                    "tree {id} is a {}, not a tree",
+                    other.kind().name()
+                ))
+            }
         };
         // A parent tree that is not held cannot vouch for anything; the
         // commit that names it fails its own check.
@@ -256,7 +314,7 @@ fn verify_tree<S: RefObjects>(
                         continue;
                     }
                     match src.leaf(&e.id)? {
-                        Some(Node::Blob | Node::Sealed) => {
+                        Some(Kind::Blob | Kind::Sealed) => {
                             seen.leaves.insert(e.id);
                         }
                         Some(other) => {
@@ -264,7 +322,7 @@ fn verify_tree<S: RefObjects>(
                                 "file entry {} names {}, a {}, not file content",
                                 e.name,
                                 e.id,
-                                other.kind()
+                                other.name()
                             ))
                         }
                         None => return refuse(format!("file content {} is not held here", e.id)),
@@ -286,16 +344,21 @@ fn verify_manifests<S: RefObjects>(
     new: ObjectId,
     new_manifest: BranchManifest,
 ) -> Result<()> {
-    let mut chain = Vec::new();
+    let mut chain: Vec<BranchManifest> = Vec::new();
+    // The manifest the chain stops at (the current tip, or a trusted tip for a
+    // new branch), whose closure is already verified.
+    let mut terminal: Option<BranchManifest> = None;
     let (mut id, mut m) = (new, new_manifest);
     let mut found = false;
     loop {
         if Some(id) == current {
             found = true;
+            terminal = Some(m);
             break;
         }
         // A new branch needs no ancestry, so it can stop at a trusted tip.
         if current.is_none() && boundary.contains(&id) {
+            terminal = Some(m);
             break;
         }
         let prev = m.prev;
@@ -312,7 +375,7 @@ fn verify_manifests<S: RefObjects>(
         return Err(Error::NonFastForward);
     }
     let mut done = Verified::default();
-    for m in &chain {
+    for (i, m) in chain.iter().enumerate() {
         let roots: Vec<ObjectId> = std::iter::once(m.base)
             .chain(m.anchors.iter().copied())
             .collect();
@@ -320,9 +383,162 @@ fn verify_manifests<S: RefObjects>(
             read_snapshot(src, r, "manifest base or anchor")?;
         }
         verify_snapshots(src, boundary, &roots, &mut done)?;
+        // Every closure entry must be a sealed object: one naming a public
+        // snapshot would make reachability mark it seen without walking it.
+        // An entry the previous manifest already lists is inside its verified
+        // closure (that manifest is the next in the chain, or the terminal).
+        let known: HashSet<&ObjectId> = chain
+            .get(i + 1)
+            .or(terminal.as_ref())
+            .map(|o| o.closure.iter().collect())
+            .unwrap_or_default();
         for c in &m.closure {
-            require_held(src, c, "sealed object")?;
+            if !known.contains(c) {
+                require_kind(src, c, Kind::Sealed, "manifest closure entry")?;
+            }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scl_core::{FileMode, SealedObj, TreeEntry};
+    use std::collections::HashMap;
+
+    /// An in-memory object source that records every id it is asked about.
+    #[derive(Default)]
+    struct Counting {
+        objects: HashMap<ObjectId, Node>,
+        asked: Vec<ObjectId>,
+    }
+
+    impl Counting {
+        fn add(&mut self, o: Object) -> ObjectId {
+            let id = o.id();
+            self.objects.insert(id, Node::of(o));
+            id
+        }
+    }
+
+    impl RefObjects for Counting {
+        fn node(&mut self, id: &ObjectId) -> Result<Option<Node>> {
+            self.asked.push(*id);
+            Ok(self.objects.get(id).cloned())
+        }
+    }
+
+    fn tree(entries: &[(&str, EntryKind, ObjectId)]) -> Object {
+        Object::Tree(Tree::new(
+            entries
+                .iter()
+                .map(|(name, kind, id)| TreeEntry {
+                    name: name.to_string(),
+                    kind: *kind,
+                    id: *id,
+                    mode: FileMode::FILE,
+                    perms: 0,
+                })
+                .collect(),
+        ))
+    }
+
+    fn snap(root: ObjectId, parents: &[ObjectId]) -> Object {
+        Object::Snapshot(Snapshot {
+            root,
+            parents: parents.to_vec(),
+            author: "t".into(),
+            timestamp: 0,
+            message: String::new(),
+            secrets: Default::default(),
+            protection: Default::default(),
+        })
+    }
+
+    /// Only what a push changed is looked at: unchanged files in a changed
+    /// directory, and unchanged closure entries and secrets, are inside the
+    /// parent's verified closure and are never read (a file can be large).
+    #[test]
+    fn unchanged_content_is_not_read() {
+        let mut src = Counting::default();
+        let big: Vec<ObjectId> = (0..3u8)
+            .map(|i| src.add(Object::blob(vec![i; 64])))
+            .collect();
+        let entry = |name: &'static str, id| (name, EntryKind::Blob, id);
+        let dir_old = src.add(tree(&[
+            entry("big0", big[0]),
+            entry("big1", big[1]),
+            entry("big2", big[2]),
+        ]));
+        let root_old = src.add(tree(&[("d", EntryKind::Tree, dir_old)]));
+        let secret = src.add(Object::Secret(scl_core::Secret {
+            name: "k".into(),
+            nonce: vec![],
+            ciphertext: vec![],
+            wrapped_keys: vec![],
+        }));
+        let parent = {
+            let Object::Snapshot(mut s) = snap(root_old, &[]) else {
+                unreachable!()
+            };
+            s.secrets.insert("k".into(), secret);
+            src.add(Object::Snapshot(s))
+        };
+
+        // The child adds one file to the directory and keeps everything else.
+        let added = src.add(Object::blob(b"new file".to_vec()));
+        let dir_new = src.add(tree(&[
+            entry("big0", big[0]),
+            entry("big1", big[1]),
+            entry("big2", big[2]),
+            entry("new", added),
+        ]));
+        let root_new = src.add(tree(&[("d", EntryKind::Tree, dir_new)]));
+        let child = {
+            let Object::Snapshot(mut s) = snap(root_new, &[parent]) else {
+                unreachable!()
+            };
+            s.secrets.insert("k".into(), secret);
+            src.add(Object::Snapshot(s))
+        };
+
+        src.asked.clear();
+        check_ref_move(&mut src, &BTreeSet::from([parent]), Some(parent), child).unwrap();
+        for unchanged in big.iter().chain([&secret]) {
+            assert!(
+                !src.asked.contains(unchanged),
+                "{unchanged} is unchanged and must not be read"
+            );
+        }
+        assert!(src.asked.contains(&added), "the new file is checked");
+
+        // The same for a manifest: entries its predecessor already lists.
+        let sealed: Vec<ObjectId> = (0..3u8)
+            .map(|i| {
+                src.add(Object::Sealed(SealedObj {
+                    payload: std::sync::Arc::from(vec![i].into_boxed_slice()),
+                }))
+            })
+            .collect();
+        let manifest = |prev: Option<ObjectId>, closure: &[ObjectId]| {
+            Object::Manifest(scl_core::BranchManifest {
+                base: parent,
+                prev,
+                anchors: vec![],
+                closure: closure.to_vec(),
+                index_ct: vec![],
+                kek_wraps: vec![],
+            })
+        };
+        let m1 = src.add(manifest(None, &sealed[..2]));
+        let m2 = src.add(manifest(Some(m1), &sealed));
+        src.asked.clear();
+        check_ref_move(&mut src, &BTreeSet::from([m1]), Some(m1), m2).unwrap();
+        assert!(!src.asked.contains(&sealed[0]) && !src.asked.contains(&sealed[1]));
+        assert!(
+            src.asked.contains(&sealed[2]),
+            "the new closure entry is checked"
+        );
+    }
 }

@@ -255,6 +255,48 @@ impl Store {
         self.existing_loose_path(id).is_some() || self.pack_index.contains_key(id)
     }
 
+    /// The kind name of a stored object (see [`Object::kind_name`]), read from
+    /// its first encoded byte without loading the rest or admitting it to the
+    /// cache, so asking about a large blob is cheap. It does not verify the
+    /// object's hash (reads do); ingest already did.
+    pub fn peek_kind(&self, id: &ObjectId) -> Result<&'static str> {
+        use std::io::{BufReader, Read, Seek, SeekFrom};
+        const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+        if let Some(resident) = self.resident.get(id) {
+            return Ok(resident.obj.kind_name());
+        }
+        if self.spilled.contains_key(id) {
+            return Ok("blob");
+        }
+        let mut first = [0_u8; 1];
+        if let Some(path) = self.existing_loose_path(id) {
+            let mut file = std::fs::File::open(&path)?;
+            let mut prefix = [0_u8; 4];
+            let n = file.read(&mut prefix)?;
+            if n == prefix.len() && prefix == ZSTD_MAGIC {
+                let mut decoder =
+                    zstd::stream::read::Decoder::new(BufReader::new(std::fs::File::open(&path)?))?;
+                decoder.read_exact(&mut first)?;
+            } else if n > 0 {
+                first[0] = prefix[0];
+            } else {
+                return Err(Error::Malformed(format!("object {id} is empty")));
+            }
+        } else if let Some(loc) = self.pack_index.get(id) {
+            let mut file = std::fs::File::open(&loc.pack_path)?;
+            file.seek(SeekFrom::Start(loc.offset))?;
+            let mut len_buf = [0_u8; 4];
+            file.read_exact(&mut len_buf)?;
+            let len = u32::from_le_bytes(len_buf) as u64;
+            let mut decoder = zstd::stream::read::Decoder::new(BufReader::new(file.take(len)))?;
+            decoder.read_exact(&mut first)?;
+        } else {
+            return Err(Error::NotFound(*id));
+        }
+        Object::kind_name_of_tag(first[0])
+            .ok_or_else(|| Error::Malformed(format!("object {id} has an unknown kind tag")))
+    }
+
     /// Whether the object is on disk right now, ignoring the resident cache
     /// and any spill: a loose file, or a pack this store has indexed that
     /// still exists. A stat per call, so it is cheap enough to confirm each id
@@ -782,6 +824,43 @@ fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `peek_kind` names a stored object's kind from disk alone, loose or
+    /// packed, without loading it.
+    #[test]
+    fn peek_kind_reads_the_kind_byte_from_disk() {
+        let dir = std::env::temp_dir().join(format!("scl-peek-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let objs = [
+            Object::blob(vec![7; 100_000]),
+            Object::Tree(crate::object::Tree::default()),
+            Object::Sealed(crate::object::SealedObj {
+                payload: std::sync::Arc::from(vec![1, 2, 3].into_boxed_slice()),
+            }),
+        ];
+        let mut st = Store::open_persistent(&dir, 1 << 20).unwrap();
+        for o in &objs {
+            st.put(o.clone()).unwrap();
+        }
+        // A fresh store has nothing resident, so this is the disk path.
+        let fresh = Store::open_persistent(&dir, 1 << 20).unwrap();
+        for o in &objs {
+            assert_eq!(fresh.peek_kind(&o.id()).unwrap(), o.kind_name());
+        }
+        assert!(fresh.peek_kind(&ObjectId::of(b"absent")).is_err());
+        // The same from a pack, once the loose files are gone.
+        let ids: Vec<ObjectId> = objs.iter().map(Object::id).collect();
+        st.write_pack(&ids).unwrap();
+        for id in &ids {
+            st.delete(id).unwrap();
+        }
+        let packed = Store::open_persistent(&dir, 1 << 20).unwrap();
+        for o in &objs {
+            assert_eq!(packed.peek_kind(&o.id()).unwrap(), o.kind_name());
+        }
+        drop((st, fresh, packed));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn blob(n: usize, fill: u8) -> Object {
         Object::blob(vec![fill; n])

@@ -346,6 +346,22 @@ impl Object {
         }
     }
 
+    /// The kind name for an encoding's leading tag byte, as [`Object::kind_name`]
+    /// reports it; `None` for a tag no current object uses.
+    pub fn kind_name_of_tag(tag: u8) -> Option<&'static str> {
+        Some(match tag {
+            TAG_BLOB => "blob",
+            TAG_TREE => "tree",
+            TAG_SNAPSHOT => "snapshot",
+            TAG_SECRET => "secret",
+            TAG_SIGNATURE => "signature",
+            TAG_TRANSCRIPT => "transcript",
+            TAG_SEALED => "sealed",
+            TAG_MANIFEST => "manifest",
+            _ => return None,
+        })
+    }
+
     pub fn kind_name(&self) -> &'static str {
         match self {
             Object::Blob(_) => "blob",

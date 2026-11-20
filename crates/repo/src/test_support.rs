@@ -106,17 +106,19 @@ pub(crate) fn ref_rules_hold<T: crate::transport::Transport>(t: &T) {
                 .collect(),
         ))
     };
-    let snap = |root: ObjectId, parents: &[ObjectId], msg: &str| {
-        Object::Snapshot(Snapshot {
-            root,
-            parents: parents.to_vec(),
-            author: "t".into(),
-            timestamp: 0,
-            message: msg.into(),
-            secrets: Default::default(),
-            protection: Default::default(),
-        })
-    };
+    let snap_with =
+        |root: ObjectId, parents: &[ObjectId], msg: &str, secrets: &[(&str, ObjectId)]| {
+            Object::Snapshot(Snapshot {
+                root,
+                parents: parents.to_vec(),
+                author: "t".into(),
+                timestamp: 0,
+                message: msg.into(),
+                secrets: secrets.iter().map(|(n, id)| (n.to_string(), *id)).collect(),
+                protection: Default::default(),
+            })
+        };
+    let snap = |root: ObjectId, parents: &[ObjectId], msg: &str| snap_with(root, parents, msg, &[]);
     let manifest = |base: ObjectId, prev: Option<ObjectId>, closure: &[ObjectId]| {
         Object::Manifest(BranchManifest {
             base,
@@ -250,6 +252,25 @@ pub(crate) fn ref_rules_hold<T: crate::transport::Transport>(t: &T) {
     assert!(mv(&[&root2], "fresh", &snap(root2.id(), &[ghost], "y"), None).is_err());
     assert_eq!(tip_of("fresh"), None);
 
+    // Secret registry entries must be secrets.
+    let secret = Object::Secret(scl_core::Secret {
+        name: "k".into(),
+        nonce: vec![0; 24],
+        ciphertext: vec![1, 2, 3],
+        wrapped_keys: vec![],
+    });
+    for (what, reg) in [
+        ("secret entry names a blob", b1.id()),
+        ("secret entry names a tree", dir1.id()),
+        ("secret entry is absent", ghost),
+    ] {
+        let c = snap_with(root2.id(), &[], what, &[("k", reg)]);
+        assert!(mv(&[&root2], "sec", &c, None).is_err(), "{what}");
+        assert_eq!(tip_of("sec"), None, "{what} created the ref");
+    }
+    let with_secret = snap_with(root2.id(), &[], "sec", &[("k", secret.id())]);
+    mv(&[&secret], "sec", &with_secret, None).unwrap();
+
     // Private branch: a manifest's `prev` chain is its ancestry.
     let m1 = manifest(c1.id(), None, &[sealed.id()]);
     let m2 = manifest(c1.id(), Some(m1.id()), &[sealed.id()]);
@@ -261,6 +282,20 @@ pub(crate) fn ref_rules_hold<T: crate::transport::Transport>(t: &T) {
             None,
         ),
         ("absent base", vec![], manifest(ghost, None, &[]), None),
+        // A closure entry must be a sealed object. One naming the public base
+        // would make the reachability walk mark it seen without walking it.
+        (
+            "closure names a snapshot",
+            vec![],
+            manifest(c1.id(), None, &[c1.id()]),
+            None,
+        ),
+        (
+            "closure names a blob",
+            vec![],
+            manifest(c1.id(), None, &[b1.id()]),
+            None,
+        ),
     ];
     for (what, objs, new, old) in cases {
         assert!(mv(&objs, "priv", &new, old).is_err(), "{what}");
@@ -276,6 +311,10 @@ pub(crate) fn ref_rules_hold<T: crate::transport::Transport>(t: &T) {
             manifest(c1.id(), Some(m2.id()), &[absent_blob.id()]),
         ),
         ("manifest absent base", manifest(ghost, Some(m2.id()), &[])),
+        (
+            "manifest closure names a snapshot",
+            manifest(c1.id(), Some(m2.id()), &[sealed.id(), c1.id()]),
+        ),
         ("snapshot over manifest", snap(root2.id(), &[m2.id()], "z")),
         ("snapshot target", c2.clone()),
     ];

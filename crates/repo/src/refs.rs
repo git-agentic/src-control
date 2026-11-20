@@ -164,7 +164,9 @@ pub fn list_heads(layout: &Layout) -> Result<Vec<(String, ObjectId)>> {
             continue;
         }
         let name = e.file_name().to_string_lossy().into_owned();
-        if name.contains(".tmp") {
+        // A ref being written has a dot-prefixed temp file (`atomic_write`); no
+        // branch name starts with a dot, so only those are skipped.
+        if name.starts_with('.') {
             continue;
         }
         // A ref gone since the directory was read is simply not there.
@@ -201,7 +203,7 @@ pub fn list_remote_tips(layout: &Layout) -> Result<Vec<(String, String, ObjectId
                 continue;
             }
             let branch = b.file_name().to_string_lossy().into_owned();
-            if branch.contains(".tmp") {
+            if branch.starts_with('.') {
                 continue;
             }
             let text = std::fs::read_to_string(b.path())?;
@@ -219,12 +221,37 @@ pub fn head_tip(layout: &Layout) -> Result<Option<ObjectId>> {
 }
 
 /// Write `bytes` to `path` via a temp file + rename so a reader never observes
-/// a half-written ref. The temp sibling is per-process (`<name>.<pid>.tmp`) so
-/// writers in different processes never clobber each other's temp file; the
-/// rename itself is atomic. The single-writer repo lock
+/// a half-written ref. The temp sibling is per-process and per-call
+/// (`.<name>.<pid>.<n>.tmp`) so writers never clobber each other's temp file;
+/// the rename itself is atomic. The single-writer repo lock
 /// ([`crate::lock::RepoLock`]) still serializes the final ref content.
+///
+/// The temp file's name starts with a dot, which no branch name can
+/// (`validate_branch_name`), so a directory listing can tell a ref being
+/// written from a branch that happens to be called `x.1.tmp`.
 fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    Ok(scl_core::fsutil::atomic_write_durable(path, bytes)?)
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(Error::BadRef(format!("bad ref path {}", path.display())));
+    };
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(
+        ".{}.{}.{n}.tmp",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(scl_core::fsutil::fsync_dir(parent)?)
 }
 
 #[cfg(test)]
@@ -353,6 +380,36 @@ mod tests {
         ));
         assert_eq!(read_branch_tip(&layout, "main").unwrap(), Some(id));
 
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    /// A branch called `x.1.tmp` is a branch; only a ref's in-flight temp file
+    /// (dot-prefixed, which no branch name can be) is skipped.
+    #[test]
+    fn list_heads_lists_tmp_looking_branches_and_skips_temp_files() {
+        let layout = tmp_layout("tmp-names");
+        let id = ObjectId::of(b"tip");
+        for name in ["x.1.tmp", "release.tmp-fix", "main"] {
+            write_branch_tip(&layout, name, &id).unwrap();
+        }
+        let dir = layout.refs_heads_dir();
+        std::fs::write(dir.join(".main.4242.1.tmp"), b"half a ref").unwrap();
+        let mut names: Vec<String> = list_heads(&layout)
+            .unwrap()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["main", "release.tmp-fix", "x.1.tmp"]);
+        // The writer leaves no temp file behind.
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter(|e| {
+                let n = e.as_ref().unwrap().file_name();
+                n.to_string_lossy() != ".main.4242.1.tmp" && n.to_string_lossy().starts_with('.')
+            })
+            .count();
+        assert_eq!(leftovers, 0);
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
 

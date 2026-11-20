@@ -240,7 +240,7 @@ impl LocalTransport {
         current: Option<ObjectId>,
         new: ObjectId,
     ) -> Result<std::collections::BTreeSet<ObjectId>> {
-        use crate::ref_guard::{Node, RefObjects};
+        use crate::ref_guard::{Kind, Node, RefObjects};
         struct Session<'a> {
             store: &'a mut Store,
             relied_on: std::collections::BTreeSet<ObjectId>,
@@ -270,24 +270,13 @@ impl LocalTransport {
                 self.relied_on.insert(*id);
                 Ok(Some(Node::of(self.store.get(id)?)))
             }
-            fn leaf(&mut self, id: &ObjectId) -> Result<Option<Node>> {
+            fn leaf(&mut self, id: &ObjectId) -> Result<Option<Kind>> {
                 if !self.present(id) {
                     return Ok(None);
                 }
                 self.relied_on.insert(*id);
-                // Measuring streams and hash-checks a blob without loading it.
-                match self.store.blob_size(id) {
-                    Ok(_) => Ok(Some(Node::Blob)),
-                    Err(scl_core::Error::WrongKind(..)) => Ok(Some(Node::of(self.store.get(id)?))),
-                    Err(e) => Err(e.into()),
-                }
-            }
-            fn held(&mut self, id: &ObjectId) -> Result<bool> {
-                let held = self.present(id);
-                if held {
-                    self.relied_on.insert(*id);
-                }
-                Ok(held)
+                // Reads the kind byte only: a file's content can be large.
+                Ok(Some(Kind::of_name(self.store.peek_kind(id)?)))
             }
         }
         let tips = self.list_refs()?.into_iter().map(|(_, t)| t).collect();
@@ -1178,7 +1167,7 @@ mod tests {
         let c1 = put_commit(&t, "c1", None);
         t.update_ref("main", &c1, None).unwrap();
         std::fs::write(
-            layout.refs_heads_dir().join("other.4242.tmp"),
+            layout.refs_heads_dir().join(".other.4242.1.tmp"),
             b"half a ref",
         )
         .unwrap();
