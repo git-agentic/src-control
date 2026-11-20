@@ -291,6 +291,13 @@ pub(crate) struct NeedsFiller<'a> {
 }
 
 impl NeedsFiller<'_> {
+    /// Make the tree `id` present (a lazy, online clone fetches it by id; any
+    /// other clone fails with the gap error naming `path` and its `sc
+    /// backfill` hint). Call it with the store lock released.
+    pub(crate) fn ensure_tree(&mut self, id: &ObjectId, path: &str) -> Result<()> {
+        self.filler.ensure_present(id, path, true)
+    }
+
     /// Make the objects a tree merge asked for present. Each `(id, path)` is
     /// what `merge_trees` could not read and where it found it. A lazy, online
     /// partial clone fetches them by id in batches; any other partial clone
