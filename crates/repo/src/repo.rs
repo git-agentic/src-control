@@ -300,6 +300,7 @@ impl Repo {
             pick_registry_base,
             None,
             &self.sparse_spec()?,
+            &self.layout.root,
             Some(&mut cache),
             author,
             message,
@@ -360,6 +361,9 @@ impl Repo {
     /// with "the view the host repo happens to have right now" — the two
     /// diverge exactly when a `sc ws` session outlives a `sparse set/disable`
     /// on the host, or when the caller is `sc work` at all.
+    /// `checkout` is the directory `files` was read from (the host root, or a
+    /// workspace's own dir): the case-alias guard asks it whether two
+    /// spellings of a protected path are one file.
     pub(crate) fn snapshot_files(
         &self,
         files: Vec<(String, Vec<u8>, scl_core::FileMode)>,
@@ -370,6 +374,7 @@ impl Repo {
         pick_registry_base: Option<ObjectId>,
         parents_override: Option<Vec<ObjectId>>,
         sparse: &crate::sparse::Sparse,
+        checkout: &Path,
         mut cache: Option<&mut crate::cache::ProtectedCache>,
         author: &str,
         message: &str,
@@ -547,7 +552,7 @@ impl Repo {
             &tip_entries,
             &all,
             merge_head.or(pick_head),
-            partial,
+            checkout,
         )?;
 
         let mut to_seal: Vec<ProtectedFile> = Vec::new();
@@ -1009,6 +1014,7 @@ impl Repo {
                     pick_registry_base,
                     None,
                     &self.sparse_spec()?,
+                    &self.layout.root,
                     Some(&mut c),
                     author,
                     message,
@@ -1099,6 +1105,7 @@ impl Repo {
             None,
             Some(tip_snap.parents.clone()),
             &self.sparse_spec()?,
+            &self.layout.root,
             Some(&mut cache),
             author,
             &msg,
@@ -1176,21 +1183,24 @@ impl Repo {
     /// The commit-time guard for rules dropped upstream. `tip_entries` are the
     /// tip's flattened entries (sparse-aware on a partial clone), `plain` the
     /// working-tree files that would land unsealed, `other` the merge or pick
-    /// head of a completion. Refuses (writing nothing) when
+    /// head of a completion, `checkout` the directory `plain` was read from.
+    /// Refuses (writing nothing) when
     /// 1. a tip entry is PROTECTED and `protection` covers its path with no
     ///    rule, which also catches an unrelated keyless commit dropping it;
-    /// 2. a plain path is PROTECTED on `other` (point lookups only, so a
-    ///    subtree a partial clone does not hold is never walked);
+    /// 2. a plain path is PROTECTED on `other` (point lookups along the path
+    ///    only; a tree a lazy, online partial clone lacks is fetched by id, any
+    ///    other clone gets the gap error with its `sc backfill` hint);
     /// 3. a plain path differs only in ASCII case from a rule prefix or a
-    ///    PROTECTED tip path: a case-insensitive checkout writes the decrypted
-    ///    file under that spelling, where it would then commit unsealed.
+    ///    PROTECTED tip path AND that spelling is the same file or directory in
+    ///    `checkout`: a case-insensitive checkout writes the decrypted file
+    ///    under the plain spelling, where it would then commit unsealed.
     fn refuse_uncovered_protected(
         &self,
         protection: &Protection,
         tip_entries: &BTreeMap<String, (ObjectId, scl_core::FileMode, u8)>,
         plain: &[(String, Vec<u8>, scl_core::FileMode, u8)],
         other: Option<ObjectId>,
-        partial: bool,
+        checkout: &Path,
     ) -> Result<()> {
         let protected = |perms: &u8| perms & scl_core::PROTECTED != 0;
         let mut bad: Vec<String> = tip_entries
@@ -1202,35 +1212,57 @@ impl Repo {
             .collect();
         if let Some(h) = other {
             let root = self.snapshot(&h)?.root;
-            let store_arc = self.vfs.store();
-            let mut store = store_arc.lock().unwrap();
+            // Loaded trees by id, so a flat directory is read once however
+            // many plain paths sit in it.
+            let mut trees: std::collections::HashMap<ObjectId, scl_core::Tree> =
+                std::collections::HashMap::new();
+            let mut filler = self.needs_filler()?;
             for (path, ..) in plain {
-                if worktree::tree_entry_at(&mut store, root, path, partial)?
-                    .is_some_and(|(.., perms)| protected(&perms))
-                {
-                    bad.push(path.clone());
+                let comps: Vec<&str> = path.split('/').collect();
+                let mut cur = root;
+                for (i, comp) in comps.iter().enumerate() {
+                    if let std::collections::hash_map::Entry::Vacant(slot) = trees.entry(cur) {
+                        filler.ensure_tree(&cur, path)?;
+                        slot.insert(self.vfs.store().lock().unwrap().get_tree(&cur)?);
+                    }
+                    let Some(e) = trees[&cur].get(comp) else {
+                        break;
+                    };
+                    match (e.kind, i + 1 == comps.len()) {
+                        (scl_core::EntryKind::Tree, false) => cur = e.id,
+                        (scl_core::EntryKind::Blob, true) => {
+                            if protected(&e.perms) {
+                                bad.push(path.clone());
+                            }
+                            break;
+                        }
+                        _ => break,
+                    }
                 }
             }
         }
-        let folded_rules: Vec<String> = protection
-            .prefixes
-            .iter()
-            .map(|r| r.prefix.to_ascii_lowercase())
-            .collect();
-        let folded_tip: std::collections::BTreeSet<String> = tip_entries
+        // A rule prefix or protected tip path that `path` could alias, by
+        // ASCII case, with the spelling to compare on disk.
+        let mut aliased: Vec<String> = Vec::new();
+        let protected_tip: Vec<&String> = tip_entries
             .iter()
             .filter(|(_, (.., perms))| protected(perms))
-            .map(|(p, _)| p.to_ascii_lowercase())
+            .map(|(p, _)| p)
             .collect();
-        let mut aliased: Vec<String> = Vec::new();
-        if !folded_rules.is_empty() || !folded_tip.is_empty() {
+        if !protection.prefixes.is_empty() || !protected_tip.is_empty() {
             for (path, ..) in plain {
                 let f = path.to_ascii_lowercase();
-                if folded_tip.contains(&f)
-                    || folded_rules
-                        .iter()
-                        .any(|r| crate::protect::path_under_prefix(&f, r))
-                {
+                // ASCII folding keeps byte lengths, so a rule's bare length
+                // cuts the same directory out of `path`.
+                let by_rule = protection.prefixes.iter().any(|r| {
+                    let bare = r.prefix.trim_end_matches('/');
+                    crate::protect::path_under_prefix(&f, &bare.to_ascii_lowercase())
+                        && same_file(checkout, &path[..bare.len()], bare)
+                });
+                let by_path = protected_tip
+                    .iter()
+                    .any(|q| q.to_ascii_lowercase() == f && same_file(checkout, path, q));
+                if by_rule || by_path {
                     aliased.push(path.clone());
                 }
             }
@@ -3158,6 +3190,28 @@ fn stop_write_blocker(
         Ok(_) if tracked(rel) => Ok(None),
         Ok(_) => Ok(Some(StopBlocker::Occupied)),
     }
+}
+
+/// Do `a` and `b` (checkout-relative) name the same file or directory, as a
+/// case-insensitive filesystem makes two spellings do? Compared by device and
+/// inode without following a final symlink (the commit reads symlinks as
+/// themselves); a path that does not exist is not the same as anything. Off
+/// unix there is no cheap identity, so the answer is a conservative yes.
+#[cfg(unix)]
+fn same_file(root: &Path, a: &str, b: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (
+        std::fs::symlink_metadata(root.join(a)),
+        std::fs::symlink_metadata(root.join(b)),
+    ) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_file(_root: &Path, _a: &str, _b: &str) -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -7436,6 +7490,7 @@ mod tests {
                 None,
                 None,
                 &dst.sparse_spec().unwrap(),
+                &dst_root,
                 None,
                 "t",
                 "msg",
@@ -7584,22 +7639,95 @@ mod tests {
                 None,
                 None,
                 &sparse,
+                &root,
                 None,
                 "t",
                 "m",
             )
         };
         // Under the folded rule prefix (the exact spelling would be sealed).
+        // Refused only where the checkout really makes them one path.
+        let insensitive = fs_ignores_case(&root);
         for path in ["Secret/.keep", "SECRET/x"] {
-            let err = snap(path).unwrap_err().to_string();
-            assert!(
-                err.contains("differs only in case") && err.contains(path),
-                "{err}"
-            );
+            if insensitive {
+                let err = snap(path).unwrap_err().to_string();
+                assert!(
+                    err.contains("differs only in case") && err.contains(path),
+                    "{err}"
+                );
+            } else {
+                snap(path).unwrap();
+            }
         }
         // Unrelated spellings still commit.
         snap("secretary.txt").unwrap();
         drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Does the filesystem under `dir` treat `Probe` and `probe` as one file?
+    fn fs_ignores_case(dir: &Path) -> bool {
+        let probe = dir.join("case-probe");
+        std::fs::write(&probe, b"p").unwrap();
+        let same = dir.join("CASE-PROBE").exists();
+        std::fs::remove_file(&probe).unwrap();
+        same
+    }
+
+    /// A plain `docs/private/README` beside a rule `Docs/private/` is a
+    /// distinct path on a case-sensitive filesystem and must commit there; on
+    /// a case-insensitive one the checkout makes them one directory.
+    #[test]
+    fn a_case_variant_of_a_rule_prefix_is_refused_only_where_it_aliases() {
+        let root = tmp_root("commit-case-variant-rule");
+        let repo = Repo::init(&root).unwrap();
+        let (_sk, pk) = scl_crypto::generate_keypair();
+        repo.protect("Docs/private/", &[pk], None).unwrap();
+        std::fs::create_dir_all(root.join("Docs/private")).unwrap();
+        std::fs::write(root.join("Docs/private/x"), "x\n").unwrap();
+        let tip = repo.commit("t", "protected").unwrap();
+        let res = repo.snapshot_files(
+            vec![(
+                "docs/private/README".to_string(),
+                b"plain\n".to_vec(),
+                scl_core::FileMode::FILE,
+            )],
+            Some(tip),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &repo.sparse_spec().unwrap(),
+            &root,
+            None,
+            "t",
+            "m",
+        );
+        if fs_ignores_case(&root) {
+            assert!(res
+                .unwrap_err()
+                .to_string()
+                .contains("differs only in case"));
+        } else {
+            res.unwrap();
+        }
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_file_compares_identity_and_never_follows_a_final_symlink() {
+        let root = tmp_root("same-file");
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        std::fs::write(root.join("d/a"), b"a").unwrap();
+        std::fs::write(root.join("d/b"), b"b").unwrap();
+        std::os::unix::fs::symlink("a", root.join("d/link")).unwrap();
+        assert!(same_file(&root, "d/a", "d/a"));
+        assert!(!same_file(&root, "d/a", "d/b"));
+        assert!(!same_file(&root, "d/a", "d/link"));
+        assert!(!same_file(&root, "d/a", "d/missing"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -7617,6 +7745,7 @@ mod tests {
                 None,
                 None,
                 &repo.sparse_spec().unwrap(),
+                &root,
                 None,
                 "t",
                 "m",

@@ -112,8 +112,10 @@ too, not just the src-control-side metadata.
   object, when a tip entry is `PROTECTED` and no rule in the resulting policy
   covers it, when a plain working-tree path is `PROTECTED` on the merge or pick
   head, or when a plain path differs only in ASCII case from a rule prefix or a
-  protected tip path (a case-insensitive checkout would write the decrypted
-  file under that spelling). Callers may first clean sparse-widen residue, fill
+  protected tip path and the checkout makes the two spellings one file (same
+  device and inode; always assumed off unix), so a case-insensitive checkout
+  would write the decrypted file under that spelling. A lazy, online partial
+  clone fetches the other parent's missing trees by id for that lookup. Callers may first clean sparse-widen residue, fill
   objects or mint the cache key. The hint is to restore the rule with
   `sc protect`, or, while a merge, pick or rebase is stopped, to abort it,
   restore the rule and retry. Case aliases of the other parent's protected

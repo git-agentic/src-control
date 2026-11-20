@@ -160,6 +160,7 @@ pub(crate) fn workspace_candidate(
         None,
         None,
         sparse,
+        dir,
         cache,
         author,
         message,

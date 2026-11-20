@@ -1179,3 +1179,56 @@ fn a_sidecar_that_would_overwrite_a_tracked_file_is_refused() {
     drop(clone);
     fx.cleanup();
 }
+
+/// Widening a stopped merge lays out a file only ours changed, so completing it
+/// asks the other parent about that path: its unchanged `docs/` tree was never
+/// held. A lazy, online clone fetches that tree by id; a clone that cannot
+/// fetch keeps the gap error with its `sc backfill` hint and the stop intact.
+#[test]
+fn completing_a_widened_merge_fills_the_other_parents_tree_for_a_plain_path() {
+    let fx = Fx::origin("widen-other-parent", |_| {});
+    fx.origin_branch(
+        "ours_b",
+        &[
+            ("src/a.txt", b"uno\ntwo\nthree\n"),
+            ("docs/a.md", b"a ours\n"),
+        ],
+    );
+    let b1 = fx.origin_branch("b1", &[("src/a.txt", b"ONE\ntwo\nthree\n")]);
+    let theirs_docs = dir_id(&fx.origin, &b1, "docs");
+    let clone = fx.clone(false);
+    clone.merge("origin/ours_b", "t").unwrap(); // fast-forward
+    assert!(matches!(
+        clone.merge("origin/b1", "t").unwrap_err(),
+        Error::MergeConflicts(1)
+    ));
+    crate::promisor::set_lazy(clone.layout(), true).unwrap();
+    clone
+        .set_sparse(&["src/".to_string(), "docs/".to_string()], None)
+        .unwrap();
+    assert_eq!(
+        std::fs::read(fx.clone_root.join("docs/a.md")).unwrap(),
+        b"a ours\n"
+    );
+    assert!(
+        !has(&clone, &theirs_docs),
+        "premise: the other parent's docs tree is still a gap"
+    );
+    clone
+        .resolve_path("src/a.txt", crate::conflicts::ResolveSide::Ours, None)
+        .unwrap();
+
+    crate::promisor::set_lazy(clone.layout(), false).unwrap();
+    let err = clone.commit("t", "merge").unwrap_err();
+    assert!(matches!(err, Error::GapOutsideFilter(_)), "got {err:?}");
+    assert!(err.to_string().contains("sc backfill"), "{err}");
+    assert!(clone.merge_in_progress(), "the stop is intact");
+
+    crate::promisor::set_lazy(clone.layout(), true).unwrap();
+    let merged = clone.commit("t", "merge").unwrap();
+    assert!(!clone.merge_in_progress());
+    assert!(has(&clone, &theirs_docs), "fetched by id for the lookup");
+    assert_eq!(clone.snapshot(&merged).unwrap().parents.len(), 2);
+    drop(clone);
+    fx.cleanup();
+}
