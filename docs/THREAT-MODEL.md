@@ -903,8 +903,9 @@ protected paths, plaintext.
   `gix::validate`), `.`, `..`, empty names and names containing `/`, `\` or NUL
   are refused. The check runs before the branch ref (and the mirror push) moves;
   blobs and subtrees written before the refusal stay in the target as
-  unreferenced objects, except that a repository this export created is removed
-  again (a pre-existing one is never touched). A commit reused through a mark is never rewritten, so it
+  unreferenced objects, and a repository the export created stays, with no refs
+  (it is never removed, since another export may be writing into it; a retry
+  points its unborn `HEAD` at the exported ref). A commit reused through a mark is never rewritten, so it
   is not judged, while anything export writes is, including a commit
   re-synthesized after its mark went stale. **Residual:** commits an older client
   already wrote into the mirror are pushed as they are, subject only to the
