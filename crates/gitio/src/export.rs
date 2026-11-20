@@ -60,9 +60,9 @@ impl GitTarget {
     /// Open an existing Git repo at `path`; if `path` does not exist, create a
     /// bare repo there. A path that exists but is not a Git repo is an error.
     pub(crate) fn open_or_init_bare(path: &Path) -> Result<GitTarget> {
-        // Claim the directory with an exclusive create: only a call that made it owns the
-        // repository (and may remove it on failure). Another process that wins the race, or a
-        // directory that already exists, makes this call treat the target as pre-existing.
+        // Claim the directory with an exclusive create: only a call that made it initializes the
+        // repository. Another process that wins the race, or a directory that already exists,
+        // makes this call treat the target as pre-existing. Nothing here ever removes a target.
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
@@ -84,8 +84,8 @@ impl GitTarget {
             let repo = gix::open(path).with_context(|| {
                 format!("{} exists but is not a git repository", path.display())
             })?;
-            // A repo with no refs (for example one a refused export left behind) has an
-            // unborn HEAD: pointing it at our ref is what a fresh repo gets.
+            // A bare repo with no refs and a symbolic, unborn HEAD (what a refused export leaves
+            // behind) gets the HEAD a fresh repo would. A checkout, or a detached HEAD, keeps its own.
             let no_refs = repo
                 .references()
                 .context("listing refs")?
@@ -93,13 +93,15 @@ impl GitTarget {
                 .context("listing refs")?
                 .next()
                 .is_none();
-            (repo, no_refs)
+            let symbolic_head = matches!(repo.head_name(), Ok(Some(_)));
+            let adopt = no_refs && repo.is_bare() && symbolic_head;
+            (repo, adopt)
         };
         Ok(GitTarget { repo, created })
     }
 
     /// Point `HEAD` at `ref_name` (a symbolic ref). Only meaningful on a repo we
-    /// created — a fresh `init_bare` HEAD may name `main`/`master` regardless of
+    /// created or a bare one with no refs — a fresh `init_bare` HEAD may name `main`/`master` regardless of
     /// our branch, so a mirror needs HEAD pointed at the ref we actually wrote or
     /// `git log`/`import_head` (which resolve HEAD) see nothing.
     pub(crate) fn set_head(&self, ref_name: &str) -> Result<()> {
