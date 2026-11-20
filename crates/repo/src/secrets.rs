@@ -689,11 +689,53 @@ const DENIED_NAMES: &[&str] = &[
     "HOME",
     "SHELL",
     "TMPDIR",
+    "GCONV_PATH",
+    "GLIBC_TUNABLES",
+    "HOSTALIASES",
+    "LOCALDOMAIN",
+    "RES_OPTIONS",
+    "NLSPATH",
+    "ZDOTDIR",
+    "CDPATH",
+    "BROWSER",
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
+    "RUSTC_WRAPPER",
+    "GOFLAGS",
+    "MAKEFLAGS",
+    "MFLAGS",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
 ];
 
 /// Prefixes denied for the same reason, plus `SC_` (sc's own knobs, such as
-/// `SC_SSH` and `SC_GIT`).
-const DENIED_PREFIXES: &[&str] = &["LD_", "DYLD_", "GIT_CONFIG", "SC_"];
+/// `SC_SSH` and `SC_GIT`). A deny list cannot be complete: it covers the
+/// loader, shell, interpreter and toolchain families; the registry itself is
+/// still unauthenticated repository data (docs/THREAT-MODEL.md).
+const DENIED_PREFIXES: &[&str] = &[
+    "LD_",
+    "DYLD_",
+    "GIT_",
+    "SC_",
+    "MALLOC_",
+    "PYTHON",
+    "PERL",
+    "RUBY",
+    "NODE_",
+    "LESS",
+    "CARGO_",
+    "RUSTC_",
+    "JAVA_",
+    "BASH_",
+    "NPM_CONFIG_",
+];
+
+/// Names a denied prefix would catch but that are ordinary credentials, not
+/// loader or interpreter knobs.
+const ALLOWED_EXCEPTIONS: &[&str] = &["NODE_AUTH_TOKEN", "CARGO_REGISTRY_TOKEN"];
+
+/// Suffixes that name a program a tool runs (`GIT_PAGER`, `SVN_EDITOR`, ...).
+const DENIED_SUFFIXES: &[&str] = &["PAGER", "EDITOR"];
 
 /// The one secret-name rule: `[A-Za-z_][A-Za-z0-9_]*`, and not a variable that
 /// changes how the child loads code or which program it runs. Applied when a
@@ -714,12 +756,14 @@ pub(crate) fn check_secret_name(name: &str) -> Result<()> {
     };
     if !shape_ok
         || DENIED_NAMES.contains(&key.as_str())
-        || DENIED_PREFIXES.iter().any(|p| key.starts_with(p))
+        || (DENIED_PREFIXES.iter().any(|p| key.starts_with(p))
+            && !ALLOWED_EXCEPTIONS.contains(&key.as_str()))
+        || DENIED_SUFFIXES.iter().any(|s| key.ends_with(s))
     {
         return Err(Error::InvalidArgument(format!(
             "secret name {name:?} is not allowed: use [A-Za-z_][A-Za-z0-9_]* and not a \
              variable that changes how a process loads code or which program runs \
-             (PATH, LD_*, DYLD_*, NODE_OPTIONS, GIT_CONFIG*, SC_*, ...)"
+             (PATH, LD_*, DYLD_*, GIT_*, NODE_*, PYTHON*, *PAGER, *EDITOR, SC_*, ...)"
         )));
     }
     Ok(())
@@ -1146,6 +1190,11 @@ mod tests {
             "NODE_OPTIONS",
             "GIT_CONFIG_COUNT",
             "SC_GIT",
+            "GIT_PAGER",
+            "GLIBC_TUNABLES",
+            "PYTHONWARNINGS",
+            "MALLOC_CONF",
+            "SVN_EDITOR",
             "a-b",
             "1X",
             "",
@@ -1163,6 +1212,10 @@ mod tests {
         repo.secret_add("DATABASE_URL", b"v", std::slice::from_ref(&pk))
             .unwrap();
         repo.secret_add("_x9", b"v", std::slice::from_ref(&pk))
+            .unwrap();
+        repo.secret_add("NODE_AUTH_TOKEN", b"v", std::slice::from_ref(&pk))
+            .unwrap();
+        repo.secret_add("GITHUB_TOKEN", b"v", std::slice::from_ref(&pk))
             .unwrap();
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
