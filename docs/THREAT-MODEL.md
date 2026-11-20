@@ -133,7 +133,15 @@ too, not just the src-control-side metadata.
   network mounts; Windows FAT, exFAT, some SMB shares) is not detected. For an
   identity file or TLS serve key the fallback is not small: it leaves the
   unencrypted private key under inherited permissions, so other local users may
-  be able to read it.
+  be able to read it. On unix, `sc` warns once on stderr (it does not refuse)
+  when an identity file passed with `--identity` is accessible to group or others
+  (`mode & 0o077`), as ssh does for keys.
+- **Sealed blobs bind no path or position (decision):** sealed protected blobs
+  and private-branch objects use constant associated data, so a writer can move
+  a sealed blob to another path or roll a path back to an older sealed version.
+  Accepted: binding the path would force a reseal on every rename and break
+  carry-by-id. Integrity of placement comes from signed commits
+  (`sc verify --require`).
 
 ## Private branches (`sc branch --private` / `sc branch publish`) — ADR-0044
 
@@ -463,6 +471,15 @@ too, not just the src-control-side metadata.
   not authentication: any peer that speaks version 6 and passes the access gates
   is served. An `ssh://` remote runs the remote host's own `sc`, so that binary
   must match too.
+- **`.sc/serve-tokens.toml` is owner-only.** Created and rewritten (add, rotate,
+  remove) through a `0600` staging file on unix (protected DACL on Windows), so a
+  default umask does not expose the token hashes and scopes.
+- **Remote-controlled text is escaped before printing.** A server's error string
+  and a commit's author and message may carry ANSI or OSC escapes, so the CLI
+  prints C0 controls (other than newline and tab), DEL and C1 controls as visible
+  escapes (`\x1b`) in those errors, in `sc log` and in `sc transcript`
+  output. Stored data and `--json` output are unchanged (JSON escapes controls).
+  Paths are not escaped.
 
 ## Bucket remotes (`sc+wal://` / `sc+s3://`) — ADR-0046/0057
 
@@ -876,6 +893,12 @@ protected paths, plaintext.
     constants, and the spools bound disk, not RAM.
   - The ceiling (1 GiB) is compile-time, so no configuration can make a length
     claim unbounded.
+- **Git export refuses unsafe tree names.** `sc export` and a push to a git
+  remote check every entry name in the exported history before creating the
+  target or writing any object: `.git`, `.gitmodules` and their HFS/NTFS aliases,
+  `.`, `..`, empty names and names containing `/`, `\` or NUL are refused. Every
+  blob is written as `100644` or `100755` by its exec bit; sc has no symlinks, so a
+  hostile tree cannot produce a Git symlink or gitlink entry.
 
 ## sc-forge: authentication, tenancy, transport, resources — P38 F1/F2
 
