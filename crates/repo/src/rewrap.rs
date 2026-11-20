@@ -20,7 +20,7 @@ pub struct RewrapReport {
     /// Already-randomized protected blobs re-sealed under a fresh DEK because
     /// the run asked to rotate (`rewrap_with` / `sc rewrap --rotate`).
     pub blobs_rotated: usize,
-    /// (entry label e.g. "secret db-pass" / "path secret/db.txt", reason)
+    /// (entry label e.g. "secret DB_PASS" / "path secret/db.txt", reason)
     pub skipped: Vec<(String, String)>,
     /// The commit id; None on --dry-run or when nothing needed rewrapping.
     pub commit: Option<ObjectId>,
@@ -470,9 +470,9 @@ mod tests {
         let repo = Repo::init(&root).unwrap();
         let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
         let (_esc_sk, esc_pk) = scl_crypto::generate_keypair();
-        repo.secret_add("db-pass", b"hunter2", std::slice::from_ref(&alice_pk))
+        repo.secret_add("DB_PASS", b"hunter2", std::slice::from_ref(&alice_pk))
             .unwrap();
-        repo.secret_add("api-key", b"tok", std::slice::from_ref(&alice_pk))
+        repo.secret_add("API_KEY", b"tok", std::slice::from_ref(&alice_pk))
             .unwrap();
         let tip_before = repo.head_tip().unwrap().unwrap();
 
@@ -491,7 +491,7 @@ mod tests {
         // ONE commit: new tip's sole parent is the old tip.
         assert_eq!(repo.snapshot(&commit).unwrap().parents, vec![tip_before]);
         // Both secrets now sealed to alice + escrow.
-        for name in ["db-pass", "api-key"] {
+        for name in ["DB_PASS", "API_KEY"] {
             let rids = repo.secret_recipients(name).unwrap();
             assert_eq!(rids.len(), 2, "{name} must gain the escrow key");
             assert!(rids.contains(&esc_pk.recipient_id()));

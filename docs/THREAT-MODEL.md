@@ -39,6 +39,28 @@ too, not just the src-control-side metadata.
   same-user process can still read the child's descriptor table, and the child
   decides what to do with what it read. Env stays the default for `sc run`,
   `sc work --with-secrets` and `sc ws run --with-secrets`.
+- **The registry is repository data, so injection validates it.** `secret_add`
+  needs no key: any writer can register a secret sealed to your public key under
+  any name. A secret name must therefore match `[A-Za-z_][A-Za-z0-9_]*` and not
+  be a variable that changes how a process loads code, which program runs, or
+  where a tool reads its config or trust roots (`PATH`, `LD_*`, `DYLD_*`,
+  `NODE_OPTIONS`, `GIT_*`, `SC_*`, proxy and CA-bundle variables, and the other
+  names in `secrets.rs`; a deny list, so not complete). The match is
+  case-insensitive on every platform, since tools such as npm read
+  `npm_config_*` in any case. `secret_add` refuses such a name. Every injecting
+  path (`sc run`, `--secrets-fd`, `sc ws run --with-secrets`,
+  `sc work --with-secrets`) validates the registry before the requested command
+  starts (`sc work`'s preflight can start an ssh transport on a lazy clone
+  first), and before decrypting anything. An entry whose name fails the rule
+  (planted, or added by an older CLI that took any name such as `db-pass`) is
+  skipped with a stderr warning, never opened and never injected, in strict and
+  non-strict mode alike. An entry whose key differs from the `name` the secret
+  was sealed under (the AEAD binds that name) refuses the whole run, and
+  `sc secret rotate` without `--value` refuses it too (`--value` re-seals it
+  afresh). **Residual:** a writer can still replace the value of an allowed name
+  (say `DATABASE_URL`) with one sealed to you, so the child connects where the
+  writer chose. The registry is not authenticated; review registry changes like
+  code, and use `sc verify --require` on the commits you run from.
 - **Rotation ≠ erasure:** `sc secret rotate` re-seals under a fresh DEK and cuts
   off future reads through the current registry, but the old ciphertext object
   remains reachable and decryptable by anyone who kept the old DEK. `sc secret
