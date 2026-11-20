@@ -642,7 +642,12 @@ pub fn parse_response(mut frame: Vec<u8>) -> Result<Vec<u8>> {
 /// `Error::PackTooLarge(msg)` from whatever we send here — sending
 /// `e.to_string()` would carry that prefix as part of `msg`, so the
 /// round-tripped error's `Display` would show the prefix twice. Sending only
-/// `inner` keeps the prefix appearing exactly once, on display.
+/// `inner` keeps the prefix appearing exactly once, on display. The same goes for
+/// `Protocol` and `Remote`.
+///
+/// The message is always the raw text, never `Display` output: `Display` escapes
+/// terminal controls for printing, and an escaped payload would change on the wire
+/// and be escaped a second time by the next hop.
 pub fn err_to_wire(e: &Error) -> (u8, String) {
     let code = match e {
         Error::NotARepo => EC_NOT_A_REPO,
@@ -655,7 +660,13 @@ pub fn err_to_wire(e: &Error) -> (u8, String) {
         _ => EC_OTHER,
     };
     let msg = match e {
-        Error::PackTooLarge(inner) | Error::ConnectionBudgetExceeded(inner) => inner.clone(),
+        Error::PackTooLarge(inner)
+        | Error::ConnectionBudgetExceeded(inner)
+        | Error::Protocol(inner)
+        | Error::Remote(inner) => inner.clone(),
+        Error::ConnectionLost(inner) => format!("connection to remote lost: {inner}"),
+        Error::BadRef(inner) => format!("malformed ref: {inner}"),
+        Error::InvalidArgument(inner) => format!("invalid argument: {inner}"),
         _ => e.to_string(),
     };
     (code, msg)
@@ -1805,6 +1816,28 @@ mod tests {
         match back {
             crate::error::Error::Remote(m) => assert!(m.contains("unborn"), "message lost: {m}"),
             other => panic!("expected Remote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_text_crosses_the_wire_raw_and_is_escaped_once_on_display() {
+        use crate::error::Error;
+        let raw = "bad\x1b[2Jtext";
+        for e in [
+            Error::Remote(raw.into()),
+            Error::Protocol(raw.into()),
+            Error::ConnectionLost(raw.into()),
+            Error::BadRef(raw.into()),
+            Error::InvalidArgument(raw.into()),
+        ] {
+            let (code, msg) = err_to_wire(&e);
+            assert!(msg.contains(raw), "payload must be raw: {msg:?}");
+            // A second hop re-encodes what it received: still raw, never escaped twice.
+            let hop = wire_to_err(code, msg);
+            let (_, msg2) = err_to_wire(&hop);
+            assert!(msg2.contains(raw), "{msg2:?}");
+            let shown = hop.to_string();
+            assert!(shown.contains("bad\\x1b[2Jtext") && !shown.contains("\\\\x1b"));
         }
     }
 

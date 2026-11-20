@@ -477,8 +477,10 @@ too, not just the src-control-side metadata.
 - **Remote-controlled text is escaped before printing.** A server's error string
   and a commit's author and message may carry ANSI or OSC escapes, so the CLI
   prints C0 controls (other than newline and tab), DEL and C1 controls as visible
-  escapes (`\x1b`) in those errors, in `sc log` and in `sc transcript`
-  output. Stored data and `--json` output are unchanged (JSON escapes controls).
+  escapes (`\x1b`) when displaying those errors and the ref-name diagnostics.
+  `sc log` and `sc transcript` rows are escaped as one line (newlines and bidi
+  controls too). Stored data, `--json` output and the bytes on the wire are
+  unchanged: errors cross the wire raw and are escaped only when displayed.
   Paths are not escaped.
 
 ## Bucket remotes (`sc+wal://` / `sc+s3://`) — ADR-0046/0057
@@ -894,11 +896,15 @@ protected paths, plaintext.
   - The ceiling (1 GiB) is compile-time, so no configuration can make a length
     claim unbounded.
 - **Git export refuses unsafe tree names.** `sc export` and a push to a git
-  remote check every entry name in the exported history before creating the
-  target or writing any object: `.git`, `.gitmodules` and their HFS/NTFS aliases,
-  `.`, `..`, empty names and names containing `/`, `\` or NUL are refused. Every
-  blob is written as `100644` or `100755` by its exec bit; sc has no symlinks, so a
-  hostile tree cannot produce a Git symlink or gitlink entry.
+  remote check every entry name in the snapshots they will write, before creating
+  the target or writing any object: `.git`, `.gitmodules` and their HFS/NTFS
+  aliases (git's own rules, via `gix::validate`), `.`, `..`, empty names and names
+  containing `/`, `\` or NUL are refused. History the destination already holds
+  (a reused mark) is not judged, and a network push also checks the commits the
+  server lacks even when the local mirror already holds them. An entry recorded
+  with symlink mode still exports as a Git symlink (changing that would change
+  re-synthesized tree ids); a Git symlink is ordinary Git content that git's own
+  checkout and `fsck` handle.
 
 ## sc-forge: authentication, tenancy, transport, resources — P38 F1/F2
 

@@ -16,7 +16,7 @@ pub enum Error {
     IndexBusy(String),
     #[error("object {0} is corrupt (failed hash verification on read)")]
     CorruptObject(ObjectId),
-    #[error("malformed ref: {0}")]
+    #[error("malformed ref: {}", scl_core::sanitize_display_line(.0))]
     BadRef(String),
     #[error("bad config: {0}")]
     BadConfig(String),
@@ -28,7 +28,7 @@ pub enum Error {
     NotProtected(String),
     #[error("identity is not authorized for protected prefix: {0}")]
     NotAuthorized(String),
-    #[error("invalid argument: {0}")]
+    #[error("invalid argument: {}", scl_core::sanitize_display_line(.0))]
     InvalidArgument(String),
     #[error("operation requires at least one commit (branch is unborn)")]
     Unborn,
@@ -240,6 +240,8 @@ mod tests {
             Error::ConnectionLost(raw.into()),
             Error::PackTooLarge(raw.into()),
             Error::ConnectionBudgetExceeded(raw.into()),
+            Error::BadRef(raw.into()),
+            Error::InvalidArgument(raw.into()),
         ] {
             let shown = e.to_string();
             assert!(
