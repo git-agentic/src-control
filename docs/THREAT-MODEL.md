@@ -903,11 +903,13 @@ protected paths, plaintext.
   `gix::validate`), `.`, `..`, empty names and names containing `/`, `\` or NUL
   are refused. The check runs before the branch ref (and the mirror push) moves;
   blobs and subtrees written before the refusal stay in the target as
-  unreferenced objects. A commit reused through a mark is never rewritten, so it
+  unreferenced objects, except that a repository this export created is removed
+  again (a pre-existing one is never touched). A commit reused through a mark is never rewritten, so it
   is not judged, while anything export writes is, including a commit
   re-synthesized after its mark went stale. **Residual:** commits an older client
-  already wrote into the mirror are pushed as they are; Git hosts that run
-  `fsck` on receive refuse such names. An entry recorded with symlink mode still
+  already wrote into the mirror are pushed as they are, subject only to the
+  receiver's own `fsck` rules, which are not export's policy (they accept a
+  regular `.gitmodules`, which export refuses). An entry recorded with symlink mode still
   exports as a Git symlink (changing that would change re-synthesized tree ids),
   and a symlinked `.gitattributes`, `.gitignore` or `.mailmap` stays exportable
   (git treats them as informational); a Git symlink is ordinary Git content that

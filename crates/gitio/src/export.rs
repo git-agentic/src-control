@@ -541,81 +541,89 @@ pub fn export_branch(
     let transcripts_dropped = count_transcripts(store, &seen_snaps)?;
 
     let target = GitTarget::open_or_init_bare(opts.to)?;
-
-    let mut commit_memo: HashMap<ObjectId, gix::ObjectId> = HashMap::new();
-    // Seed with commits already on the target (marks map): these are reused, not
-    // rewritten. A bad hex here is a corrupt marks file — surface it. Verify each
-    // still EXISTS there before reuse: `git gc` in the target can prune commits a
-    // stale mark still names, and blindly reusing a pruned oid writes a broken
-    // parent chain (P21 follow-on, ADR-0031). A missing one is treated as
-    // unknown — the walk below re-synthesizes it — and counted.
-    let mut stale_marks = 0usize;
-    for (sc_id, git_hex) in opts.known_git_commits {
-        let g = gix::ObjectId::from_hex(git_hex.as_bytes())
-            .map_err(|e| anyhow::anyhow!("bad git oid in marks for {sc_id}: {e}"))?;
-        if target.has_object(g) {
-            commit_memo.insert(*sc_id, g);
-        } else {
-            stale_marks += 1;
+    let result = (|| -> anyhow::Result<ExportReport> {
+        let mut commit_memo: HashMap<ObjectId, gix::ObjectId> = HashMap::new();
+        // Seed with commits already on the target (marks map): these are reused, not
+        // rewritten. A bad hex here is a corrupt marks file — surface it. Verify each
+        // still EXISTS there before reuse: `git gc` in the target can prune commits a
+        // stale mark still names, and blindly reusing a pruned oid writes a broken
+        // parent chain (P21 follow-on, ADR-0031). A missing one is treated as
+        // unknown — the walk below re-synthesizes it — and counted.
+        let mut stale_marks = 0usize;
+        for (sc_id, git_hex) in opts.known_git_commits {
+            let g = gix::ObjectId::from_hex(git_hex.as_bytes())
+                .map_err(|e| anyhow::anyhow!("bad git oid in marks for {sc_id}: {e}"))?;
+            if target.has_object(g) {
+                commit_memo.insert(*sc_id, g);
+            } else {
+                stale_marks += 1;
+            }
         }
-    }
-    let mut new_marks: Vec<(String, ObjectId)> = Vec::new();
-    let mut tree_memo: HashMap<ObjectId, gix::ObjectId> = HashMap::new();
-    let mut blob_memo: HashMap<ObjectId, gix::ObjectId> = HashMap::new();
-    let mut protected = 0usize;
+        let mut new_marks: Vec<(String, ObjectId)> = Vec::new();
+        let mut tree_memo: HashMap<ObjectId, gix::ObjectId> = HashMap::new();
+        let mut blob_memo: HashMap<ObjectId, gix::ObjectId> = HashMap::new();
+        let mut protected = 0usize;
 
-    // Post-order DAG walk: a commit is written only after all its parents have
-    // Git oids. Explicit stack (no recursion) so deep history can't overflow.
-    let mut stack: Vec<(ObjectId, bool)> = vec![(tip, false)];
-    while let Some((sid, ready)) = stack.pop() {
-        if commit_memo.contains_key(&sid) {
-            continue;
-        }
-        if ready {
-            let snap = store.get_snapshot(&sid)?;
-            let tree_oid = map_tree(
-                store,
-                &target,
-                snap.root,
-                &mut tree_memo,
-                &mut blob_memo,
-                &mut protected,
-            )?;
-            let parent_oids: Vec<gix::ObjectId> =
-                snap.parents.iter().map(|p| commit_memo[p]).collect();
-            let cid = map_commit(&target, &snap, tree_oid, &parent_oids)?;
-            commit_memo.insert(sid, cid);
-            new_marks.push((cid.to_hex().to_string(), sid));
-        } else {
-            stack.push((sid, true));
-            let snap = store.get_snapshot(&sid)?;
-            for p in &snap.parents {
-                if !commit_memo.contains_key(p) {
-                    stack.push((*p, false));
+        // Post-order DAG walk: a commit is written only after all its parents have
+        // Git oids. Explicit stack (no recursion) so deep history can't overflow.
+        let mut stack: Vec<(ObjectId, bool)> = vec![(tip, false)];
+        while let Some((sid, ready)) = stack.pop() {
+            if commit_memo.contains_key(&sid) {
+                continue;
+            }
+            if ready {
+                let snap = store.get_snapshot(&sid)?;
+                let tree_oid = map_tree(
+                    store,
+                    &target,
+                    snap.root,
+                    &mut tree_memo,
+                    &mut blob_memo,
+                    &mut protected,
+                )?;
+                let parent_oids: Vec<gix::ObjectId> =
+                    snap.parents.iter().map(|p| commit_memo[p]).collect();
+                let cid = map_commit(&target, &snap, tree_oid, &parent_oids)?;
+                commit_memo.insert(sid, cid);
+                new_marks.push((cid.to_hex().to_string(), sid));
+            } else {
+                stack.push((sid, true));
+                let snap = store.get_snapshot(&sid)?;
+                for p in &snap.parents {
+                    if !commit_memo.contains_key(p) {
+                        stack.push((*p, false));
+                    }
                 }
             }
         }
-    }
 
-    let tip_git = commit_memo[&tip];
-    target.set_ref_force(opts.ref_name, tip_git)?;
-    // If we created the repo, point HEAD at the exported ref so `git log` and
-    // `import_head` (which resolve HEAD) see the history. Never touch HEAD on a
-    // pre-existing repo.
-    if target.created {
-        target.set_head(opts.ref_name)?;
-    }
+        let tip_git = commit_memo[&tip];
+        target.set_ref_force(opts.ref_name, tip_git)?;
+        // If we created the repo, point HEAD at the exported ref so `git log` and
+        // `import_head` (which resolve HEAD) see the history. Never touch HEAD on a
+        // pre-existing repo.
+        if target.created {
+            target.set_head(opts.ref_name)?;
+        }
 
-    Ok(ExportReport {
-        git_commit: tip_git.to_hex().to_string(),
-        commits_written: commit_memo.len(),
-        protected_blobs_as_ciphertext: protected,
-        secrets_dropped,
-        signatures_dropped,
-        transcripts_dropped,
-        new_marks,
-        stale_marks,
-    })
+        Ok(ExportReport {
+            git_commit: tip_git.to_hex().to_string(),
+            commits_written: commit_memo.len(),
+            protected_blobs_as_ciphertext: protected,
+            secrets_dropped,
+            signatures_dropped,
+            transcripts_dropped,
+            new_marks,
+            stale_marks,
+        })
+    })();
+    // A refused or failed export must not leave a repository THIS call created: its HEAD would name
+    // Git's default branch, and a clean retry would take it for pre-existing, skip `set_head` and
+    // report success on a repo `git log` cannot read. A pre-existing repo is never touched.
+    if result.is_err() && target.created {
+        let _ = std::fs::remove_dir_all(opts.to);
+    }
+    result
 }
 
 /// The current git-oid-hex that `ref_name` points at in the git repo at `path`,
@@ -1575,19 +1583,56 @@ mod tests {
             ));
             let _ = std::fs::remove_dir_all(&dir);
             let empty = HashMap::new();
-            let opts = ExportOptions {
+            let opts = |ref_name| ExportOptions {
                 to: &dir,
-                ref_name: "refs/heads/main",
+                ref_name,
                 include_encrypted: false,
                 known_git_commits: &empty,
             };
-            let err = export_branch(&mut store, snap, &opts).unwrap_err();
+            // A non-default ref: HEAD of a repo left behind would not name it.
+            let topic = "refs/heads/topic";
+            let err = export_branch(&mut store, snap, &opts(topic)).unwrap_err();
             assert!(
                 format!("{err:#}").contains("not a safe Git path"),
                 "{err:#}"
             );
-            // Nothing may point at the hostile history (the target itself may have been created).
-            assert_eq!(read_ref(&dir, "refs/heads/main").unwrap(), None);
+            // The target this call created is removed, not left half-made.
+            assert!(
+                !dir.exists(),
+                "a refused first export must remove its target"
+            );
+
+            // A clean retry to the same ref succeeds and leaves a repo `git log` can read.
+            let clean = commit_with(&mut store, "a.txt", None, "clean");
+            export_branch(&mut store, clean, &opts(topic)).unwrap();
+            let out = Command::new("git")
+                .args([
+                    "--git-dir",
+                    dir.to_str().unwrap(),
+                    "log",
+                    "--format=%s",
+                    "topic",
+                ])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "clean");
+            let head = Command::new("git")
+                .args(["--git-dir", dir.to_str().unwrap(), "log", "--format=%s"])
+                .output()
+                .unwrap();
+            assert!(
+                head.status.success(),
+                "HEAD must name the exported ref: {head:?}"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+
+            // A pre-existing repo is never removed, and no ref moves in it.
+            GitTarget::open_or_init_bare(&dir).unwrap();
+            assert!(export_branch(&mut store, snap, &opts(topic)).is_err());
+            assert!(dir.exists());
+            assert_eq!(read_ref(&dir, topic).unwrap(), None);
+            std::fs::remove_dir_all(&dir).unwrap();
         }
     }
 
