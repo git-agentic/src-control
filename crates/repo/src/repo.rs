@@ -1242,27 +1242,42 @@ impl Repo {
             }
         }
         // A rule prefix or protected tip path that `path` could alias, by
-        // ASCII case, with the spelling to compare on disk.
+        // ASCII case. Both are indexed once by folded spelling, so each plain
+        // path costs a few lookups and only a match touches the disk.
         let mut aliased: Vec<String> = Vec::new();
-        let protected_tip: Vec<&String> = tip_entries
-            .iter()
-            .filter(|(_, (.., perms))| protected(perms))
-            .map(|(p, _)| p)
-            .collect();
-        if !protection.prefixes.is_empty() || !protected_tip.is_empty() {
+        let mut tips: std::collections::HashMap<String, Vec<&str>> = Default::default();
+        for (p, (.., perms)) in tip_entries {
+            if protected(perms) {
+                tips.entry(p.to_ascii_lowercase()).or_default().push(p);
+            }
+        }
+        let mut rules: std::collections::HashMap<String, Vec<&str>> = Default::default();
+        for r in &protection.prefixes {
+            let bare = r.prefix.trim_end_matches('/');
+            rules
+                .entry(bare.to_ascii_lowercase())
+                .or_default()
+                .push(bare);
+        }
+        if !rules.is_empty() || !tips.is_empty() {
             for (path, ..) in plain {
                 let f = path.to_ascii_lowercase();
-                // ASCII folding keeps byte lengths, so a rule's bare length
-                // cuts the same directory out of `path`.
-                let by_rule = protection.prefixes.iter().any(|r| {
-                    let bare = r.prefix.trim_end_matches('/');
-                    crate::protect::path_under_prefix(&f, &bare.to_ascii_lowercase())
-                        && same_file(checkout, &path[..bare.len()], bare)
-                });
-                let by_path = protected_tip
-                    .iter()
-                    .any(|q| q.to_ascii_lowercase() == f && same_file(checkout, path, q));
-                if by_rule || by_path {
+                let by_path = tips
+                    .get(&f)
+                    .is_some_and(|qs| qs.iter().any(|q| same_file(checkout, path, q)));
+                // The path itself and each parent directory, as a rule's bare
+                // form; ASCII folding keeps byte lengths, so the same prefix
+                // cuts the original spelling.
+                let by_rule = !by_path
+                    && f.match_indices('/')
+                        .map(|(i, _)| i)
+                        .chain(std::iter::once(f.len()))
+                        .any(|i| {
+                            rules.get(&f[..i]).is_some_and(|bares| {
+                                bares.iter().any(|b| same_file(checkout, &path[..i], b))
+                            })
+                        });
+                if by_path || by_rule {
                     aliased.push(path.clone());
                 }
             }
@@ -7646,8 +7661,9 @@ mod tests {
             )
         };
         // Under the folded rule prefix (the exact spelling would be sealed).
-        // Refused only where the checkout really makes them one path.
-        let insensitive = fs_ignores_case(&root);
+        // Refused only where the checkout really makes them one path (off
+        // unix the identity check always assumes they are).
+        let insensitive = fs_ignores_case(&root) || !cfg!(unix);
         for path in ["Secret/.keep", "SECRET/x"] {
             if insensitive {
                 let err = snap(path).unwrap_err().to_string();
@@ -7686,6 +7702,9 @@ mod tests {
         std::fs::create_dir_all(root.join("Docs/private")).unwrap();
         std::fs::write(root.join("Docs/private/x"), "x\n").unwrap();
         let tip = repo.commit("t", "protected").unwrap();
+        // Two existing directories on a case-sensitive filesystem.
+        std::fs::create_dir_all(root.join("docs/private")).unwrap();
+        std::fs::write(root.join("docs/private/README"), "plain\n").unwrap();
         let res = repo.snapshot_files(
             vec![(
                 "docs/private/README".to_string(),
@@ -7704,7 +7723,7 @@ mod tests {
             "t",
             "m",
         );
-        if fs_ignores_case(&root) {
+        if fs_ignores_case(&root) || !cfg!(unix) {
             assert!(res
                 .unwrap_err()
                 .to_string()
