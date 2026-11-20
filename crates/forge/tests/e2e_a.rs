@@ -1310,12 +1310,15 @@ fn admin_passwords_can_come_from_stdin_but_not_both_ways() {
         a.extend_from_slice(extra);
         run(&a, stdin)
     };
+    // Generated, so no password literal reaches the hashing code (CodeQL hard-coded-credential rule).
+    let pw1 = scl_crypto::random_hex(12);
+    let pw2 = scl_crypto::random_hex(12);
     // The trailing newline is not part of the password; an empty line is refused.
     assert!(!create(&["--password-stdin"], "\n").0, "empty password");
     assert!(!create(&["--password-stdin"], "").0, "no line at all");
     let (ok, err) = create(
         &["--password-stdin", "--must-change-password=false"],
-        "stdin-pw-1\r\n",
+        &format!("{pw1}\r\n"),
     );
     assert!(ok, "{err}");
     let (ok, err) = create(&["--password", "x", "--password-stdin"], "y\n");
@@ -1338,7 +1341,7 @@ fn admin_passwords_can_come_from_stdin_but_not_both_ways() {
             "--password-stdin",
             "--must-change-password=false",
         ],
-        "stdin-pw-2\n",
+        &format!("{pw2}\n"),
     );
     assert!(ok, "{err}");
     let hash_of = |pw: &str| {
@@ -1349,9 +1352,9 @@ fn admin_passwords_can_come_from_stdin_but_not_both_ways() {
         scl_crypto::verify_password(pw, Some(&u.password_hash))
     };
     assert!(
-        hash_of("stdin-pw-2"),
+        hash_of(&pw2),
         "the stdin password was stored, without its newline"
     );
-    assert!(!hash_of("stdin-pw-1"));
+    assert!(!hash_of(&pw1));
     let _ = std::fs::remove_dir_all(&dir);
 }
