@@ -328,7 +328,7 @@ fn verify_tree<S: RefObjects>(
                         continue;
                     }
                     match src.leaf(&e.id)? {
-                        Some(Kind::Blob | Kind::Sealed) => {
+                        Some(Kind::Blob) => {
                             seen.leaves.insert(e.id);
                         }
                         Some(other) => {

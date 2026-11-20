@@ -523,7 +523,9 @@ too, not just the src-control-side metadata.
   wrong kind or unreadable is refused. This stops a rewind, a sideways move, a
   public/private kind flip and a tip whose history dangles, which would break
   clone, fetch and gc for everyone. It is not a content check: write access
-  still adds any history and fast-forwards any branch it can name.
+  still adds any history and fast-forwards any branch it can name. Cost: a push
+  whose history joins an existing branch below its tip (not at a tip) is walked
+  back to the root, so an rw client can make a push cost a full-history walk.
 
 ## Bucket remotes (`sc+wal://` / `sc+s3://`) — ADR-0046/0057
 

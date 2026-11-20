@@ -231,10 +231,13 @@ pub(crate) fn ref_rules_hold<T: crate::transport::Transport>(t: &T) {
     ]);
     let tree_over_blob = tree(&[("a", EntryKind::Tree, b1.id())]);
     let file_over_tree = tree(&[("a", EntryKind::Blob, dir1.id())]);
+    // Checkout reads only blobs, so a sealed object as file content would break every checkout.
+    let file_over_sealed = tree(&[("a", EntryKind::Blob, sealed.id())]);
     for (what, objs, root) in [
         ("file and tree entry share an id", vec![&dirx], &reuse),
         ("tree entry names a blob", vec![&b1], &tree_over_blob),
         ("file entry names a tree", vec![&dir1, &b1], &file_over_tree),
+        ("file entry names a sealed object", vec![&sealed], &file_over_sealed),
     ] {
         let c = snap(root.id(), &[c2.id()], what);
         let mut objs = objs;
