@@ -49,7 +49,9 @@ accepted in every scope.
 
 It is local state like `.sc/local-key`: written atomically and durably
 (`fsutil::atomic_write_durable`: fsynced temp file, rename, fsynced directory,
-as durable as the ref write it precedes) by a command that holds the repo lock,
+as durable as the ref write it precedes; an accept or forget that changes
+nothing still syncs the directory, so a retry after a failed sync does not report
+success on an unsynced record) by a command that holds the repo lock,
 never part of a snapshot, never
 in a pack, never sent by clone, fetch or push, and not read by `sc gc`. `sc ws`
 and `sc work` commit through the host repo, so they use the host's record. Its
@@ -96,9 +98,9 @@ carry that copies existing wraps is never gated:
 |---|---|---|
 | `protect::encrypt_protected`, the one function that turns a rule's recipients into wraps | `path:<winning prefix>` | refuses the whole call, naming every pair |
 | callers: `snapshot_files` (commit, amend, merge/pick/rebase completion, `sc ws harvest`, `sc work`, `ws refresh`), the clean merge, `replay_commit` (cherry-pick, rebase), `branch_publish` (private-branch protected files) | | inherit it |
-| `sc protect` | `path:<prefix>` | validates the candidate rule before anything moves (even with nothing to seal), then builds the rule's snapshot and the sealing commit with the named keys staged in memory, records the approvals, and only then moves the refs (it advanced the ref before its sealing commit), so a refusal under any rule leaves refs, oplog and record alone |
+| `sc protect` | `path:<prefix>` | validates the candidate rule before anything moves (even with nothing to seal), then builds the rule's snapshot and the sealing commit with the pending approvals passed to that call's seal gate only (no state shared with other operations on the handle), records them, and only then moves the refs (it advanced the ref before its sealing commit), so a refusal under any rule leaves refs, oplog and record alone |
 | `secret_rotate` | `secret:<NAME>` | refuses on the final recipient set |
-| `rewrap` (secrets and protected paths) | `secret:<NAME>`, `path:<prefix>` | an entry with an unaccepted key is skipped and reported, the rest is committed, the exit code is non-zero (ADR-0027 skip-and-report). A secret registered under a name other than the one it is sealed under is skipped before it is opened (the registry name would pick the approvals, the sealed name the reseal). The record is read only for an entry that mints a wrap: a secret that opens, a path re-sealed or rotated, or a target with no wrap yet; a randomized path whose every wrap is reused copies them and needs no approval |
+| `rewrap` (secrets and protected paths) | `secret:<NAME>`, `path:<prefix>` | an entry with an unaccepted key is skipped and reported, the rest is committed, the exit code is non-zero (ADR-0027 skip-and-report). A secret registered under a name other than the one it is sealed under is skipped before it is opened (the registry name would pick the approvals, the sealed name the reseal); `secret grant` and `secret rotate` refuse it the same way. The record is read only for an entry that mints a wrap, and for a re-seal only after its ciphertext has opened (a corrupt blob is skipped as that whatever the record's state): a secret that opens, a path re-sealed or rotated, or a target with no wrap yet; a randomized path whose every wrap is reused copies them and needs no approval |
 | `branch_revoke` | `branch:<name>` | refuses on the remaining set |
 
 A conflict stop writes plaintext and seals nothing, so it is not gated; its

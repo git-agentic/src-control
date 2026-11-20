@@ -40,9 +40,10 @@ impl Repo {
     /// [`Repo::protect`] with the keys the user `named` apart from the `escrows`
     /// a command appends. Both get the rule; only `named` is recorded as
     /// accepted (escrow counts from `[escrow]` at check time, ADR-0059). The
-    /// approvals are staged in memory while the whole plan (the rule and the
-    /// sealing commit) is validated, then recorded, then the refs move, so a
-    /// refusal leaves the record and the refs as they were.
+    /// whole plan (the rule and the sealing commit) is validated with `named`
+    /// and `escrows` counted as accepted for this call only, then `named` is
+    /// recorded, then the refs move, so a refusal leaves the record and the
+    /// refs as they were.
     pub fn protect_with_escrow(
         &self,
         prefix: &str,
@@ -133,24 +134,28 @@ impl Repo {
         let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
         let mut cache = self.open_protected_cache()?;
         let message = format!("encrypt under {prefix}");
-        let id = {
-            // The keys it was given count as accepted for this one validation.
-            let _staged = self.stage_approvals(&scope, named, escrows);
-            self.snapshot_files(
-                files,
-                Some(policy_id),
-                None,
-                None,
-                None,
-                None,
-                None,
-                &self.sparse_spec()?,
-                &self.layout.root,
-                Some(&mut cache),
-                "system",
-                &message,
-            )?
+        // The keys it was given count as accepted for this validation only.
+        let pending = || {
+            Ok(self
+                .accepted()?
+                .with_named(&scope, named)
+                .with_escrow(escrows))
         };
+        let id = self.snapshot_files_with(
+            files,
+            Some(policy_id),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &self.sparse_spec()?,
+            &self.layout.root,
+            Some(&mut cache),
+            &pending,
+            "system",
+            &message,
+        )?;
         // Validated: record the approvals, then move the refs.
         self.accept_keys(&scope, named)?;
         crate::refs::write_branch_tip(self.layout(), &head, &policy_id)?;

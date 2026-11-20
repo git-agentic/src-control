@@ -175,6 +175,17 @@ impl Repo {
                 _ => return Err(Error::NoSuchSecret(format!("{name} is not a secret"))),
             }
         };
+        // The AEAD binds the sealed name. An entry registered under another
+        // name would be approved by the registry name and wrapped as the sealed
+        // one, so refuse it before recording or wrapping anything, as rotate
+        // and rewrap do.
+        if secret.name != name {
+            return Err(Error::InvalidArgument(format!(
+                "registry entry {name} points at a secret sealed as {:?}; \
+                 rotate it with --value instead",
+                secret.name
+            )));
+        }
         self.accept_keys(
             &crate::accepted::secret_scope(name),
             std::slice::from_ref(new),

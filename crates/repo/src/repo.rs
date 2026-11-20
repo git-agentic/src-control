@@ -62,9 +62,6 @@ pub struct AbortReport {
 pub struct Repo {
     pub(crate) layout: Layout,
     pub(crate) vfs: VfsRepo,
-    /// Approvals the running command is validating but has not recorded
-    /// (`Repo::stage_approvals`).
-    pub(crate) staged: std::sync::Mutex<Vec<(Option<String>, scl_crypto::PublicKey)>>,
     _lock: RepoLock,
 }
 
@@ -128,7 +125,6 @@ impl Repo {
         Ok(Repo {
             layout,
             vfs: VfsRepo::new(store),
-            staged: std::sync::Mutex::new(Vec::new()),
             _lock: lock,
         })
     }
@@ -332,6 +328,40 @@ impl Repo {
         Ok(id)
     }
 
+    /// [`Repo::snapshot_files_with`] reading the approvals from the record, which
+    /// is what every commit-shaped caller wants.
+    pub(crate) fn snapshot_files(
+        &self,
+        files: Vec<(String, Vec<u8>, scl_core::FileMode)>,
+        tip: Option<ObjectId>,
+        merge_head: Option<ObjectId>,
+        pick_head: Option<ObjectId>,
+        decided_root: Option<ObjectId>,
+        pick_registry_base: Option<ObjectId>,
+        parents_override: Option<Vec<ObjectId>>,
+        sparse: &crate::sparse::Sparse,
+        checkout: &Path,
+        cache: Option<&mut crate::cache::ProtectedCache>,
+        author: &str,
+        message: &str,
+    ) -> Result<ObjectId> {
+        self.snapshot_files_with(
+            files,
+            tip,
+            merge_head,
+            pick_head,
+            decided_root,
+            pick_registry_base,
+            parents_override,
+            sparse,
+            checkout,
+            cache,
+            &|| self.accepted(),
+            author,
+            message,
+        )
+    }
+
     /// The commit pipeline minus ref movement: split protected/plaintext files,
     /// scan the plaintext (Err(SecretDetected) on a hit), convergently encrypt
     /// protected files, carry forward absent still-protected content from
@@ -383,7 +413,10 @@ impl Repo {
     /// `checkout` is the directory `files` was read from (the host root, or a
     /// workspace's own dir): the case-alias guard asks it whether two
     /// spellings of a protected path are one file.
-    pub(crate) fn snapshot_files(
+    /// `accepted` supplies the approvals the seal gate checks (ADR-0059); it is
+    /// called only when something is sealed. `protect` passes the keys it is
+    /// about to record, for this call only.
+    pub(crate) fn snapshot_files_with(
         &self,
         files: Vec<(String, Vec<u8>, scl_core::FileMode)>,
         tip: Option<ObjectId>,
@@ -395,6 +428,7 @@ impl Repo {
         sparse: &crate::sparse::Sparse,
         checkout: &Path,
         mut cache: Option<&mut crate::cache::ProtectedCache>,
+        accepted: &dyn Fn() -> Result<crate::accepted::Accepted>,
         author: &str,
         message: &str,
     ) -> Result<ObjectId> {
@@ -691,8 +725,7 @@ impl Repo {
             }
         }
 
-        let (protected_all, sealed_wrapped) =
-            crate::protect::encrypt_protected(to_seal, || self.accepted())?;
+        let (protected_all, sealed_wrapped) = crate::protect::encrypt_protected(to_seal, accepted)?;
         // Record every freshly sealed path's new blob id into the cache; the
         // committing caller persists it only after the ref actually moves.
         if let Some(c) = cache {

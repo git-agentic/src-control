@@ -284,28 +284,22 @@ impl Repo {
             // An entry mints a wrap when it is re-sealed under a fresh DEK, or
             // when a target has no wrap yet. Reusing every existing wrap copies
             // them and needs no approval, so the record is not read.
-            let mints_a_wrap = convergent
-                || rotate
-                || target_pks.iter().any(|pk| {
-                    !wks.iter()
-                        .any(|w| w.recipient_id == pk.recipient_id().as_str())
-                });
-            if mints_a_wrap {
+            let wrap_missing = target_pks.iter().any(|pk| {
+                !wks.iter()
+                    .any(|w| w.recipient_id == pk.recipient_id().as_str())
+            });
+            // The record is read at the last moment: a re-seal checks it after
+            // its ciphertext has opened, so a corrupt blob is skipped as that
+            // even when the record is unreadable.
+            let unaccepted = |accepted: &mut Option<crate::accepted::Accepted>| -> Result<_> {
                 if accepted.is_none() {
-                    accepted = Some(self.accepted()?.with_escrow(escrows));
+                    *accepted = Some(self.accepted()?.with_escrow(escrows));
                 }
-                let pending = accepted
+                Ok(accepted
                     .as_ref()
                     .expect("loaded above")
-                    .unaccepted(&scope, &target_pks);
-                if !pending.is_empty() {
-                    skipped.push((
-                        format!("path {path}"),
-                        crate::accepted::describe_inline(&pending),
-                    ));
-                    continue;
-                }
-            }
+                    .unaccepted(&scope, &target_pks))
+            };
             if convergent || rotate {
                 // Convergent (pre-P33): eager upgrade. Randomized with
                 // `rotate`: a genuine cutover to a fresh DEK. Either way:
@@ -335,6 +329,14 @@ impl Repo {
                         continue;
                     }
                 };
+                let pending = unaccepted(&mut accepted)?;
+                if !pending.is_empty() {
+                    skipped.push((
+                        format!("path {path}"),
+                        crate::accepted::describe_inline(&pending),
+                    ));
+                    continue;
+                }
                 if dry_run {
                     if convergent {
                         blobs_resealed += 1;
@@ -377,6 +379,16 @@ impl Repo {
                     blobs_rotated += 1;
                 }
                 continue;
+            }
+            if wrap_missing {
+                let pending = unaccepted(&mut accepted)?;
+                if !pending.is_empty() {
+                    skipped.push((
+                        format!("path {path}"),
+                        crate::accepted::describe_inline(&pending),
+                    ));
+                    continue;
+                }
             }
             if dry_run {
                 blobs_rewrapped += 1;

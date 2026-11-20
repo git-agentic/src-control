@@ -134,11 +134,12 @@ too, not just the src-control-side metadata.
   `branch:<name>`; local `[escrow]` keys count in every scope. The gate is
   `encrypt_protected`, the one function that turns a rule into wraps, plus
   `sc protect` (it checks the rule it changes, builds its sealing commit with the
-  named keys staged in memory, records them, then moves the refs), `secret_rotate`, `rewrap` (an entry with an
+  pending approvals passed to that call's gate only, records them, then moves the
+  refs), `secret_rotate`, `rewrap` (an entry with an
   unaccepted key is skipped, the rest commits, the exit code is non-zero) and
   `branch_revoke`. The record is written durably (fsynced, as durable as the ref
-  write). `sc rewrap` skips a secret registered under a name other than the one
-  it is sealed under. The record loads only when something is sealed, so a commit
+  write). `sc rewrap` skips, and `sc secret grant` refuses, a secret registered under a
+  name other than the one it is sealed under. The record loads only when something is sealed, so a commit
   that wraps nothing does not depend on it. Escrow keys are never recorded: they
   count from the current `[escrow]` section, so removing one withdraws it. A
   scope in a refusal comes from the repository, so it is escaped and a scope
