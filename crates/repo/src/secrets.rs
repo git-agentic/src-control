@@ -815,6 +815,8 @@ const ALLOWED_EXCEPTIONS: &[&str] = &[
     "NODE_AUTH_TOKEN",
     "CARGO_REGISTRY_TOKEN",
     "YARN_NPM_AUTH_TOKEN",
+    "GEM_HOST_API_KEY",
+    "RUBYGEMS_API_KEY",
 ];
 
 /// Suffixes that name a program or options a tool runs (`GIT_PAGER`,
@@ -1318,6 +1320,8 @@ mod tests {
         for ok in [
             "GITHUB_TOKEN",
             "YARN_NPM_AUTH_TOKEN",
+            "GEM_HOST_API_KEY",
+            "RUBYGEMS_API_KEY",
             "CARGO_REGISTRY_TOKEN",
         ] {
             repo.secret_add(ok, b"v", std::slice::from_ref(&pk))
