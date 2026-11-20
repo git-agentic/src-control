@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use scl_core::{EntryKind, FileMode, Object, ObjectId, Snapshot, Store, PROTECTED};
+use scl_core::{EntryKind, Object, ObjectId, Snapshot, Store, PROTECTED};
 
 /// A Git repository we write objects and refs into.
 pub(crate) struct GitTarget {
@@ -27,12 +27,11 @@ pub(crate) struct GitTreeEntry {
     pub oid: gix::ObjectId,
 }
 
-/// The four Git entry kinds we emit.
+/// The Git entry kinds we emit. sc has no symlinks, so there is no link kind.
 #[derive(Clone, Copy)]
 pub(crate) enum GitMode {
     File,
     Exec,
-    Link,
     Tree,
 }
 
@@ -49,7 +48,6 @@ impl GitMode {
         match self {
             GitMode::File => EntryKind::Blob,
             GitMode::Exec => EntryKind::BlobExecutable,
-            GitMode::Link => EntryKind::Link,
             GitMode::Tree => EntryKind::Tree,
         }
         .into()
@@ -264,10 +262,12 @@ fn map_tree(
                 map_tree(store, target, e.id, tree_memo, blob_memo, protected_count)?,
             ),
             EntryKind::Blob => {
-                let mode = match e.mode {
-                    m if m == FileMode::EXEC => GitMode::Exec,
-                    FileMode(0o120000) => GitMode::Link,
-                    _ => GitMode::File,
+                // Only 100644 / 100755: a hostile tree must not smuggle in a symlink (120000)
+                // or gitlink mode, so the owner exec bit alone decides.
+                let mode = if e.mode.0 & 0o100 != 0 {
+                    GitMode::Exec
+                } else {
+                    GitMode::File
                 };
                 (mode, map_blob(store, target, e.id, blob_memo)?)
             }
@@ -447,6 +447,48 @@ fn count_transcripts(
     Ok(count)
 }
 
+/// Code points HFS+ ignores when it compares names, so `.g\u{200c}it` is `.git` on a Mac.
+fn hfs_ignorable(c: char) -> bool {
+    matches!(c, '\u{200c}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}')
+}
+
+/// The names `fsck` treats as the special file `.<name>`: the dotted name, and on NTFS the 8.3 short
+/// names `<first six>~1` to `~4` and `<hash prefix>~1` to `~9`. `hash` is NTFS's fall-back short-name
+/// prefix for that file (`gi7eba` for `.gitmodules`).
+fn special_names(name: &str, hash: Option<&str>) -> Vec<String> {
+    let mut v = vec![format!(".{name}")];
+    v.extend((1..=4).map(|n| format!("{}~{n}", &name[..6])));
+    if let Some(h) = hash {
+        v.extend((1..=9).map(|n| format!("{h}~{n}")));
+    }
+    v
+}
+
+/// Whether a path component is one of `names` on any filesystem git runs on.
+fn is_alias(component: &str, names: &[String]) -> bool {
+    let c: String = component.chars().filter(|c| !hfs_ignorable(*c)).collect();
+    // NTFS ignores trailing dots and spaces and treats `name:stream` as the file `name`.
+    let c = c.split(':').next().unwrap_or("");
+    let c = c.trim_end_matches([' ', '.']).to_ascii_lowercase();
+    names.contains(&c)
+}
+
+/// Refuse a tree entry name git's `fsck` would refuse (or that a checkout would resolve into `.git`
+/// or `.gitmodules`), so a hostile sc tree cannot become a hostile Git tree.
+fn check_entry_name(name: &str) -> anyhow::Result<()> {
+    let bad = name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\\', '\0'])
+        || is_alias(name, &[".git".into(), "git~1".into()])
+        || is_alias(name, &special_names("gitmodules", Some("gi7eba")));
+    anyhow::ensure!(
+        !bad,
+        "refusing to export: tree entry name {name:?} is not a safe Git path component"
+    );
+    Ok(())
+}
+
 /// Record PROTECTED entry paths under `prefix`, recursing into subtrees. Uses an
 /// explicit stack so deep trees can't overflow. Deduplicates subtree object ids
 /// via `seen` so shared subtrees (identical content at multiple paths in a
@@ -465,6 +507,7 @@ fn scan_tree(
         }
         let tree = store.get_tree(&id)?;
         for e in &tree.entries {
+            check_entry_name(&e.name)?;
             let path = if pre.is_empty() {
                 e.name.clone()
             } else {
@@ -610,6 +653,7 @@ pub fn read_ref(path: &Path, ref_name: &str) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scl_core::FileMode;
     use std::process::Command;
 
     fn git(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
@@ -678,7 +722,7 @@ mod tests {
 
     #[test]
     fn single_snapshot_exports_files_and_modes() {
-        use scl_core::{EntryKind, FileMode, Object, Store, StoreConfig, Tree, TreeEntry};
+        use scl_core::{EntryKind, Object, Store, StoreConfig, Tree, TreeEntry};
         use std::collections::{BTreeMap, HashMap};
         let mut store = Store::new(StoreConfig::default());
         let blob = store.put(Object::blob(b"fn main(){}".to_vec())).unwrap();
@@ -919,7 +963,7 @@ mod tests {
 
     // Helper: a snapshot with one PROTECTED entry and one registry secret.
     fn encrypted_snapshot(store: &mut scl_core::Store) -> scl_core::ObjectId {
-        use scl_core::{EntryKind, FileMode, Object, Secret, Snapshot, Tree, TreeEntry, PROTECTED};
+        use scl_core::{EntryKind, Object, Secret, Snapshot, Tree, TreeEntry, PROTECTED};
         use std::collections::BTreeMap;
         let ct = store
             .put(Object::blob(b"ciphertext-bytes".to_vec()))
@@ -1444,5 +1488,135 @@ mod tests {
 
         std::fs::remove_dir_all(&gsrc).unwrap();
         std::fs::remove_dir_all(&dst).unwrap();
+    }
+
+    fn one_entry_snapshot(
+        store: &mut scl_core::Store,
+        name: &str,
+        mode: FileMode,
+        nested: bool,
+    ) -> ObjectId {
+        use scl_core::{Snapshot, Tree, TreeEntry};
+        let blob = store.put(Object::blob(b"x".to_vec())).unwrap();
+        let entry = |name: &str, kind, id, mode| TreeEntry {
+            name: name.into(),
+            kind,
+            id,
+            mode,
+            perms: 0,
+        };
+        let mut root = store
+            .put(Object::Tree(Tree::new(vec![entry(
+                name,
+                EntryKind::Blob,
+                blob,
+                mode,
+            )])))
+            .unwrap();
+        if nested {
+            root = store
+                .put(Object::Tree(Tree::new(vec![
+                    entry("a.txt", EntryKind::Blob, blob, FileMode::FILE),
+                    entry("sub", EntryKind::Tree, root, FileMode::FILE),
+                ])))
+                .unwrap();
+        }
+        store
+            .put(Object::Snapshot(Snapshot {
+                root,
+                parents: vec![],
+                author: "t".into(),
+                timestamp: 1,
+                message: "m".into(),
+                secrets: Default::default(),
+                protection: Default::default(),
+            }))
+            .unwrap()
+    }
+
+    #[test]
+    fn check_entry_name_refuses_git_special_and_malformed_names() {
+        for bad in [
+            "",
+            ".",
+            "..",
+            ".git",
+            ".GIT",
+            ".git.",
+            ".git ",
+            "git~1",
+            ".g\u{200c}it",
+            ".git:x",
+            ".gitmodules",
+            ".GitModules",
+            "gitmod~1",
+            "gi7eba~1",
+            "a/b",
+            "a\\b",
+            "a\0b",
+        ] {
+            assert!(check_entry_name(bad).is_err(), "{bad:?} must be refused");
+        }
+        for ok in [
+            ".gitignore",
+            ".gitattributes",
+            "gitmodules",
+            "main.rs",
+            ".github",
+            "..a",
+        ] {
+            assert!(check_entry_name(ok).is_ok(), "{ok:?} must be allowed");
+        }
+    }
+
+    #[test]
+    fn export_refuses_hostile_name_before_writing_anything() {
+        for name in [".git", ".gitmodules", "GIT~1"] {
+            let mut store = scl_core::Store::new(scl_core::StoreConfig::default());
+            // Nested, so the walk must reach it past a clean sibling blob.
+            let snap = one_entry_snapshot(&mut store, name, FileMode::FILE, true);
+            let dir = std::env::temp_dir().join(format!(
+                "scl-hostile-{}-{}",
+                std::process::id(),
+                name.replace('~', "_")
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let empty = HashMap::new();
+            let opts = ExportOptions {
+                to: &dir,
+                ref_name: "refs/heads/main",
+                include_encrypted: false,
+                known_git_commits: &empty,
+            };
+            let err = export_branch(&mut store, snap, &opts).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("not a safe Git path"),
+                "{err:#}"
+            );
+            assert!(!dir.exists(), "no git repo may be created on refusal");
+        }
+    }
+
+    #[test]
+    fn export_never_emits_symlink_or_odd_modes() {
+        let mut store = scl_core::Store::new(scl_core::StoreConfig::default());
+        let snap = one_entry_snapshot(&mut store, "link", FileMode(0o120000), false);
+        let dir = std::env::temp_dir().join(format!("scl-nolink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let empty = HashMap::new();
+        let opts = ExportOptions {
+            to: &dir,
+            ref_name: "refs/heads/main",
+            include_encrypted: false,
+            known_git_commits: &empty,
+        };
+        export_branch(&mut store, snap, &opts).unwrap();
+        let out = Command::new("git")
+            .args(["--git-dir", dir.to_str().unwrap(), "ls-tree", "main"])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8(out.stdout).unwrap();
+        assert!(listing.starts_with("100644 blob"), "{listing}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
