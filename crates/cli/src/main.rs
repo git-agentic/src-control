@@ -4818,13 +4818,14 @@ fn run_protect(prefix: Option<String>, to: Vec<String>, list: bool, json: bool) 
         for (p, recips) in prefixes {
             let granted = recips.iter().filter(|r| r.granted).count();
             // A rule prefix comes from the repository.
-            println!(
+            // `print_line` exits quietly when the reader closes the pipe (`| grep -q`).
+            print_line(&format!(
                 "{}  ({granted} granted)",
                 scl_core::sanitize_display_line(&p)
-            );
+            ));
             for r in recips {
                 let state = if r.granted { "granted" } else { "REVOKED" };
-                println!("  {}  {}@e{}", r.id.as_str(), state, r.epoch);
+                print_line(&format!("  {}  {}@e{}", r.id.as_str(), state, r.epoch));
             }
         }
         return Ok(());
