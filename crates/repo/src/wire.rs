@@ -571,6 +571,12 @@ pub fn read_pack_stream(
         let frame =
             read_frame_opt(r)?.ok_or_else(|| Error::Protocol("EOF before ST_PACK_END".into()))?;
         match frame.split_first() {
+            // `write_pack_stream` never frames zero bytes. An empty chunk
+            // advances neither the size cap nor the idle timeout, so a peer
+            // could repeat it for ever.
+            Some((&ST_PACK_CHUNK, [])) => {
+                return Err(Error::Protocol("empty ST_PACK_CHUNK frame".into()))
+            }
             Some((&ST_PACK_CHUNK, rest)) => {
                 let next = total + rest.len() as u64;
                 if max_bytes != 0 && next > max_bytes {
@@ -2201,6 +2207,26 @@ mod tests {
         drop(client);
         server_join.join().unwrap().unwrap();
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `write_pack_stream` never frames zero bytes, so an empty chunk is a
+    /// peer making no progress: it moves neither the size cap nor the
+    /// idle timeout, and could be repeated for ever.
+    #[test]
+    fn read_pack_stream_refuses_an_empty_chunk() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &[ST_PACK_CHUNK, b'a']).unwrap();
+        for _ in 0..1000 {
+            write_frame(&mut buf, &[ST_PACK_CHUNK]).unwrap();
+        }
+        write_frame(&mut buf, &[ST_PACK_END]).unwrap();
+        let mut sink = Vec::new();
+        let err = read_pack_stream(&mut std::io::Cursor::new(buf), &mut sink, 0).unwrap_err();
+        assert!(
+            matches!(err, Error::Protocol(_)),
+            "expected Protocol error, got {err:?}"
+        );
+        assert_eq!(sink, b"a", "refused at the first empty chunk");
     }
 
     #[test]

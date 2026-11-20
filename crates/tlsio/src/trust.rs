@@ -206,7 +206,7 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
         let h = std::thread::spawn(move || {
             let (tcp, _) = listener.accept().unwrap();
-            let Ok(stream) = server_stream(&cfg, tcp) else {
+            let Ok(stream) = server_stream(&cfg, tcp, None) else {
                 return; // a client that rejects the cert aborts the handshake
             };
             let (mut r, mut w) = stream.split();
