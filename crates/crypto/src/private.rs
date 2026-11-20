@@ -108,10 +108,20 @@ pub fn open_object(payload: &[u8], dek: &[u8; KEY_LEN]) -> Result<Zeroizing<Vec<
 
 /// One branch-index entry: where an inner object's ciphertext lives and the
 /// DEK that opens it.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct IndexEntry {
     pub sealed: ObjectId,
     pub dek: [u8; KEY_LEN],
+}
+
+/// The DEK is never printed: a `{:?}` in an error path or a log must not leak key bytes.
+impl std::fmt::Debug for IndexEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndexEntry")
+            .field("sealed", &self.sealed)
+            .field("dek", &"<redacted>")
+            .finish()
+    }
 }
 
 /// The decrypted branch index: the inner (plaintext-id) tip snapshot plus the
@@ -122,10 +132,23 @@ pub struct IndexEntry {
 /// Inner ids are BLAKE3 hashes of plaintext encodings, so the index is exactly
 /// as sensitive as the DEKs it carries: it exists in plaintext only inside an
 /// authorized process and is zeroized on drop (best-effort).
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct BranchIndex {
     pub inner_tip: Option<ObjectId>,
     pub entries: BTreeMap<ObjectId, IndexEntry>,
+}
+
+/// Prints the tip and the entry count only; the entries carry DEKs.
+impl std::fmt::Debug for BranchIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BranchIndex")
+            .field("inner_tip", &self.inner_tip)
+            .field(
+                "entries",
+                &format_args!("<{} redacted>", self.entries.len()),
+            )
+            .finish()
+    }
 }
 
 impl Drop for BranchIndex {
@@ -261,6 +284,27 @@ mod tests {
 
     fn oid(b: u8) -> ObjectId {
         ObjectId::from_bytes([b; 32])
+    }
+
+    #[test]
+    fn debug_output_never_contains_dek_bytes() {
+        let dek = [0xab; KEY_LEN];
+        let entry = IndexEntry {
+            sealed: oid(1),
+            dek,
+        };
+        let mut idx = BranchIndex::default();
+        idx.entries.insert(oid(2), entry.clone());
+        let (hex, dec) = (hex::encode(dek), format!("{:?}", dek.to_vec()));
+        for shown in [
+            format!("{entry:?}"),
+            format!("{entry:#?}"),
+            format!("{idx:?}"),
+            format!("{idx:#?}"),
+        ] {
+            assert!(!shown.contains(&hex) && !shown.contains(&dec), "{shown}");
+            assert!(shown.contains("redacted"), "{shown}");
+        }
     }
 
     #[test]
