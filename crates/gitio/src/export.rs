@@ -253,6 +253,14 @@ fn map_tree(
         return Ok(g);
     }
     let tree = store.get_tree(&id)?;
+    // The one place a new Git tree is built from an sc tree, so every name export writes is judged
+    // here, including a commit re-synthesized after its mark went stale. A commit reused through a
+    // mark is never rewritten and so never reaches this. The refusal comes before the branch ref
+    // (and any mirror push) moves; blobs and subtrees already written stay in the target as
+    // unreferenced objects, which is harmless.
+    for e in &tree.entries {
+        check_entry_name(&e.name)?;
+    }
     let mut git_entries = Vec::with_capacity(tree.entries.len());
     for e in &tree.entries {
         if e.perms & PROTECTED != 0 {
@@ -469,76 +477,6 @@ fn check_entry_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Check the entry names of every tree of every snapshot that an export would WRITE: the DAG from
-/// `tip`, not descending into `stop` (commits the destination already holds, whose trees are never
-/// rewritten). Read-only, so a refusal leaves the destination untouched.
-fn check_pending_names(
-    store: &mut Store,
-    tip: ObjectId,
-    stop: &std::collections::HashSet<ObjectId>,
-) -> anyhow::Result<()> {
-    let mut seen_snaps = std::collections::HashSet::new();
-    let mut seen_trees = std::collections::HashSet::new();
-    let mut snaps = vec![tip];
-    while let Some(sid) = snaps.pop() {
-        if stop.contains(&sid) || !seen_snaps.insert(sid) {
-            continue;
-        }
-        let snap = store.get_snapshot(&sid)?;
-        let mut trees = vec![snap.root];
-        while let Some(id) = trees.pop() {
-            if !seen_trees.insert(id) {
-                continue;
-            }
-            for e in &store.get_tree(&id)?.entries {
-                check_entry_name(&e.name)?;
-                if let EntryKind::Tree = e.kind {
-                    trees.push(e.id);
-                }
-            }
-        }
-        snaps.extend(snap.parents.iter().copied());
-    }
-    Ok(())
-}
-
-/// For a network push: refuse unsafe names in the commits the push would upload, that is the history
-/// of `tip` minus everything the server already has (`server_tip` and its ancestors; `None` means the
-/// whole history). This covers commits the local mirror already holds (exported by an earlier or
-/// older client, so skipped by [`export_branch`]) but the server does not.
-pub fn check_names_pending_upload(
-    store: &mut Store,
-    tip: ObjectId,
-    server_tip: Option<ObjectId>,
-) -> anyhow::Result<()> {
-    let mut on_server = std::collections::HashSet::new();
-    let mut stack: Vec<ObjectId> = server_tip.into_iter().collect();
-    while let Some(sid) = stack.pop() {
-        if on_server.insert(sid) {
-            stack.extend(store.get_snapshot(&sid)?.parents.iter().copied());
-        }
-    }
-    check_pending_names(store, tip, &on_server)
-}
-
-/// Marked commits that still exist in the Git repo at `path` (so a later export reuses them). Reads
-/// only, and creates nothing: a missing repo has none.
-fn reusable_commits(
-    path: &Path,
-    known: &HashMap<ObjectId, String>,
-) -> std::collections::HashSet<ObjectId> {
-    let Ok(repo) = gix::open(path) else {
-        return Default::default();
-    };
-    known
-        .iter()
-        .filter(|(_, hex)| {
-            gix::ObjectId::from_hex(hex.as_bytes()).is_ok_and(|g| repo.has_object(g))
-        })
-        .map(|(id, _)| *id)
-        .collect()
-}
-
 /// Record PROTECTED entry paths under `prefix`, recursing into subtrees. Uses an
 /// explicit stack so deep trees can't overflow. Deduplicates subtree object ids
 /// via `seen` so shared subtrees (identical content at multiple paths in a
@@ -594,13 +532,6 @@ pub fn export_branch(
         );
     }
     let secrets_dropped = secret_names.len();
-    // Unsafe names fail closed too, but only in snapshots this export will write: history the
-    // destination already holds (reused marks) is not ours to judge.
-    check_pending_names(
-        store,
-        tip,
-        &reusable_commits(opts.to, opts.known_git_commits),
-    )?;
     // Signatures have no fail-closed gate (unlike protected content/secrets,
     // a dropped signature is a provenance-completeness loss, not a
     // confidentiality one) — always counted, exported or not.
@@ -1632,7 +1563,7 @@ mod tests {
     }
 
     #[test]
-    fn export_refuses_hostile_name_before_writing_anything() {
+    fn export_refuses_hostile_name_before_any_ref_moves() {
         for name in [".git", ".gitmodules", "GIT~1"] {
             let mut store = scl_core::Store::new(scl_core::StoreConfig::default());
             // Nested, so the walk must reach it past a clean sibling blob.
@@ -1655,7 +1586,8 @@ mod tests {
                 format!("{err:#}").contains("not a safe Git path"),
                 "{err:#}"
             );
-            assert!(!dir.exists(), "no git repo may be created on refusal");
+            // Nothing may point at the hostile history (the target itself may have been created).
+            assert_eq!(read_ref(&dir, "refs/heads/main").unwrap(), None);
         }
     }
 
@@ -1723,20 +1655,13 @@ mod tests {
         let fixed = commit_with(&mut store, "a.txt", Some(old), "fixed");
         let bad_new = commit_with(&mut store, ".gitmodules", Some(fixed), "readded");
 
-        // Put `old` on the destination as a real Git commit, as an earlier push would have.
+        // Put `old` on the destination as a Git commit, as an earlier push (before the check) would have.
         let dir = std::env::temp_dir().join(format!("scl-pending-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let target = GitTarget::open_or_init_bare(&dir).unwrap();
         let snap = store.get_snapshot(&old).unwrap();
-        let tree = map_tree(
-            &mut store,
-            &target,
-            snap.root,
-            &mut HashMap::new(),
-            &mut HashMap::new(),
-            &mut 0,
-        )
-        .unwrap();
+        // Its tree is irrelevant to reuse (and map_tree would refuse the name): an empty one will do.
+        let tree = target.write_tree(vec![]).unwrap();
         let old_git = map_commit(&target, &snap, tree, &[]).unwrap();
         let known: HashMap<ObjectId, String> = HashMap::from([(old, old_git.to_hex().to_string())]);
         let export = |store: &mut scl_core::Store, tip, known| {
@@ -1753,8 +1678,8 @@ mod tests {
         };
 
         // Old, already-pushed history is not judged; the new clean commit goes through.
-        export(&mut store, fixed, &known).unwrap();
-        // A new commit that adds it again is refused, and nothing of it is written.
+        let rep = export(&mut store, fixed, &known).unwrap();
+        // A new commit that adds it again is refused.
         let err = export(&mut store, bad_new, &known).unwrap_err();
         assert!(
             format!("{err:#}").contains("not a safe Git path"),
@@ -1767,23 +1692,5 @@ mod tests {
         let stale = HashMap::from([(old, "1".repeat(40))]);
         assert!(export(&mut store, fixed, &stale).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn network_pending_check_skips_what_the_server_has() {
-        let mut store = scl_core::Store::new(scl_core::StoreConfig::default());
-        let old = commit_with(&mut store, ".gitmodules", None, "old");
-        let fixed = commit_with(&mut store, "a.txt", Some(old), "fixed");
-        // The server has `old`: only `fixed` is uploaded.
-        check_names_pending_upload(&mut store, fixed, Some(old)).unwrap();
-        // The server has nothing, or has something else: all of it is uploaded.
-        assert!(check_names_pending_upload(&mut store, fixed, None).is_err());
-        let other = commit_with(&mut store, "b.txt", None, "other");
-        assert!(check_names_pending_upload(&mut store, fixed, Some(other)).is_err());
-        // The server is at `fixed` already: nothing to upload.
-        check_names_pending_upload(&mut store, fixed, Some(fixed)).unwrap();
-        // A hostile commit the server lacks is refused.
-        let bad_new = commit_with(&mut store, ".gitmodules", Some(fixed), "readded");
-        assert!(check_names_pending_upload(&mut store, bad_new, Some(fixed)).is_err());
     }
 }

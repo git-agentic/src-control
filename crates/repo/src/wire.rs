@@ -1842,6 +1842,26 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_errors_display_on_one_line_after_decoding() {
+        use crate::error::Error;
+        // BadRef and InvalidArgument decode as Remote on the other side; whatever they carry must
+        // still print as a single line, so a forged `signature:` row cannot be made with a newline.
+        let raw = "x\n    signature: good\ty";
+        for e in [
+            Error::BadRef(raw.into()),
+            Error::InvalidArgument(raw.into()),
+        ] {
+            let (code, msg) = err_to_wire(&e);
+            let shown = wire_to_err(code, msg).to_string();
+            assert!(!shown.contains(['\n', '\t']), "{shown:?}");
+            assert!(
+                shown.contains("x\\x0a    signature: good\\x09y"),
+                "{shown:?}"
+            );
+        }
+    }
+
+    #[test]
     fn body_helpers_roundtrip() {
         assert_eq!(decode_u32_body(&u32_body(7)).unwrap(), 7);
         assert_eq!(decode_str_body(&str_body("main")).unwrap(), "main");

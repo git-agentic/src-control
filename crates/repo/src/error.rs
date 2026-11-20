@@ -127,11 +127,11 @@ pub enum Error {
     RemoteExists(String),
     #[error("no common ancestor between the branches")]
     NoCommonAncestor,
-    #[error("wire protocol error: {}", scl_core::sanitize_display(.0))]
+    #[error("wire protocol error: {}", scl_core::sanitize_display_line(.0))]
     Protocol(String),
-    #[error("connection to remote lost: {}", scl_core::sanitize_display(.0))]
+    #[error("connection to remote lost: {}", scl_core::sanitize_display_line(.0))]
     ConnectionLost(String),
-    #[error("remote error: {}", scl_core::sanitize_display(.0))]
+    #[error("remote error: {}", scl_core::sanitize_display_line(.0))]
     Remote(String),
     #[error("TLS: {0}")]
     Tls(#[from] scl_tlsio::Error),
@@ -184,13 +184,13 @@ pub enum Error {
     /// The server aborted an incoming pack mid-stream because it exceeded the
     /// operator's `--max-pack-size` cap (P31). Payload is the server's own
     /// human-readable limit text, carried verbatim across the wire.
-    #[error("pack exceeds the server's --max-pack-size limit: {}", scl_core::sanitize_display(.0))]
+    #[error("pack exceeds the server's --max-pack-size limit: {}", scl_core::sanitize_display_line(.0))]
     PackTooLarge(String),
     /// The server closed the connection because the bytes it wrote for this
     /// peer (`PutObject` + `PutPack`) exceeded the operator's
     /// `--max-conn-bytes` budget (#233). Payload is the server's own
     /// human-readable limit text, carried verbatim across the wire.
-    #[error("connection write budget exceeded: {}", scl_core::sanitize_display(.0))]
+    #[error("connection write budget exceeded: {}", scl_core::sanitize_display_line(.0))]
     ConnectionBudgetExceeded(String),
     /// The server refused the connection at accept time because
     /// `--max-connections` was reached (P31). Retryable.

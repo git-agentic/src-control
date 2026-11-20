@@ -343,7 +343,8 @@ fn push_refuses_when_remote_has_unseen_commit() {
 
 // A hostile `.gitmodules` is refused in what a push uploads, but not in history the server already
 // has: git itself accepted that commit, and a fix that removes the file must still push. Goes
-// through the network bridge (file://), which asks the server for its tip.
+// through the network bridge (file://). Names are checked where export builds a tree, so a commit
+// reused through a mark is never judged and a refusal leaves the remote tip where it was.
 #[test]
 fn network_push_checks_names_only_in_commits_the_server_lacks() {
     let root = tmp("netnames");
