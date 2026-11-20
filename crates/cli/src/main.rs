@@ -3997,11 +3997,12 @@ fn run_clone_git(url: &str, dst: &std::path::Path) -> Result<()> {
     }
 
     // An existing destination must be an empty directory (git parity).
-    let claim = scl_repo::sync::claim_clone_dir(dst)?;
-    let repo = match scl_repo::Repo::init(dst) {
+    let mut claim = scl_repo::sync::claim_clone_dir(dst)?;
+    let repo = match claim.init_repo() {
         Ok(r) => r,
         Err(e) => {
-            scl_repo::sync::discard_after_init_error(&claim, &e);
+            // Removes `.sc/` only if `init_repo` created it exclusively.
+            scl_repo::sync::discard_failed_clone(&claim);
             return Err(e.into());
         }
     };

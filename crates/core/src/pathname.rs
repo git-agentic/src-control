@@ -64,8 +64,16 @@ fn is_control_dir(component: &str) -> bool {
     if matches!(upper.as_str(), ".SC" | "SC~1" | "SC~2" | "SC~3" | "SC~4") {
         return true;
     }
-    let ascii = c.to_ascii_uppercase();
-    let Some((hex, n)) = ascii.strip_prefix("SC").and_then(|t| t.split_once('~')) else {
+    // The `S` and `C` fold like `.sc` does (NTFS upcases `\u{17f}` to `S`); the
+    // four hex digits and the `~N` are ASCII only.
+    let folds_to = |ch: Option<char>, want: char| {
+        ch.is_some_and(|ch| ch.to_uppercase().eq(std::iter::once(want)))
+    };
+    let mut chars = c.chars();
+    if !(folds_to(chars.next(), 'S') && folds_to(chars.next(), 'C')) {
+        return false;
+    }
+    let Some((hex, n)) = chars.as_str().split_once('~') else {
         return false;
     };
     hex.len() == 4
@@ -120,6 +128,8 @@ mod tests {
             ".\u{17f}C",
             ".\u{17f}c.",
             "\u{17f}c~1",
+            "\u{17f}C1234~1",
+            "\u{17f}c1a2b~1",
             ".sc:x",
             ".sc/recipients.toml",
             "a/.Sc/b",
@@ -181,6 +191,8 @@ mod tests {
             "SC\u{fb00}12~1",
             "sc\u{fb00}12~1",
             "sc\u{17f}123~1",
+            "s\u{17f}1a2b~9",
+            "\u{17f}\u{17f}1a2b~9",
             "..a",
             "a..",
         ] {

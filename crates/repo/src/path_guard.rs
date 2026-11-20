@@ -237,8 +237,8 @@ fn discard_failed_clone_removes_only_what_the_clone_made() {
     // and every parent the claim made go, the directory that was there stays.
     let parent = tmp_root("discard-parent");
     let created = parent.join("deep/er/dst");
-    let claim = crate::sync::claim_clone_dir(&created).unwrap();
-    Repo::init(&created).unwrap();
+    let mut claim = crate::sync::claim_clone_dir(&created).unwrap();
+    drop(claim.init_repo().unwrap());
     crate::sync::discard_failed_clone(&claim);
     assert!(!parent.join("deep").exists(), "claimed parents are removed");
     assert!(parent.exists(), "a pre-existing parent is not");
@@ -247,8 +247,8 @@ fn discard_failed_clone_removes_only_what_the_clone_made() {
     // A claimed destination that gained a file is left, and so are its parents.
     let parent = tmp_root("discard-nonempty");
     let created = parent.join("deep/dst");
-    let claim = crate::sync::claim_clone_dir(&created).unwrap();
-    Repo::init(&created).unwrap();
+    let mut claim = crate::sync::claim_clone_dir(&created).unwrap();
+    drop(claim.init_repo().unwrap());
     std::fs::write(created.join("stray"), "x").unwrap();
     crate::sync::discard_failed_clone(&claim);
     assert!(!created.join(".sc").exists());
@@ -257,8 +257,8 @@ fn discard_failed_clone_removes_only_what_the_clone_made() {
 
     // An existing empty directory is accepted and kept; only its `.sc/` goes.
     let existing = tmp_root("discard-existing");
-    let claim = crate::sync::claim_clone_dir(&existing).unwrap();
-    Repo::init(&existing).unwrap();
+    let mut claim = crate::sync::claim_clone_dir(&existing).unwrap();
+    drop(claim.init_repo().unwrap());
     crate::sync::discard_failed_clone(&claim);
     assert!(existing.exists() && !existing.join(".sc").exists());
     std::fs::remove_dir_all(&existing).unwrap();
@@ -266,18 +266,45 @@ fn discard_failed_clone_removes_only_what_the_clone_made() {
 }
 
 #[test]
-fn a_repo_exists_race_during_clone_removes_nothing() {
-    // The destination is claimed while empty, then another process makes `.sc/`.
+fn a_dot_sc_we_did_not_create_is_never_removed() {
+    // The destination is claimed while empty, then another process makes
+    // `.sc/` (with its own repo lock and content) before our exclusive
+    // `create_dir`: ours fails, and cleanup must leave theirs alone.
     let parent = tmp_root("race");
     let dst = parent.join("deep/dst");
-    let claim = crate::sync::claim_clone_dir(&dst).unwrap();
+    let mut claim = crate::sync::claim_clone_dir(&dst).unwrap();
     std::fs::create_dir_all(dst.join(".sc")).unwrap();
     std::fs::write(dst.join(".sc/precious"), "theirs").unwrap();
-    let err = Repo::init(&dst).err().expect("init must refuse");
+    let err = claim.init_repo().err().expect("not ours");
     assert!(matches!(err, Error::RepoExists(_)), "{err:?}");
-    crate::sync::discard_after_init_error(&claim, &err);
+    crate::sync::discard_failed_clone(&claim);
     assert_eq!(std::fs::read(dst.join(".sc/precious")).unwrap(), b"theirs");
     std::fs::remove_dir_all(&parent).unwrap();
+
+    // Same when the destination already existed (and was empty at the claim).
+    let dst = tmp_root("race-existing");
+    let mut claim = crate::sync::claim_clone_dir(&dst).unwrap();
+    std::fs::create_dir(dst.join(".sc")).unwrap();
+    std::fs::write(dst.join(".sc/precious"), "theirs").unwrap();
+    assert!(claim.init_repo().is_err());
+    crate::sync::discard_failed_clone(&claim);
+    assert_eq!(std::fs::read(dst.join(".sc/precious")).unwrap(), b"theirs");
+    std::fs::remove_dir_all(&dst).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dangling_symlink_destination_is_refused() {
+    let base = tmp_root("dangling");
+    let dst = base.join("dst");
+    std::os::unix::fs::symlink(base.join("nowhere"), &dst).unwrap();
+    let err = crate::sync::claim_clone_dir(&dst).unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+    assert!(
+        !base.join("nowhere").exists(),
+        "nothing was created through it"
+    );
+    std::fs::remove_dir_all(&base).unwrap();
 }
 
 #[test]

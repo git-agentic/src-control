@@ -76,6 +76,17 @@ impl Repo {
         if layout.dot_sc.exists() {
             return Err(Error::RepoExists(layout.dot_sc.display().to_string()));
         }
+        Self::init_in_new_dot_sc(layout)
+    }
+
+    /// [`Repo::init`] for a caller that has just created `.sc/` itself with an
+    /// exclusive `create_dir` (clone, via [`crate::sync::CloneClaim`]) and so
+    /// knows it owns the directory: there is no existence check left to race.
+    pub(crate) fn init_in_claimed_dot_sc(root: &Path) -> Result<Repo> {
+        Self::init_in_new_dot_sc(Layout::at(root))
+    }
+
+    fn init_in_new_dot_sc(layout: Layout) -> Result<Repo> {
         std::fs::create_dir_all(layout.objects_dir())?;
         std::fs::create_dir_all(layout.refs_heads_dir())?;
         refs::write_head(&layout, DEFAULT_BRANCH)?;

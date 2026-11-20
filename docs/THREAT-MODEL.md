@@ -822,9 +822,14 @@ protected paths, plaintext.
     `sc<4 hex>~1` to `~9`), and on Windows any `\` or `:`. The tree flatteners and
     `safe_join` apply it before the first write (`sc ws fork` and `sc work` check
     first, before they touch the filesystem), so clone, switch, merge, undo and
-    `scl_vfs::Worktree::checkout` refuse with `UnsafePath` and change nothing; both
-    tree builders refuse to commit such a path. A clone that fails removes the
-    directory it created (only its `.sc/` if the directory already existed).
+    `scl_vfs::Worktree::checkout` refuse with `UnsafePath` before any
+    working-tree write or ref move; both tree builders refuse to commit such a
+    path. The guarantee covers working-tree writes and refs, not every file: an
+    unborn merge can mint `.sc/local-key` before the refusal, and a lazy fill can
+    keep the (hash-verified) objects it fetched. A clone that fails removes only
+    what it made: a `.sc/` it created exclusively, and the destination and
+    parents it created while they are empty. An existing clone destination must
+    be an empty directory.
 - **Not enforced (known limits):**
   - A user file whose bytes equal the tracked or laid ones cannot be told from
     the stop's own write, so it is removed.

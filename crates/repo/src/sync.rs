@@ -19,40 +19,48 @@ use crate::worktree;
 
 /// What a clone destination is, as [`claim_clone_dir`] found or made it: the
 /// directories this invocation created (missing parents first, then the
-/// destination itself), so a failed clone can remove exactly those.
+/// destination itself) and whether it created `.sc/`, so a failed clone can
+/// remove exactly those and nothing else.
 #[derive(Debug)]
 pub struct CloneClaim {
     dst: std::path::PathBuf,
     made: Vec<std::path::PathBuf>,
+    /// `.sc/` was created by this invocation's exclusive `create_dir`.
+    sc_made: bool,
+}
+
+/// The empty-directory rule for an existing clone destination (as `git clone`
+/// requires). A non-empty one is refused, which also keeps a symlink or
+/// junction already inside it from redirecting the checkout's writes.
+fn ensure_empty_dir(dst: &Path) -> Result<()> {
+    if std::fs::metadata(dst).is_ok_and(|m| m.is_dir()) && std::fs::read_dir(dst)?.next().is_none()
+    {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "destination path '{}' already exists and is not an empty directory",
+        dst.display()
+    )))
 }
 
 /// Claim the clone destination. An existing destination must be an empty
-/// directory (as `git clone` requires): a non-empty one is refused, which also
-/// keeps a symlink or junction already inside it from redirecting the
-/// checkout's writes. A missing one is created, parents included, one
-/// `create_dir` at a time, and each directory that call made is recorded.
-/// Ownership comes from a `create_dir` that returned `Ok`, never from
-/// `exists()`, which a race or a metadata error can get wrong.
+/// directory ([`ensure_empty_dir`]). A missing one is created, parents
+/// included, one `create_dir` at a time, and each directory that call made is
+/// recorded. Ownership comes from a `create_dir` that returned `Ok`, never from
+/// `exists()`, which a race or a metadata error can get wrong; a destination
+/// that appears between our look and our `create_dir` (`AlreadyExists`) gets
+/// the same empty-directory check instead of being trusted.
 pub fn claim_clone_dir(dst: &Path) -> Result<CloneClaim> {
-    let not_empty = || {
-        Error::InvalidArgument(format!(
-            "destination path '{}' already exists and is not an empty directory",
-            dst.display()
-        ))
-    };
     let mut claim = CloneClaim {
         dst: dst.to_path_buf(),
         made: Vec::new(),
+        sc_made: false,
     };
-    match std::fs::metadata(dst) {
-        Ok(m) if m.is_dir() => {
-            return if std::fs::read_dir(dst)?.next().is_none() {
-                Ok(claim)
-            } else {
-                Err(not_empty())
-            };
+    match dst.symlink_metadata() {
+        Ok(_) => {
+            ensure_empty_dir(dst)?;
+            return Ok(claim);
         }
-        Ok(_) => return Err(not_empty()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
@@ -66,29 +74,60 @@ pub fn claim_clone_dir(dst: &Path) -> Result<CloneClaim> {
         .collect();
     missing.reverse();
     for dir in missing {
-        match std::fs::create_dir(dir) {
-            Ok(()) => claim.made.push(dir.to_path_buf()),
-            // Someone else made it between our look and now: theirs, not ours.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => {
-                discard_failed_clone(&claim);
-                return Err(e.into());
+        let made = match std::fs::create_dir(dir) {
+            Ok(()) => {
+                claim.made.push(dir.to_path_buf());
+                continue;
             }
+            // Someone else made it between our look and now: theirs, not ours.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if dir == dst {
+                    ensure_empty_dir(dst)
+                } else {
+                    Ok(())
+                }
+            }
+            Err(e) => Err(e.into()),
+        };
+        if let Err(e) = made {
+            discard_failed_clone(&claim);
+            return Err(e);
         }
     }
     Ok(claim)
 }
 
+impl CloneClaim {
+    /// Create the repository in the claimed destination, owning `.sc/` by
+    /// creating it exclusively (`create_dir`; `AlreadyExists` means another
+    /// process's, reported as `RepoExists`, and it is never removed by
+    /// [`discard_failed_clone`]). Two initializers can both pass an
+    /// existence check, so cleanup of `.sc/` is allowed only for the one whose
+    /// `create_dir` succeeded.
+    pub fn init_repo(&mut self) -> Result<Repo> {
+        let dot_sc = self.dst.join(".sc");
+        match std::fs::create_dir(&dot_sc) {
+            Ok(()) => self.sc_made = true,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(Error::RepoExists(dot_sc.display().to_string()));
+            }
+            Err(e) => return Err(e.into()),
+        }
+        Repo::init_in_claimed_dot_sc(&self.dst)
+    }
+}
+
 /// Take a failed clone back out of the claimed destination, removing only what
-/// this invocation made: its own `.sc/`, then the destination and any parents
-/// the claim created, deepest first, each only while empty (`remove_dir`, never
-/// `remove_dir_all`). A directory that is not empty is left in place and named
-/// on stderr. Best effort; the caller must have dropped its [`Repo`] (the repo
-/// lock lives in `.sc/`) and reports the clone's own error, not this one. Do
-/// not call it when `Repo::init` failed with `RepoExists`: that `.sc/` is
-/// another process's. See [`discard_after_init_error`].
+/// this invocation made: its own `.sc/` (only if [`CloneClaim::init_repo`]
+/// created it), then the destination and any parents the claim created,
+/// deepest first, each only while empty (`remove_dir`, never `remove_dir_all`).
+/// A directory that is not empty is left in place and named on stderr. Best
+/// effort; the caller must have dropped its [`Repo`] (the repo lock lives in
+/// `.sc/`) and reports the clone's own error, not this one.
 pub fn discard_failed_clone(claim: &CloneClaim) {
-    let _ = std::fs::remove_dir_all(claim.dst.join(".sc"));
+    if claim.sc_made {
+        let _ = std::fs::remove_dir_all(claim.dst.join(".sc"));
+    }
     for dir in claim.made.iter().rev() {
         if let Err(e) = std::fs::remove_dir(dir) {
             if e.kind() != std::io::ErrorKind::NotFound {
@@ -100,15 +139,6 @@ pub fn discard_failed_clone(claim: &CloneClaim) {
                 break;
             }
         }
-    }
-}
-
-/// [`discard_failed_clone`] for a failed `Repo::init`: if `init` refused with
-/// `RepoExists`, another process made the `.sc/` after the claim, so nothing is
-/// removed at all; any other `init` failure left only what this call wrote.
-pub fn discard_after_init_error(claim: &CloneClaim, err: &Error) {
-    if !matches!(err, Error::RepoExists(_)) {
-        discard_failed_clone(claim);
     }
 }
 
@@ -218,11 +248,12 @@ impl Repo {
         let remote_refs = transport.list_refs()?;
         let head_branch = transport.head_branch()?;
 
-        let claim = claim_clone_dir(dst.as_ref())?;
-        let dst_repo = match Repo::init(dst.as_ref()) {
+        let mut claim = claim_clone_dir(dst.as_ref())?;
+        let dst_repo = match claim.init_repo() {
             Ok(r) => r,
             Err(e) => {
-                discard_after_init_error(&claim, &e);
+                // Removes `.sc/` only if `init_repo` created it exclusively.
+                discard_failed_clone(&claim);
                 return Err(e);
             }
         };
