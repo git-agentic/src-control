@@ -367,7 +367,8 @@ def dep_indexes(spec, expected):
 
 
 EXPECT_KEYS = {
-    "http": {"status", "message_contains", "fields", "ignore_fields", "ignore_headers", "ignore_body", "skip"},
+    "http": {"status", "message_contains", "fields", "ignore_fields", "ignore_headers", "ignore_body", "body",
+             "absent_headers", "skip"},
     "git": {"ok", "message_contains", "skip"},
     "note": {"value", "value_prefix", "skip"},
 }
@@ -490,6 +491,20 @@ def apply_override(exp, act, ov, bij, match=None):
                 got = len(body) if k == "$len" and isinstance(body, list) else dget(body, k)
                 if got != v:
                     d.append(("fail", f"unexpected: {k} {v!r} expected, got {got!r}"))
+        # `body`: the exact JSON object the departed answer must have (same keys, by value, URLs included);
+        # `absent_headers`: recorded headers that must not appear on it
+        if "body" in e:
+            ab = act.get("body")
+            if not isinstance(ab, dict) or set(ab) != set(e["body"]):
+                d.append(("fail", f"unexpected: body keys {sorted(e['body'])} expected, got "
+                                  f"{sorted(ab) if isinstance(ab, dict) else type(ab).__name__}"))
+            else:
+                found = []
+                cmp_json(e["body"], ab, "", found, set(), bij)
+                d += [x for x in found if x[0] == "fail"]
+        for h in e.get("absent_headers", []):
+            if h in act.get("headers", {}):
+                d.append(("fail", f"unexpected: header {h} must be absent, got {act['headers'][h]!r}"))
         pins = list((e.get("fields") or {}))
         status_ok = sts is None or act["status"] in sts
         if status_ok:
@@ -1205,6 +1220,20 @@ def cmd_selftest(a):
     for key, value in (("mergeable", False), ("html_url", "<base>/acme/wrong/pulls/1")):
         wrong = dict(pr, body=dict(pr["body"], **{key: value}))
         assert any(lv == "fail" and key in text for lv, text in compare_pr(wrong)), f"wrong {key} must fail"
+    # a departure's `body` pins an error shape and URL, `absent_headers` a header that must not appear
+    miss = {"errors": ["user redirect does not exist [name: acme]"], "message": "GetOrgByName", "url": "<base>/api/swagger"}
+    rec = {"kind": "http", "method": "GET", "path": "/api/v1/orgs/acme", "status": 200, "headers": {"x-total-count": "1"},
+           "body": []}
+    ov = {"kind": "http", "match": None, "expect": {"status": 404, "message_contains": ["getorgbyname"],
+          "ignore_body": True, "ignore_headers": ["x-total-count"], "body": miss, "absent_headers": ["x-total-count"]}}
+    base = {"kind": "http", "method": "GET", "path": "/api/v1/orgs/acme", "status": 404, "headers": {}, "body": miss}
+    def departed(act):
+        return [t for lv, t in apply_override(rec, act, ov, Bij()) if lv == "fail"]
+    assert not departed(base), "the pinned missing-organization answer is honoured"
+    assert departed(dict(base, body=dict(miss, url="<base>/api/other"))), "a changed URL must fail"
+    assert departed(dict(base, body=dict(miss, errors=None))), "a changed errors list must fail"
+    assert departed(dict(base, body=dict(miss, extra=1))), "an extra key must fail"
+    assert departed(dict(base, headers={"x-total-count": "0"})), "a count header must fail"
     bad = []
     for d in sorted(os.listdir(a.fixtures_root)):
         full = os.path.join(a.fixtures_root, d)
