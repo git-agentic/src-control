@@ -76,7 +76,10 @@ fn save(layout: &Layout, tokens: &[TokenEntry]) -> Result<()> {
         tokens: tokens.to_vec(),
     };
     let text = toml::to_string(&file).map_err(|e| Error::BadConfig(e.to_string()))?;
-    scl_core::fsutil::atomic_write_durable(&layout.serve_tokens_path(), text.as_bytes())?;
+    scl_core::fsutil::atomic_write_durable_owner_only(
+        &layout.serve_tokens_path(),
+        text.as_bytes(),
+    )?;
     Ok(())
 }
 
@@ -304,6 +307,28 @@ mod tests {
         let text = std::fs::read_to_string(layout.serve_tokens_path()).unwrap();
         assert!(!text.contains(&raw), "raw token must NEVER be persisted");
         assert!(text.contains("ci") && text.contains("ro"));
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_file_is_owner_only_after_add_rotate_and_remove() {
+        use std::os::unix::fs::PermissionsExt;
+        let layout = tmp_layout("mode");
+        let mode = || {
+            std::fs::metadata(layout.serve_tokens_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        add(&layout, "ci", Scope::Ro).unwrap();
+        add(&layout, "ci2", Scope::Rw).unwrap();
+        assert_eq!(mode(), 0o600);
+        rotate(&layout, "ci", now()).unwrap();
+        assert_eq!(mode(), 0o600);
+        remove(&layout, "ci2").unwrap();
+        assert_eq!(mode(), 0o600);
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
 
