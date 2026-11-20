@@ -537,45 +537,18 @@ impl Repo {
             None => BTreeMap::new(),
         };
 
-        // Protection rules are repository data: a tip (or the other parent of a
-        // completion) can keep a path's PROTECTED entry while its rule is gone.
-        // A checkout holds that path's plaintext, and it would land here as an
-        // unprotected file, so refuse before any object is written. No stock
-        // command removes a rule (merges union them).
-        {
-            let mut dropped: Vec<&str> = Vec::new();
-            let mut note = |entries: &BTreeMap<String, (ObjectId, scl_core::FileMode, u8)>| {
-                for (path, ..) in &all {
-                    if entries
-                        .get(path)
-                        .is_some_and(|(.., perms)| perms & scl_core::PROTECTED != 0)
-                    {
-                        dropped.push(path);
-                    }
-                }
-            };
-            note(&tip_entries);
-            if let Some(h) = merge_head.or(pick_head) {
-                let other_root = self.snapshot(&h)?.root;
-                let store_arc = self.vfs.store();
-                let mut store = store_arc.lock().unwrap();
-                note(&if partial {
-                    worktree::tree_file_entries_with_perms_sparse(&mut store, other_root, sparse)?
-                } else {
-                    worktree::tree_file_entries_with_perms(&mut store, other_root)?
-                });
-            }
-            if !dropped.is_empty() {
-                dropped.sort_unstable();
-                dropped.dedup();
-                return Err(Error::InvalidArgument(format!(
-                    "protected on a parent but covered by no protection rule: {}; committing \
-                     would store plaintext. The rule was removed upstream; restore it with \
-                     `sc protect`.",
-                    dropped.join(", ")
-                )));
-            }
-        }
+        // Protection rules are repository data: a parent can keep an entry's
+        // PROTECTED bit while its rule is gone. A checkout then holds that
+        // path's plaintext and a commit would store it unsealed (or drop the
+        // absent entry's protection), so refuse before any object is written.
+        // No stock command removes a rule (merges union them).
+        self.refuse_uncovered_protected(
+            &protection,
+            &tip_entries,
+            &all,
+            merge_head.or(pick_head),
+            partial,
+        )?;
 
         let mut to_seal: Vec<ProtectedFile> = Vec::new();
         // (path, plaintext) for each sealed path, so its fresh blob id can be
@@ -1198,6 +1171,101 @@ impl Repo {
         let store_arc = self.vfs.store();
         let id = store_arc.lock().unwrap().put(snap)?;
         Ok(id)
+    }
+
+    /// The commit-time guard for rules dropped upstream. `tip_entries` are the
+    /// tip's flattened entries (sparse-aware on a partial clone), `plain` the
+    /// working-tree files that would land unsealed, `other` the merge or pick
+    /// head of a completion. Refuses (writing nothing) when
+    /// 1. a tip entry is PROTECTED and `protection` covers its path with no
+    ///    rule, which also catches an unrelated keyless commit dropping it;
+    /// 2. a plain path is PROTECTED on `other` (point lookups only, so a
+    ///    subtree a partial clone does not hold is never walked);
+    /// 3. a plain path differs only in ASCII case from a rule prefix or a
+    ///    PROTECTED tip path: a case-insensitive checkout writes the decrypted
+    ///    file under that spelling, where it would then commit unsealed.
+    fn refuse_uncovered_protected(
+        &self,
+        protection: &Protection,
+        tip_entries: &BTreeMap<String, (ObjectId, scl_core::FileMode, u8)>,
+        plain: &[(String, Vec<u8>, scl_core::FileMode, u8)],
+        other: Option<ObjectId>,
+        partial: bool,
+    ) -> Result<()> {
+        let protected = |perms: &u8| perms & scl_core::PROTECTED != 0;
+        let mut bad: Vec<String> = tip_entries
+            .iter()
+            .filter(|(p, (.., perms))| {
+                protected(perms) && crate::protect::matching_prefix(protection, p).is_none()
+            })
+            .map(|(p, _)| p.clone())
+            .collect();
+        if let Some(h) = other {
+            let root = self.snapshot(&h)?.root;
+            let store_arc = self.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            for (path, ..) in plain {
+                if worktree::tree_entry_at(&mut store, root, path, partial)?
+                    .is_some_and(|(.., perms)| protected(&perms))
+                {
+                    bad.push(path.clone());
+                }
+            }
+        }
+        let folded_rules: Vec<String> = protection
+            .prefixes
+            .iter()
+            .map(|r| r.prefix.to_ascii_lowercase())
+            .collect();
+        let folded_tip: std::collections::BTreeSet<String> = tip_entries
+            .iter()
+            .filter(|(_, (.., perms))| protected(perms))
+            .map(|(p, _)| p.to_ascii_lowercase())
+            .collect();
+        let mut aliased: Vec<String> = Vec::new();
+        if !folded_rules.is_empty() || !folded_tip.is_empty() {
+            for (path, ..) in plain {
+                let f = path.to_ascii_lowercase();
+                if folded_tip.contains(&f)
+                    || folded_rules
+                        .iter()
+                        .any(|r| crate::protect::path_under_prefix(&f, r))
+                {
+                    aliased.push(path.clone());
+                }
+            }
+        }
+        if bad.is_empty() && aliased.is_empty() {
+            return Ok(());
+        }
+        let stopped = crate::merge_state::in_progress(&self.layout)
+            || crate::pick_state::in_progress(&self.layout)
+            || crate::rebase_state::in_progress(&self.layout);
+        let hint = if stopped {
+            "abort the operation, restore the rule, and retry"
+        } else {
+            "restore the rule with `sc protect`"
+        };
+        bad.sort_unstable();
+        bad.dedup();
+        aliased.sort_unstable();
+        aliased.dedup();
+        let mut msg = String::new();
+        if !bad.is_empty() {
+            msg += &format!(
+                "protected on a parent but covered by no protection rule: {}; committing would \
+                 store plaintext or drop the protection. The rule was removed upstream; {hint}. ",
+                bad.join(", ")
+            );
+        }
+        if !aliased.is_empty() {
+            msg += &format!(
+                "differs only in case from a protected path or rule, so a case-insensitive \
+                 checkout would commit its plaintext unsealed: {}; rename it",
+                aliased.join(", ")
+            );
+        }
+        Err(Error::InvalidArgument(msg.trim_end().to_string()))
     }
 
     /// Build + persist a snapshot and advance the current branch ref.
@@ -7414,13 +7482,11 @@ mod tests {
         std::fs::remove_dir_all(&dst_root).unwrap();
     }
 
-    /// A tip that keeps a protected entry (PROTECTED bit, wrap list) but lacks
-    /// the rule is repository data a writer can build by hand. A recipient who
-    /// switches to it holds the plaintext, so their next ordinary commit must
-    /// not publish it.
-    #[test]
-    fn a_commit_never_stores_plaintext_of_a_path_whose_rule_was_dropped_upstream() {
-        let root = tmp_root("commit-rule-dropped");
+    /// `main` holds a protected `secret/x` (sealed to the returned identity);
+    /// `feat` is a hand-built child with the same tree but no rule. HEAD is on
+    /// `feat` with no identity used yet.
+    fn repo_with_dropped_rule(tag: &str) -> (Repo, std::path::PathBuf, scl_crypto::SecretKey) {
+        let root = tmp_root(tag);
         let repo = Repo::init(&root).unwrap();
         let (sk, pk) = scl_crypto::generate_keypair();
         repo.protect("secret/", &[pk], None).unwrap();
@@ -7442,6 +7508,26 @@ mod tests {
             "drop the rule",
         )
         .unwrap();
+        (repo, root, sk)
+    }
+
+    fn assert_refused(repo: &Repo, what: &str) {
+        let before = repo.head_tip().unwrap();
+        let err = repo.commit("t", what).unwrap_err().to_string();
+        assert!(
+            err.contains("secret/x") && err.contains("sc protect"),
+            "{err}"
+        );
+        assert_eq!(repo.head_tip().unwrap(), before);
+    }
+
+    /// A tip that keeps a protected entry (PROTECTED bit, wrap list) but lacks
+    /// the rule is repository data a writer can build by hand. A recipient who
+    /// switches to it holds the plaintext, so their next ordinary commit must
+    /// not publish it.
+    #[test]
+    fn a_commit_never_stores_plaintext_of_a_path_whose_rule_was_dropped_upstream() {
+        let (repo, root, sk) = repo_with_dropped_rule("commit-rule-dropped");
         // Plaintext on disk through the normal API.
         let _ = std::fs::remove_file(root.join("secret/x"));
         repo.switch_with_identity("main", Some(&sk)).unwrap();
@@ -7451,13 +7537,96 @@ mod tests {
             "secret x\n"
         );
         std::fs::write(root.join("other.txt"), "edited\n").unwrap();
-        let before = repo.head_tip().unwrap();
-        let err = repo.commit("t", "unrelated edit").unwrap_err().to_string();
+        assert_refused(&repo, "unrelated edit");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_keyless_commit_does_not_silently_drop_uncovered_protected_entries() {
+        let (repo, root, _sk) = repo_with_dropped_rule("commit-rule-dropped-keyless");
+        std::fs::write(root.join("other.txt"), "edited\n").unwrap();
+        assert_refused(&repo, "keyless edit");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_new_plain_file_under_a_dropped_rule_is_refused() {
+        let (repo, root, _sk) = repo_with_dropped_rule("commit-rule-dropped-new");
+        std::fs::write(root.join("secret/new.txt"), "fresh\n").unwrap();
+        assert_refused(&repo, "new file");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_plain_path_differing_only_in_case_from_a_rule_or_protected_path_is_refused() {
+        let root = tmp_root("commit-case-alias");
+        let repo = Repo::init(&root).unwrap();
+        let (_sk, pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/x"), "secret x\n").unwrap();
+        let tip = repo.commit("t", "protected").unwrap();
+        let sparse = repo.sparse_spec().unwrap();
+        let snap = |path: &str| {
+            repo.snapshot_files(
+                vec![(
+                    path.to_string(),
+                    b"plain\n".to_vec(),
+                    scl_core::FileMode::FILE,
+                )],
+                Some(tip),
+                None,
+                None,
+                None,
+                None,
+                None,
+                &sparse,
+                None,
+                "t",
+                "m",
+            )
+        };
+        // Under the folded rule prefix (the exact spelling would be sealed).
+        for path in ["Secret/.keep", "SECRET/x"] {
+            let err = snap(path).unwrap_err().to_string();
+            assert!(
+                err.contains("differs only in case") && err.contains(path),
+                "{err}"
+            );
+        }
+        // Unrelated spellings still commit.
+        snap("secretary.txt").unwrap();
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_stopped_operation_hint_says_to_abort_not_to_protect() {
+        let (repo, root, _sk) = repo_with_dropped_rule("commit-rule-dropped-stopped");
+        std::fs::write(repo.layout().dot_sc.join("MERGE_HEAD"), "x").unwrap();
+        let err = repo
+            .snapshot_files(
+                Vec::new(),
+                repo.head_tip().unwrap(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                &repo.sparse_spec().unwrap(),
+                None,
+                "t",
+                "m",
+            )
+            .unwrap_err()
+            .to_string();
         assert!(
-            err.contains("secret/x") && err.contains("sc protect"),
+            err.contains("abort the operation") && !err.contains("sc protect"),
             "{err}"
         );
-        assert_eq!(repo.head_tip().unwrap(), before);
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }

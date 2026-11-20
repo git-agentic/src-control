@@ -107,11 +107,17 @@ too, not just the src-control-side metadata.
   protection rules are repository data, so a writer can hand-build a tip that
   keeps a path's `PROTECTED` entry but omits its rule. A recipient who checks
   that tip out holds the plaintext, and an unguarded `sc commit` would store it
-  unsealed. Every commit-building path (commit, amend, merge/pick/rebase
-  completion, `sc ws harvest`, `sc work`) therefore refuses, before writing any
-  object, when a working-tree path is `PROTECTED` on a parent (the tip, and the
-  merge or pick head on a completion) and no rule in the resulting policy covers
-  it; restore the rule with `sc protect`.
+  unsealed. Snapshot assembly (commit, amend, merge/pick/rebase completion,
+  `sc ws harvest`, `sc work`) therefore refuses, before it writes any snapshot
+  object, when a tip entry is `PROTECTED` and no rule in the resulting policy
+  covers it, when a plain working-tree path is `PROTECTED` on the merge or pick
+  head, or when a plain path differs only in ASCII case from a rule prefix or a
+  protected tip path (a case-insensitive checkout would write the decrypted
+  file under that spelling). Callers may first clean sparse-widen residue, fill
+  objects or mint the cache key. The hint is to restore the rule with
+  `sc protect`, or, while a merge, pick or rebase is stopped, to abort it,
+  restore the rule and retry. Case aliases of the other parent's protected
+  paths are not checked.
 - **Local cache key, `sc keygen` identity and TLS serve key are owner-only on
   unix and Windows (P33, #214, #281):** the
   unchanged-detection cache is keyed by `.sc/local-key`, created owner-only from
