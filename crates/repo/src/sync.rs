@@ -18,17 +18,36 @@ use crate::transport::Transport;
 use crate::worktree;
 
 /// Take a failed clone back out of `dst`: the whole directory when the clone
-/// created it (`dst_existed` false), otherwise only the `.sc/` it made, so a
-/// directory that was already there is never removed. Best effort; the caller
-/// must have dropped its [`Repo`] (the repo lock lives in `.sc/`) and reports
-/// the clone's own error, not this one. Call it only after `Repo::init`
-/// succeeded, since `init` refuses a directory that already holds a `.sc/`.
-pub fn discard_failed_clone(dst: &Path, dst_existed: bool) {
-    let _ = if dst_existed {
-        std::fs::remove_dir_all(dst.join(".sc"))
-    } else {
+/// created it (`created`, as [`claim_clone_dir`] reported), otherwise only the
+/// `.sc/` it made, so a directory that was already there is never removed.
+/// Best effort; the caller must have dropped its [`Repo`] (the repo lock lives
+/// in `.sc/`) and reports the clone's own error, not this one. Call it only
+/// after `Repo::init` succeeded, since `init` refuses a directory that already
+/// holds a `.sc/`.
+pub fn discard_failed_clone(dst: &Path, created: bool) {
+    let _ = if created {
         std::fs::remove_dir_all(dst)
+    } else {
+        std::fs::remove_dir_all(dst.join(".sc"))
     };
+}
+
+/// Claim the clone destination: `true` only if this call created `dst` (its
+/// missing parents are made first), so the clone owns it and may remove it on
+/// failure. Anything else, an existing directory included, or an error we
+/// cannot interpret, is `false`: the directory is the user's, and a failed
+/// clone removes only the `.sc/` it made. It never decides ownership from
+/// `exists()`, which a race or a metadata error can get wrong.
+pub fn claim_clone_dir(dst: &Path) -> bool {
+    match std::fs::create_dir(dst) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            dst.parent()
+                .is_some_and(|p| std::fs::create_dir_all(p).is_ok())
+                && std::fs::create_dir(dst).is_ok()
+        }
+        Err(_) => false,
+    }
 }
 
 impl Repo {
@@ -136,8 +155,18 @@ impl Repo {
         let remote_refs = transport.list_refs()?;
         let head_branch = transport.head_branch()?;
 
-        let dst_existed = dst.as_ref().exists();
-        let dst_repo = Repo::init(dst.as_ref())?;
+        let created = claim_clone_dir(dst.as_ref());
+        let dst_repo = match Repo::init(dst.as_ref()) {
+            Ok(r) => r,
+            Err(e) => {
+                // `init` refuses an existing `.sc/`, which is not ours to
+                // remove; only a directory this call made goes.
+                if created {
+                    discard_failed_clone(dst.as_ref(), true);
+                }
+                return Err(e);
+            }
+        };
         // Anything that fails from here leaves a half-built clone: take it
         // back out, as `git clone` does. The closure owns `dst_repo`, so its
         // repo lock is released before the directory goes.
@@ -259,7 +288,7 @@ impl Repo {
             Ok(dst_repo)
         })();
         if result.is_err() {
-            discard_failed_clone(dst.as_ref(), dst_existed);
+            discard_failed_clone(dst.as_ref(), created);
         }
         result
     }

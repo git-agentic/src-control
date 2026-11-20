@@ -284,6 +284,14 @@ impl Repo {
         } else {
             crate::sparse::Sparse::default()
         };
+        // Unsafe tree paths refuse before the session root exists (a full
+        // clone has no other check until the agents' checkouts are written).
+        {
+            let tip_root = self.snapshot(&tip)?.root;
+            let store_arc = self.vfs().store();
+            let mut store = store_arc.lock().unwrap();
+            crate::worktree::preflight_paths(&mut store, tip_root, &view)?;
+        }
         let labels: Vec<String> = (1..=opts.agents)
             .map(|i| format!("{}-{i}", opts.base_name))
             .collect();

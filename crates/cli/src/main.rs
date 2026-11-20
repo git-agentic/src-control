@@ -3996,9 +3996,17 @@ fn run_clone_git(url: &str, dst: &std::path::Path) -> Result<()> {
         );
     }
 
-    let dst_existed = dst.exists();
+    let created = scl_repo::sync::claim_clone_dir(dst);
     std::fs::create_dir_all(dst)?;
-    let repo = scl_repo::Repo::init(dst)?;
+    let repo = match scl_repo::Repo::init(dst) {
+        Ok(r) => r,
+        Err(e) => {
+            if created {
+                scl_repo::sync::discard_failed_clone(dst, true);
+            }
+            return Err(e.into());
+        }
+    };
     // A failed clone takes itself back out, as `git clone` does; the closure
     // owns `repo`, so its lock is released before the directory goes.
     let adopted = (move || -> Result<String> {
@@ -4020,7 +4028,7 @@ fn run_clone_git(url: &str, dst: &std::path::Path) -> Result<()> {
     let default = match adopted {
         Ok(default) => default,
         Err(e) => {
-            scl_repo::sync::discard_failed_clone(dst, dst_existed);
+            scl_repo::sync::discard_failed_clone(dst, created);
             return Err(e);
         }
     };

@@ -735,6 +735,16 @@ pub(crate) fn safe_join(root: &Path, rel: &str) -> Result<std::path::PathBuf> {
     Ok(root.join(rel))
 }
 
+/// Check that every path `root` lays out under `sparse` is one a checkout may
+/// write ([`check_tree_entry_path`]), for a command that changes the
+/// filesystem before its own materialize would refuse (`sc ws fork` clears the
+/// old session directory and mints `.sc/local-key`; `sc work` creates its
+/// session root). Reads only. Call it after [`preflight_view`], so on a partial
+/// clone the view's trees are known to be present.
+pub(crate) fn preflight_paths(store: &mut Store, root: ObjectId, sparse: &Sparse) -> Result<()> {
+    tree_file_entries_with_perms_sparse(store, root, sparse).map(|_| ())
+}
+
 /// Check, before anything is written, that every object the sparse view needs
 /// under `root` is in the store (ADR-0048, the view closure obligation). Only a
 /// partial clone can have such a gap, so a full clone returns immediately and

@@ -175,17 +175,75 @@ fn fast_forward_onto_a_planted_tip_refuses_before_writing_anything() {
     cleanup(repo, &root);
 }
 
+/// A repo on `main` whose tip is the planted tree (the working tree is stale,
+/// which these commands do not read).
+fn repo_at_planted_tip(tag: &str) -> (Repo, PathBuf) {
+    let root = tmp_root(tag);
+    let repo = Repo::init(&root).unwrap();
+    std::fs::write(root.join("a.txt"), "a\n").unwrap();
+    let c1 = repo.commit("me", "base").unwrap();
+    let evil = plant(&repo, Some(c1), true);
+    crate::refs::write_branch_tip(repo.layout(), "main", &evil).unwrap();
+    (repo, root)
+}
+
+#[test]
+fn ws_fork_on_a_planted_tip_refuses_before_changing_the_filesystem() {
+    let (repo, root) = repo_at_planted_tip("ws-fork");
+    // Residue a fork would clear, and the key it would mint.
+    let ws = root.join(".sc/ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("leftover"), "keep").unwrap();
+    // The commit in the setup minted the key; drop it so a new one is visible.
+    let _ = std::fs::remove_file(root.join(".sc/local-key"));
+    let err = repo.ws_fork(None, 2, "me", None).unwrap_err();
+    assert_unsafe(&err);
+    assert_eq!(std::fs::read(ws.join("leftover")).unwrap(), b"keep");
+    assert!(!ws.join("1").exists() && !ws.join("session.toml").exists());
+    assert!(!root.join(".sc/local-key").exists(), "no key was minted");
+    cleanup(repo, &root);
+}
+
+#[test]
+fn sc_work_on_a_planted_tip_refuses_before_creating_the_session() {
+    let (repo, root) = repo_at_planted_tip("work");
+    let scratch = tmp_root("work-scratch");
+    let session = scratch.join("session");
+    let err = repo
+        .work(crate::workspace::WorkOptions {
+            agents: 1,
+            base_name: "work".into(),
+            cmd: vec!["true".into()],
+            author: "t".into(),
+            message: None,
+            identity: None,
+            with_secrets: false,
+            session_root: Some(session.clone()),
+        })
+        .unwrap_err();
+    assert_unsafe(&err);
+    assert!(!session.exists(), "no session root was created");
+    std::fs::remove_dir_all(&scratch).unwrap();
+    cleanup(repo, &root);
+}
+
 #[test]
 fn discard_failed_clone_removes_only_what_the_clone_made() {
-    let created = tmp_root("discard-created");
+    // A missing destination (with a missing parent) is claimed, so it is ours.
+    let parent = tmp_root("discard-parent");
+    let created = parent.join("deep/dst");
+    assert!(crate::sync::claim_clone_dir(&created));
     Repo::init(&created).unwrap();
-    crate::sync::discard_failed_clone(&created, false);
+    crate::sync::discard_failed_clone(&created, true);
     assert!(!created.exists());
+    std::fs::remove_dir_all(&parent).unwrap();
 
+    // An existing directory is never claimed, so only its `.sc/` goes.
     let existing = tmp_root("discard-existing");
     std::fs::write(existing.join("mine.txt"), "keep").unwrap();
+    assert!(!crate::sync::claim_clone_dir(&existing));
     Repo::init(&existing).unwrap();
-    crate::sync::discard_failed_clone(&existing, true);
+    crate::sync::discard_failed_clone(&existing, false);
     assert!(!existing.join(".sc").exists());
     assert_eq!(std::fs::read(existing.join("mine.txt")).unwrap(), b"keep");
     std::fs::remove_dir_all(&existing).unwrap();

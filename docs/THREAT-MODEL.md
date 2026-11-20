@@ -817,9 +817,11 @@ protected paths, plaintext.
     or leave the checkout. A tree comes from a peer and decode accepts any entry
     name, so `scl_core::check_tree_path` refuses, per component, an empty, `.`,
     `..` or NUL name, `.sc` at any depth under its filesystem aliases (HFS
-    ignorable code points, NTFS `:stream`, trailing dots and spaces, case, the
-    short name `sc~1`), and on Windows any `\` or `:`. The tree flatteners and
-    `safe_join` apply it before the first write, so clone, switch, merge, undo and
+    ignorable code points, NTFS `:stream`, trailing dots and spaces, Unicode case
+    folding such as `.ſc` on APFS, the 8.3 short names `sc~1` to `sc~4` and
+    `sc<4 hex>~1` to `~9`), and on Windows any `\` or `:`. The tree flatteners and
+    `safe_join` apply it before the first write (`sc ws fork` and `sc work` check
+    first, before they touch the filesystem), so clone, switch, merge, undo and
     `scl_vfs::Worktree::checkout` refuse with `UnsafePath` and change nothing; both
     tree builders refuse to commit such a path. A clone that fails removes the
     directory it created (only its `.sc/` if the directory already existed).

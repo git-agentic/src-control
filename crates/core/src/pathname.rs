@@ -48,12 +48,35 @@ fn hfs_ignorable(c: char) -> bool {
 /// Whether `component` is `.sc` on any filesystem a checkout may live on:
 /// mirrors `is_alias` in `crates/forge/src/gitwrite.rs` (HFS-ignorable code
 /// points dropped, an NTFS `:stream` suffix cut, trailing dots and spaces
-/// trimmed, ASCII case folded), against `.sc` and the 8.3 short name `sc~1`.
+/// trimmed) but folds case with Unicode uppercase, not ASCII: a case-insensitive
+/// APFS volume resolves `.\u{17f}c` (LATIN SMALL LETTER LONG S) to `.sc`, and
+/// `'\u{17f}'.to_uppercase()` is `S`. The folded name is then compared against
+/// `.SC`, the first-six style 8.3 names `SC~1` to `SC~4`, and NTFS's checksum
+/// short name `SC` + four hex digits + `~1` to `~9` (the base of `.sc` is only
+/// two characters once the dot is stripped, so NTFS may use that form).
 fn is_control_dir(component: &str) -> bool {
     let c: String = component.chars().filter(|c| !hfs_ignorable(*c)).collect();
     let c = c.split(':').next().unwrap_or("");
-    let c = c.trim_end_matches([' ', '.']).to_ascii_lowercase();
-    c == ".sc" || c == "sc~1"
+    let c: String = c
+        .trim_end_matches([' ', '.'])
+        .chars()
+        .flat_map(char::to_uppercase)
+        .collect();
+    if c == ".SC" {
+        return true;
+    }
+    let Some(tail) = c.strip_prefix("SC") else {
+        return false;
+    };
+    match tail.split_once('~') {
+        Some(("", n)) => matches!(n, "1" | "2" | "3" | "4"),
+        Some((hex, n)) => {
+            hex.len() == 4
+                && hex.bytes().all(|b| b.is_ascii_hexdigit())
+                && matches!(n.as_bytes(), [b'1'..=b'9'])
+        }
+        None => false,
+    }
 }
 
 /// Refuse a `/`-separated tree path that must never be written under a
@@ -95,6 +118,14 @@ mod tests {
             "\u{feff}.sc",
             "sc~1",
             "SC~1",
+            "sc~4",
+            "sc1a2B~1",
+            "SCABCD~9",
+            "a/sc0000~3",
+            ".\u{17f}c",
+            ".\u{17f}C",
+            ".\u{17f}c.",
+            "\u{17f}c~1",
             ".sc:x",
             ".sc/recipients.toml",
             "a/.Sc/b",
@@ -146,7 +177,13 @@ mod tests {
             "a/.sc_x/b",
             "src/main.rs",
             ".sc-keep",
-            "sc~2",
+            "sc~5",
+            "sc123~1",
+            "sc12345~1",
+            "scxyzw~1",
+            "sc1234~0",
+            "sc1234~10",
+            "\u{17f}x",
             "..a",
             "a..",
         ] {
