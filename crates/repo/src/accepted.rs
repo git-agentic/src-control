@@ -60,35 +60,88 @@ pub struct Unaccepted {
 }
 
 impl Unaccepted {
-    fn label(&self) -> &str {
-        self.name.as_deref().unwrap_or("UNKNOWN")
+    /// The local `[recipients]` name, or `UNKNOWN`, made safe to print.
+    fn label(&self) -> String {
+        match &self.name {
+            Some(n) => scl_core::sanitize_display_line(n).into_owned(),
+            None => "UNKNOWN".to_string(),
+        }
+    }
+
+    /// The scope as text that is safe to print: a rule prefix, secret name or
+    /// branch name comes from the repository, so it can hold control characters.
+    fn shown_scope(&self) -> String {
+        scl_core::sanitize_display_line(&self.scope).into_owned()
+    }
+
+    /// Whether the scope prints as itself. A scope that does not never gets a
+    /// runnable command, however it would be quoted.
+    fn scope_is_plain(&self) -> bool {
+        matches!(
+            scl_core::sanitize_display_line(&self.scope),
+            std::borrow::Cow::Borrowed(_)
+        )
     }
 
     /// The exact `sc policy accept` command; an unknown key needs
-    /// `--allow-unknown`.
-    pub fn accept_command(&self) -> String {
+    /// `--allow-unknown`. `None` when the scope holds control characters.
+    pub fn accept_command(&self) -> Option<String> {
+        if !self.scope_is_plain() {
+            return None;
+        }
         let unknown = if self.name.is_none() {
             " --allow-unknown"
         } else {
             ""
         };
-        format!(
+        Some(format!(
             "sc policy accept {} --key {}{unknown}",
             sh_quote(&self.scope),
             self.key
-        )
+        ))
     }
 
-    /// The command that removes the recipient from the repository data.
-    pub fn remove_command(&self) -> String {
+    /// The command that removes the recipient from the repository data, flags
+    /// first and the target after `--` when it starts with `-`. `None` when the
+    /// scope holds control characters.
+    pub fn remove_command(&self) -> Option<String> {
+        if !self.scope_is_plain() {
+            return None;
+        }
         let (kind, target) = self.scope.split_once(':').unwrap_or(("", &self.scope));
         let target = sh_quote(target);
-        match kind {
-            "path" => format!("sc revoke {target} --recipient-id {}", self.id),
-            "secret" => format!("sc secret revoke {target} --recipient-id {}", self.id),
+        let (head, flags) = match kind {
+            "path" => ("sc revoke", format!("--recipient-id {}", self.id)),
+            "secret" => ("sc secret revoke", format!("--recipient-id {}", self.id)),
+            _ => (
+                "sc branch revoke",
+                format!("--recipient-id {} --identity <key>", self.id),
+            ),
+        };
+        Some(if target.starts_with('-') {
+            format!("{head} {flags} -- {target}")
+        } else {
+            format!("{head} {target} {flags}")
+        })
+    }
+
+    /// Where to look at a scope that has no safe command.
+    fn inspect_command(&self) -> &'static str {
+        match self.scope.split_once(':').map(|(k, _)| k) {
+            Some("path") => "sc protect --list",
+            Some("secret") => "sc secret list",
+            _ => "sc branch list",
+        }
+    }
+
+    /// The Accept and Remove lines of the refusal.
+    fn command_lines(&self) -> String {
+        match (self.accept_command(), self.remove_command()) {
+            (Some(accept), Some(remove)) => format!("  Accept: {accept}\n  Remove: {remove}\n"),
             _ => format!(
-                "sc branch revoke {target} --recipient-id {} --identity <key>",
-                self.id
+                "  The scope holds control characters, so no command is suggested; \
+                 inspect it with `{}`.\n",
+                self.inspect_command()
             ),
         }
     }
@@ -106,17 +159,17 @@ fn sh_quote(s: &str) -> String {
     }
 }
 
-/// The text of [`Error::UnacceptedRecipients`].
+/// The text of [`Error::UnacceptedRecipients`]. Every field that can come from
+/// the repository is escaped.
 pub(crate) fn describe(pairs: &[Unaccepted]) -> String {
     let mut out = String::new();
     for p in pairs {
         out.push_str(&format!(
-            "{} grants a recipient you have not accepted: {} ({}).\n  Accept: {}\n  Remove: {}\n",
-            p.scope,
+            "{} grants a recipient you have not accepted: {} ({}).\n{}",
+            p.shown_scope(),
             p.id,
             p.label(),
-            p.accept_command(),
-            p.remove_command()
+            p.command_lines()
         ));
     }
     out.push_str("Nothing was written.");
@@ -128,12 +181,18 @@ pub(crate) fn describe_inline(pairs: &[Unaccepted]) -> String {
     pairs
         .iter()
         .map(|p| {
+            let commands = match (p.accept_command(), p.remove_command()) {
+                (Some(accept), Some(remove)) => format!("accept: {accept}; remove: {remove}"),
+                _ => format!(
+                    "the scope holds control characters, so no command is suggested \
+                     (inspect it with `{}`)",
+                    p.inspect_command()
+                ),
+            };
             format!(
-                "grants a recipient you have not accepted: {} ({}); accept: {}; remove: {}",
+                "grants a recipient you have not accepted: {} ({}); {commands}",
                 p.id,
-                p.label(),
-                p.accept_command(),
-                p.remove_command()
+                p.label()
             )
         })
         .collect::<Vec<_>>()
@@ -315,40 +374,60 @@ impl Repo {
         Accepted::load(&self.layout)
     }
 
-    /// Record `id` as accepted for `scope` (`sc policy accept`; idempotent).
-    /// `key` is the full public key when the caller has it; a `path:` scope
-    /// records full keys, so it is required there. Local file only: allowed
-    /// while a merge, pick or rebase is stopped.
-    pub fn accept_recipient(
+    /// Record recipients as accepted for `scope` (`sc policy accept`;
+    /// idempotent). Each entry is the id plus the full public key when the
+    /// caller has it; a `path:` scope records full keys, so it is required
+    /// there. The whole batch is validated before the record is written, once.
+    /// Local file only: allowed while a merge, pick or rebase is stopped.
+    pub fn accept_recipients(
         &self,
         scope: &str,
-        id: &RecipientId,
-        key: Option<&PublicKey>,
+        entries: &[(RecipientId, Option<PublicKey>)],
     ) -> Result<()> {
         validate_scope(scope)?;
-        let recorded = match (scope.starts_with("path:"), key) {
-            (true, Some(k)) => entry(scope, k),
-            (true, None) => {
-                return Err(Error::InvalidArgument(format!(
-                    "{scope} records full public keys: pass the scl-pk- key of {id}, \
-                     or a recipient id that is in .sc/recipients.toml"
-                )))
-            }
-            (false, _) => id.to_string(),
-        };
+        let mut recorded = Vec::with_capacity(entries.len());
+        for (id, key) in entries {
+            recorded.push(match (scope.starts_with("path:"), key) {
+                (true, Some(k)) => entry(scope, k),
+                (true, None) => {
+                    return Err(Error::InvalidArgument(format!(
+                        "{scope} records full public keys: pass the scl-pk- key of {id}, \
+                         or a recipient id that is in .sc/recipients.toml"
+                    )))
+                }
+                (false, _) => id.to_string(),
+            });
+        }
         let mut pairs = read_pairs(&self.layout)?;
-        if pairs.insert((scope.to_string(), recorded)) {
+        let before = pairs.len();
+        pairs.extend(recorded.into_iter().map(|e| (scope.to_string(), e)));
+        if pairs.len() != before {
             write_pairs(&self.layout, &pairs)?;
         }
         Ok(())
     }
 
-    /// [`Repo::accept_recipient`] for keys the user named on the command line.
+    /// [`Repo::accept_recipients`] for keys the user named on the command line.
     pub fn accept_keys(&self, scope: &str, keys: &[PublicKey]) -> Result<()> {
-        for k in keys {
-            self.accept_recipient(scope, &k.recipient_id(), Some(k))?;
-        }
-        Ok(())
+        let entries: Vec<_> = keys
+            .iter()
+            .map(|k| (k.recipient_id(), Some(k.clone())))
+            .collect();
+        self.accept_recipients(scope, &entries)
+    }
+
+    /// [`Repo::accept_keys`] for a recipient list a command assembled from what
+    /// the user named plus the configured escrow keys. An escrow key is never
+    /// recorded: it counts as accepted from the current `[escrow]` config at
+    /// check time, so removing it from there takes the acceptance with it.
+    pub(crate) fn accept_named_keys(&self, scope: &str, keys: &[PublicKey]) -> Result<()> {
+        let accepted = self.accepted()?;
+        let named: Vec<PublicKey> = keys
+            .iter()
+            .filter(|k| !accepted.escrow.contains(k.recipient_id().as_str()))
+            .cloned()
+            .collect();
+        self.accept_keys(scope, &named)
     }
 
     /// Remove every accepted pair of `scope` for this recipient (`sc policy
@@ -534,7 +613,10 @@ mod tests {
         );
         let named = refused(c.commit("me", "m"));
         assert_eq!(named[0].name.as_deref(), Some("mallory"));
-        assert!(!named[0].accept_command().contains("--allow-unknown"));
+        assert!(!named[0]
+            .accept_command()
+            .unwrap()
+            .contains("--allow-unknown"));
         drop(c);
         let _ = std::fs::remove_dir_all(c_root);
         w.cleanup();
@@ -626,6 +708,7 @@ mod tests {
         assert_eq!(pairs[0].id, atk_id);
         assert!(pairs[0]
             .remove_command()
+            .unwrap()
             .starts_with("sc secret revoke API_TOKEN --recipient-id"));
 
         let report = v.rewrap(&vsk, &[], &both, false).unwrap();
@@ -927,9 +1010,9 @@ mod tests {
         assert_eq!(acc.pairs.len(), 2);
         // A path scope needs the full key; a bad scope is refused.
         assert!(repo
-            .accept_recipient("path:x/", &pk.recipient_id(), None)
+            .accept_recipients("path:x/", &[(pk.recipient_id(), None)])
             .is_err());
-        repo.accept_recipient("secret:T", &pk.recipient_id(), None)
+        repo.accept_recipients("secret:T", &[(pk.recipient_id(), None)])
             .unwrap();
         assert!(repo.accept_keys("nope", std::slice::from_ref(&pk)).is_err());
         // Forgetting goes by recipient id, whichever form was recorded.
@@ -961,6 +1044,234 @@ mod tests {
                 .is_empty());
             assert_eq!(acc.unaccepted(scope, std::slice::from_ref(&other)).len(), 1);
         }
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // Escrow keys a command appends are accepted from the current `[escrow]`
+    // config at check time, never recorded: removing one from the config takes
+    // the acceptance with it.
+    #[test]
+    fn escrow_keys_a_command_appends_are_not_recorded() {
+        let root = dir("escrow-not-recorded");
+        let (sk, me) = generate_keypair();
+        let (_, bob) = generate_keypair();
+        let (_, escrow) = generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        let toml = format!("[escrow]\nkeys = [\"{}\"]\n", escrow.to_key_string());
+        put(&root, ".sc/recipients.toml", &toml);
+        put(&root, "p/x.txt", "x\n");
+        repo.protect("p/", &[me.clone(), escrow.clone()], None)
+            .unwrap();
+        repo.secret_add("S", b"v", &[me.clone(), escrow.clone()])
+            .unwrap();
+        repo.branch_private(
+            "b",
+            &sk,
+            std::slice::from_ref(&bob),
+            std::slice::from_ref(&escrow),
+        )
+        .unwrap();
+
+        let record = std::fs::read_to_string(repo.layout().accepted_recipients_path()).unwrap();
+        assert!(
+            !record.contains(&escrow.to_key_string()) && !record.contains(&id_of(&escrow)),
+            "escrow recorded: {record}"
+        );
+        for (scope, key) in [
+            ("path:p/", &me),
+            ("secret:S", &me),
+            ("branch:b", &bob),
+            ("branch:b", &sk.public()),
+        ] {
+            assert!(repo
+                .accepted()
+                .unwrap()
+                .unaccepted(scope, std::slice::from_ref(key))
+                .is_empty());
+        }
+        // Escrow is accepted while it is configured.
+        let acc = repo.accepted().unwrap();
+        for scope in ["path:p/", "secret:S", "branch:b"] {
+            assert!(acc
+                .unaccepted(scope, std::slice::from_ref(&escrow))
+                .is_empty());
+        }
+        // And stops being accepted when it is removed from the config.
+        put(&root, ".sc/recipients.toml", "[recipients]\n");
+        let acc = repo.accepted().unwrap();
+        for scope in ["path:p/", "secret:S", "branch:b"] {
+            assert_eq!(
+                acc.unaccepted(scope, std::slice::from_ref(&escrow)).len(),
+                1
+            );
+        }
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // The local approval goes before the ref moves: when the record cannot be
+    // written the revoke fails with nothing moved, and it lands once it can.
+    #[test]
+    fn a_revoke_drops_the_approval_before_it_moves_the_ref() {
+        let root = dir("revoke-order");
+        let (sk, a) = generate_keypair();
+        let (_, b) = generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        put(&root, "p/x.txt", "x\n");
+        repo.protect("p/", &[a.clone(), b.clone()], None).unwrap();
+        repo.secret_add("S", b"v", &[a.clone(), b.clone()]).unwrap();
+        repo.branch_private("emb", &sk, std::slice::from_ref(&b), &[])
+            .unwrap();
+        let block = root.join(".sc/accepted-recipients.tmp");
+        std::fs::create_dir(&block).unwrap();
+
+        let tip = repo.head_tip().unwrap();
+        assert!(repo.revoke("p/", &b.recipient_id()).is_err());
+        assert_eq!(repo.head_tip().unwrap(), tip, "path revoke moved the ref");
+        assert!(repo.secret_revoke("S", &b.recipient_id()).is_err());
+        assert_eq!(repo.head_tip().unwrap(), tip, "secret revoke moved the ref");
+        assert_eq!(repo.secret_recipients("S").unwrap().len(), 2);
+        let emb = crate::refs::read_branch_tip(repo.layout(), "emb").unwrap();
+        assert!(repo
+            .branch_revoke("emb", &sk, &b.recipient_id(), std::slice::from_ref(&a))
+            .is_err());
+        assert_eq!(
+            crate::refs::read_branch_tip(repo.layout(), "emb").unwrap(),
+            emb,
+            "branch revoke moved the ref"
+        );
+
+        std::fs::remove_dir(&block).unwrap();
+        repo.revoke("p/", &b.recipient_id()).unwrap();
+        repo.secret_revoke("S", &b.recipient_id()).unwrap();
+        assert_eq!(repo.secret_recipients("S").unwrap().len(), 1);
+        // `a` is the creator of `emb` and the key `branch_private` accepted.
+        repo.branch_revoke("emb", &sk, &b.recipient_id(), std::slice::from_ref(&a))
+            .unwrap();
+        let acc = repo.accepted().unwrap();
+        for scope in ["path:p/", "secret:S", "branch:emb"] {
+            assert_eq!(acc.unaccepted(scope, std::slice::from_ref(&b)).len(), 1);
+        }
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // A batch with one entry it cannot record writes none of them.
+    #[test]
+    fn a_batch_with_a_bad_entry_writes_nothing() {
+        let root = dir("batch");
+        let (_, good) = generate_keypair();
+        let (_, other) = generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        let err = repo
+            .accept_recipients(
+                "path:x/",
+                &[
+                    (good.recipient_id(), Some(good.clone())),
+                    (other.recipient_id(), None),
+                ],
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+        assert!(!repo.layout().accepted_recipients_path().exists());
+        // Without the bad entry the same call records, in one write.
+        repo.accept_recipients("path:x/", &[(good.recipient_id(), Some(good.clone()))])
+            .unwrap();
+        assert_eq!(repo.accepted().unwrap().pairs.len(), 1);
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // A scope comes from the repository: it is escaped in the message and a
+    // scope with control characters gets no command to run.
+    #[test]
+    fn a_scope_with_control_characters_is_escaped_and_gets_no_command() {
+        let evil = "path:a\n  Accept: sc policy accept x\u{1b}[2J/";
+        let pair = Unaccepted {
+            scope: evil.into(),
+            key: "k".into(),
+            id: "0".repeat(32),
+            name: Some("na\nme\u{202e}".into()),
+        };
+        assert_eq!(pair.accept_command(), None);
+        assert_eq!(pair.remove_command(), None);
+        for text in [
+            Error::UnacceptedRecipients {
+                pairs: vec![pair.clone()],
+            }
+            .to_string(),
+            describe_inline(std::slice::from_ref(&pair)),
+        ] {
+            assert!(
+                text.chars()
+                    .all(|c| c == '\n' || !(c.is_control() || c == '\u{202e}')),
+                "raw control character in {text:?}"
+            );
+            assert!(text.contains("control characters"), "{text}");
+            assert!(text.contains("sc protect --list"), "{text}");
+            assert!(
+                text.lines().all(|l| !l.trim_start().starts_with("Accept:")),
+                "{text}"
+            );
+        }
+        // A plain scope still gets both commands.
+        let plain = Unaccepted {
+            scope: "secret:DB".into(),
+            ..pair
+        };
+        assert!(plain.accept_command().is_some() && plain.remove_command().is_some());
+    }
+
+    // A target that starts with `-` goes after `--`, flags first.
+    #[test]
+    fn a_remove_command_puts_a_dashed_target_after_the_flags() {
+        let id = "0".repeat(32);
+        let at = |scope: &str| {
+            Unaccepted {
+                scope: scope.into(),
+                key: "k".into(),
+                id: id.clone(),
+                name: None,
+            }
+            .remove_command()
+            .unwrap()
+        };
+        assert_eq!(
+            at("path:-x/"),
+            format!("sc revoke --recipient-id {id} -- -x/")
+        );
+        assert_eq!(
+            at("secret:-X"),
+            format!("sc secret revoke --recipient-id {id} -- -X")
+        );
+        assert_eq!(
+            at("branch:-b"),
+            format!("sc branch revoke --recipient-id {id} --identity <key> -- -b")
+        );
+        assert_eq!(at("path:x/"), format!("sc revoke x/ --recipient-id {id}"));
+    }
+
+    // An unreadable record blocks a seal, not a commit that wraps nothing.
+    #[test]
+    fn an_unreadable_record_blocks_only_what_seals() {
+        let root = dir("lazy");
+        let (_, pk) = generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        put(&root, "plain.txt", "p\n");
+        put(&root, "p/x.txt", "x\n");
+        repo.protect("p/", std::slice::from_ref(&pk), None).unwrap();
+        let record = repo.layout().accepted_recipients_path();
+        std::fs::remove_file(&record).unwrap();
+        std::fs::create_dir(&record).unwrap();
+
+        // Plain edit: the protected file is carried, nothing is wrapped.
+        put(&root, "plain.txt", "edited\n");
+        repo.commit("me", "plain").unwrap();
+        // A seal needs the record.
+        put(&root, "p/x.txt", "changed\n");
+        let err = repo.commit("me", "seal").unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err}");
         drop(repo);
         let _ = std::fs::remove_dir_all(root);
     }

@@ -688,7 +688,7 @@ impl Repo {
         }
 
         let (protected_all, sealed_wrapped) =
-            crate::protect::encrypt_protected(to_seal, &self.accepted()?)?;
+            crate::protect::encrypt_protected(to_seal, || self.accepted())?;
         // Record every freshly sealed path's new blob id into the cache; the
         // committing caller persists it only after the ref actually moves.
         if let Some(c) = cache {
@@ -1878,7 +1878,7 @@ impl Repo {
         }
 
         let (encrypted, fresh_wrapped) =
-            crate::protect::encrypt_protected(to_encrypt, &self.accepted()?)?;
+            crate::protect::encrypt_protected(to_encrypt, || self.accepted())?;
         carried.extend(encrypted);
         let all = carried;
 

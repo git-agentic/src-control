@@ -241,3 +241,124 @@ fn a_fresh_clone_refuses_a_default_secret_rotate_until_accepted() {
     let _ = alice_pk;
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+#[test]
+fn a_batch_with_an_unresolvable_path_id_records_nothing() {
+    let root = tmp("batch");
+    let keys = tmp("batch-keys");
+    let (_, alice_pk) = keygen(&keys, "alice");
+    assert!(sc(&root, &["init"]).status.success());
+    std::fs::write(
+        root.join(".sc/recipients.toml"),
+        format!("[recipients]\nalice = \"{alice_pk}\"\n"),
+    )
+    .unwrap();
+
+    // The first key is fine; the second is an id nobody here can resolve to a
+    // full key, which a `path:` scope needs even with --allow-unknown.
+    let unknown = "00112233445566778899aabbccddeeff";
+    let both = format!("{alice_pk},{unknown}");
+    let out = sc(
+        &root,
+        &[
+            "policy",
+            "accept",
+            "path:a/",
+            "--key",
+            &both,
+            "--allow-unknown",
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("full public keys"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(record(&root), "", "the first key was not written");
+
+    // For a secret an id is all the record holds, so the same batch works.
+    let out = sc(
+        &root,
+        &[
+            "policy",
+            "accept",
+            "secret:X",
+            "--key",
+            &both,
+            "--allow-unknown",
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(record(&root).lines().count(), 2);
+
+    std::fs::remove_dir_all(&root).unwrap();
+    std::fs::remove_dir_all(&keys).unwrap();
+}
+
+#[test]
+fn the_remove_command_form_for_a_dashed_target_parses() {
+    let root = tmp("dashed");
+    assert!(sc(&root, &["init"]).status.success());
+    std::fs::write(root.join("f.txt"), "1\n").unwrap();
+    assert!(sc(&root, &["commit", "-m", "c"]).status.success());
+    let id = "00112233445566778899aabbccddeeff";
+    for args in [
+        vec!["revoke", "--recipient-id", id, "--", "-x/"],
+        vec!["secret", "revoke", "--recipient-id", id, "--", "-X"],
+        vec![
+            "branch",
+            "revoke",
+            "--recipient-id",
+            id,
+            "--identity",
+            "/nonexistent",
+            "--",
+            "-b",
+        ],
+    ] {
+        let out = sc(&root, &args);
+        let err = stderr(&out);
+        assert!(!out.status.success(), "{args:?} has nothing to revoke");
+        assert!(
+            !err.contains("unexpected argument") && !err.contains("Usage:"),
+            "{args:?} did not parse: {err}"
+        );
+    }
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn escrow_keys_are_not_recorded_by_protect_or_secret_add() {
+    let root = tmp("escrow");
+    let keys = tmp("escrow-keys");
+    let (_, alice_pk) = keygen(&keys, "alice");
+    let (_, escrow_pk) = keygen(&keys, "escrow");
+    assert!(sc(&root, &["init"]).status.success());
+    std::fs::write(
+        root.join(".sc/recipients.toml"),
+        format!("[recipients]\nalice = \"{alice_pk}\"\n[escrow]\nkeys = [\"{escrow_pk}\"]\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("secret")).unwrap();
+    std::fs::write(root.join("secret/a.txt"), "data\n").unwrap();
+    let out = sc(&root, &["protect", "secret/", "--to", "alice"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = sc(
+        &root,
+        &["secret", "add", "DB", "--to", "alice", "--value", "v"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let rec = record(&root);
+    assert!(rec.contains(&alice_pk), "the named key is recorded: {rec}");
+    assert!(rec.contains("secret:DB\t"), "{rec}");
+    assert!(!rec.contains(&escrow_pk), "escrow recorded: {rec}");
+    // The secret line holds an id: compare through the escrow's own id.
+    let shown = String::from_utf8_lossy(&sc(&root, &["escrow", "show"]).stdout).to_string();
+    let escrow_id = shown.split(": ").nth(1).unwrap().lines().next().unwrap();
+    assert!(!rec.contains(escrow_id), "escrow id recorded: {rec}");
+
+    std::fs::remove_dir_all(&root).unwrap();
+    std::fs::remove_dir_all(&keys).unwrap();
+}

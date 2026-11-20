@@ -754,7 +754,9 @@ enum PolicyOp {
         /// Public keys (`scl-pk-...`) or recipient ids to accept.
         #[arg(long, required = true, value_delimiter = ',')]
         key: Vec<String>,
-        /// Accept a key that is in neither `[recipients]` nor `[escrow]`.
+        /// Accept a key that is in neither `[recipients]` nor `[escrow]`. A
+        /// `path:` scope records full keys, so it still needs the `scl-pk-`
+        /// key: an id that does not resolve to one is an error.
         #[arg(long)]
         allow_unknown: bool,
     },
@@ -3289,10 +3291,14 @@ fn run_secret(op: SecretOp) -> Result<()> {
                 None => read_value_from_stdin()?,
             };
             let dir = load_recipients(&recipients_path)?;
-            let mut pks = resolve_names(&dir, &to)?;
+            let named = resolve_names(&dir, &to)?;
             let escrows = load_escrows(&recipients_path)?;
-            pks = append_escrow(pks, &escrows);
+            let pks = append_escrow(named.clone(), &escrows);
             repo.secret_add(&name, value.as_bytes(), &pks)?;
+            // Only the keys named here are recorded as accepted (a key that is
+            // also escrow included); the escrow keys appended above count from
+            // `[escrow]` at check time.
+            repo.accept_keys(&format!("secret:{name}"), &named)?;
             println!("added secret {name} for {} recipient(s)", pks.len());
         }
         SecretOp::Grant { name, to, identity } => {
@@ -3416,9 +3422,8 @@ fn run_policy(op: PolicyOp) -> Result<()> {
                 }
                 resolved.push((id, given.or(local)));
             }
-            for (id, pk) in &resolved {
-                repo.accept_recipient(&scope, id, pk.as_ref())?;
-            }
+            // The whole batch is checked, then written once.
+            repo.accept_recipients(&scope, &resolved)?;
             println!("accepted {} recipient(s) for {scope}", resolved.len());
         }
         PolicyOp::Forget { scope, key } => {
@@ -4817,10 +4822,14 @@ fn run_protect(prefix: Option<String>, to: Vec<String>, list: bool, json: bool) 
 
     let recipients_path = repo.layout().dot_sc.join("recipients.toml");
     let dir = load_recipients(&recipients_path)?;
-    let mut pks = resolve_names(&dir, &to)?;
+    let named = resolve_names(&dir, &to)?;
     let escrows = load_escrows(&recipients_path)?;
-    pks = append_escrow(pks, &escrows);
+    let pks = append_escrow(named.clone(), &escrows);
     let id = repo.protect(&prefix, &pks, None)?;
+    // Only the keys named here are recorded as accepted (a key that is also
+    // escrow included); the escrow keys appended above count from `[escrow]`
+    // at check time.
+    repo.accept_keys(&format!("path:{prefix}"), &named)?;
     println!(
         "protected {prefix} for {} recipient(s): {}",
         pks.len(),

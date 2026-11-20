@@ -86,8 +86,10 @@ impl Repo {
         let mut skipped: Vec<(String, String)> = Vec::new();
         // Wraps minted here come from repository data (wrap labels, rules), so
         // an entry whose target set holds a key this clone never accepted is
-        // skipped, not sealed (ADR-0059). The escrow set passed in is local.
-        let accepted = self.accepted()?.with_escrow(escrows);
+        // skipped, not sealed (ADR-0059). The escrow set passed in is local. The
+        // record loads at the first entry that wraps anything, so a rewrap with
+        // nothing to wrap does not depend on it being readable.
+        let mut accepted: Option<crate::accepted::Accepted> = None;
 
         // ---- Secrets half: fresh-DEK reseal to current set + escrow. ----
         let mut registry = snap.secrets.clone();
@@ -138,7 +140,13 @@ impl Repo {
                 continue;
             }
             let targets = crate::secrets::append_dedup(targets, escrows);
-            let pending = accepted.unaccepted(&crate::accepted::secret_scope(&name), &targets);
+            if accepted.is_none() {
+                accepted = Some(self.accepted()?.with_escrow(escrows));
+            }
+            let pending = accepted
+                .as_ref()
+                .expect("loaded above")
+                .unaccepted(&crate::accepted::secret_scope(&name), &targets);
             if !pending.is_empty() {
                 skipped.push((
                     format!("secret {name}"),
@@ -255,7 +263,13 @@ impl Repo {
                     target_pks.push(e.clone());
                 }
             }
-            let pending = accepted.unaccepted(&scope, &target_pks);
+            if accepted.is_none() {
+                accepted = Some(self.accepted()?.with_escrow(escrows));
+            }
+            let pending = accepted
+                .as_ref()
+                .expect("loaded above")
+                .unaccepted(&scope, &target_pks);
             if !pending.is_empty() {
                 skipped.push((
                     format!("path {path}"),

@@ -250,7 +250,7 @@ pub(crate) fn replay_commit(
     };
 
     let (mut all, to_encrypt) = split_for_encryption(&fm.files, &union_prot)?;
-    let (encrypted, fresh_wrapped) = protect::encrypt_protected(to_encrypt, &repo.accepted()?)?;
+    let (encrypted, fresh_wrapped) = protect::encrypt_protected(to_encrypt, || repo.accepted())?;
     all.extend(encrypted);
     let root = match &tree_carried {
         Some((crate::merge_tree::Carried::Root(id), _)) => *id,

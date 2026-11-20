@@ -136,7 +136,13 @@ too, not just the src-control-side metadata.
   `sc protect` (it checks the rule it changes and builds its sealing commit
   before either ref moves), `secret_rotate`, `rewrap` (an entry with an
   unaccepted key is skipped, the rest commits, the exit code is non-zero) and
-  `branch_revoke`. A carry that copies
+  `branch_revoke`. The record loads only when something is sealed, so a commit
+  that wraps nothing does not depend on it. Escrow keys are never recorded: they
+  count from the current `[escrow]` section, so removing one withdraws it. A
+  scope in a refusal comes from the repository, so it is escaped and a scope
+  with control characters gets no runnable command. The record's integrity
+  relies on the working-tree path guard (a checkout never writes under `.sc/`).
+  A carry that copies
   existing wraps is not a seal and is not gated. A refusal writes nothing and
   names the scope, the id, the local `[recipients]` name or `UNKNOWN`, the
   `sc policy accept` command and the revoke command. Only keys you name on the

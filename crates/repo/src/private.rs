@@ -331,8 +331,11 @@ impl Repo {
                 wrap_keys.push(pk.clone());
             }
         }
-        // The creator and the keys named for this branch are accepted for it.
-        self.accept_keys(&crate::accepted::branch_scope(name), &wrap_keys)?;
+        // The creator and the keys named for this branch are accepted for it;
+        // the escrow keys are not recorded (they count from `[escrow]`).
+        let mut named = vec![creator.public()];
+        named.extend(recipients.iter().cloned());
+        self.accept_keys(&crate::accepted::branch_scope(name), &named)?;
         let kek_wraps: Vec<WrappedKey> = wrap_keys
             .iter()
             .map(|pk| scl_crypto::wrap_kek_for(&kek, pk))
@@ -1318,9 +1321,9 @@ impl Repo {
             index_ct: ctx.index.encrypt(&new_kek),
             kek_wraps,
         };
-        let id = self.replace_manifest(name, &ctx, manifest, &format!("branch revoke {name}"))?;
+        // Drop the local approval before the ref moves (see `Repo::revoke`).
         self.forget_recipient(&crate::accepted::branch_scope(name), revoked)?;
-        Ok(id)
+        self.replace_manifest(name, &ctx, manifest, &format!("branch revoke {name}"))
     }
 
     fn replace_manifest(
@@ -1897,7 +1900,7 @@ impl Repo {
                 BTreeMap::new()
             };
             let (encrypted, fresh) =
-                crate::protect::encrypt_protected(to_encrypt, &self.accepted()?)?;
+                crate::protect::encrypt_protected(to_encrypt, || self.accepted())?;
             for (path, ct, mode, perms) in encrypted {
                 let blob = Object::blob(ct.clone());
                 let bid = blob.id();

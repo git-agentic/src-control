@@ -146,11 +146,17 @@ pub(crate) type WrapMap = BTreeMap<ObjectId, Vec<WrappedKey>>;
 /// The one place a rule's recipients become wraps, so it is also the gate
 /// (ADR-0059): every recipient must be accepted in this clone for the winning
 /// rule's scope (or be local escrow), else the call refuses, naming every
-/// unaccepted pair, before any file is sealed.
+/// unaccepted pair, before any file is sealed. `accepted` loads the record, and
+/// runs only when there is something to seal: a commit that wraps nothing must
+/// not depend on the record being readable.
 pub(crate) fn encrypt_protected(
     plaintexts: Vec<SealInput>,
-    accepted: &crate::accepted::Accepted,
+    accepted: impl FnOnce() -> Result<crate::accepted::Accepted>,
 ) -> Result<(Vec<SealedFile>, WrapMap)> {
+    if plaintexts.is_empty() {
+        return Ok((Vec::new(), BTreeMap::new()));
+    }
+    let accepted = accepted()?;
     let mut unaccepted: Vec<crate::accepted::Unaccepted> = Vec::new();
     for (_, _, _, recipients, prefix) in &plaintexts {
         let keys: Vec<scl_crypto::PublicKey> = recipients
@@ -232,8 +238,10 @@ mod tests {
                     vec![pk.to_bytes()],
                     "secret/".into(),
                 )],
-                &crate::accepted::Accepted::default()
-                    .with_named("path:secret/", std::slice::from_ref(&pk)),
+                || {
+                    Ok(crate::accepted::Accepted::default()
+                        .with_named("path:secret/", std::slice::from_ref(&pk)))
+                },
             )
             .unwrap()
         };
@@ -438,7 +446,7 @@ mod tests {
                 vec![],
                 "secret/".into(),
             )],
-            &crate::accepted::Accepted::default(),
+            || Ok(crate::accepted::Accepted::default()),
         )
         .unwrap_err();
         assert!(

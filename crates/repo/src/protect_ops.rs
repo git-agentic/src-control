@@ -97,7 +97,7 @@ impl Repo {
                 .with_named(&scope, recipients)
                 .require(&scope, &granted)?;
         }
-        self.accept_keys(&scope, recipients)?;
+        self.accept_named_keys(&scope, recipients)?;
         let head = crate::refs::current_branch(self.layout())?;
         let before = crate::refs::read_branch_tip(self.layout(), &head)?;
         // Build the rule's snapshot and the sealing commit on top of it before
@@ -332,6 +332,10 @@ impl Repo {
             e.epoch = epoch;
             e.state = scl_core::RecipientState::Revoked;
         }
+        // Drop the local approval before the ref moves: an interruption between
+        // the two leaves a revoke that did not land and a recipient to revoke
+        // again, never a landed revoke the approval outlives.
+        self.forget_recipient(&crate::accepted::path_scope(prefix), recipient_id)?;
         let head = crate::refs::current_branch(self.layout())?;
         let before = crate::refs::read_branch_tip(self.layout(), &head)?;
         let id = self.commit_snapshot(
@@ -349,7 +353,6 @@ impl Repo {
             &head,
             &[(head.clone(), before, Some(id))],
         )?;
-        self.forget_recipient(&crate::accepted::path_scope(prefix), recipient_id)?;
         Ok(id)
     }
 

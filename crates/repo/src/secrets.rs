@@ -107,8 +107,9 @@ impl Repo {
         }
         check_secret_name(name)?;
         require_recipients(recipients)?;
-        // The caller named these keys, so they are accepted for this secret.
-        self.accept_keys(&crate::accepted::secret_scope(name), recipients)?;
+        // The caller named these keys, so they are accepted for this secret
+        // (the escrow keys a command appends are not recorded).
+        self.accept_named_keys(&crate::accepted::secret_scope(name), recipients)?;
         let secret = scl_crypto::seal(name, value, recipients);
         let id = {
             let arc = self.store_arc();
@@ -213,20 +214,20 @@ impl Repo {
                  use `secret rotate --to <names>` to change the recipient set instead"
             )));
         }
+        // Drop the local approval before the ref moves (see `Repo::revoke`).
+        self.forget_recipient(&crate::accepted::secret_scope(name), recipient)?;
         let new_id = {
             let arc = self.store_arc();
             let i = arc.lock().unwrap().put(Object::Secret(revoked))?;
             i
         };
         reg.insert(name.to_string(), new_id);
-        let id = self.commit_registry(
+        self.commit_registry(
             reg,
             "secret",
             &format!("revoke from {name}"),
             &format!("secret revoke {name}"),
-        )?;
-        self.forget_recipient(&crate::accepted::secret_scope(name), recipient)?;
-        Ok(id)
+        )
     }
 
     /// Rotate a secret's value under a **fresh DEK**, re-sealing for `recipients`.

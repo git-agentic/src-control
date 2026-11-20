@@ -50,7 +50,15 @@ accepted in every scope.
 It is local state like `.sc/local-key`: written atomically (temp file and
 rename) by a command that holds the repo lock, never part of a snapshot, never
 in a pack, never sent by clone, fetch or push, and not read by `sc gc`. `sc ws`
-and `sc work` commit through the host repo, so they use the host's record.
+and `sc work` commit through the host repo, so they use the host's record. Its
+integrity depends on the working-tree path guard (a checkout never writes under
+`.sc/`, fix/sc-path-guard): without it a cloned tree could plant the file.
+
+Escrow keys are never recorded. They count as accepted from the `[escrow]`
+section as it is when a seal is checked, so removing a key from `[escrow]`
+withdraws its acceptance everywhere. The record loads only when something is
+about to be sealed (or accepted, forgotten or checked by a revoke), so a commit
+or a rewrap that wraps nothing does not depend on it being readable.
 
 ### The gate
 
@@ -59,7 +67,11 @@ neither accepted for the seal's scope nor escrow. The error names every
 unaccepted pair: the scope, the recipient id, the local `[recipients]` name or
 `UNKNOWN`, the `sc policy accept` command (with `--allow-unknown` for an
 unknown key; a `path:` scope shows the full key to pass) and the command that
-removes the key from the data:
+removes the key from the data. A scope is a rule prefix, secret name or branch
+name, so the repository controls it: every field is escaped with
+`sanitize_display_line`, and a scope with control characters gets no command
+at all, only a pointer to `sc protect --list`, `sc secret list` or
+`sc branch list`:
 
 ```
 path:secret/sub/ grants a recipient you have not accepted: 3f9a... (UNKNOWN).
@@ -70,7 +82,8 @@ Nothing was written.
 
 Remove is `sc revoke <prefix> --recipient-id <id>`, `sc secret revoke <NAME>
 --recipient-id <id>` or `sc branch revoke <name> --recipient-id <id>
---identity <key>`.
+--identity <key>`. A target that starts with `-` is written flags first and
+after `--` (`sc revoke --recipient-id <id> -- -x/`).
 
 The gate sits where wraps are minted, after the carry-or-seal decision, so a
 carry that copies existing wraps is never gated:
@@ -93,10 +106,16 @@ Only keys the user names on the command line are accepted without asking:
 `sc protect --to`, `sc grant`, `sc secret add`, `sc secret grant`,
 `sc secret rotate --to`, `sc branch --private --to` (and the creator's own
 key) and `sc branch grant`. The library functions behind them record the keys
-they were given; `sc secret rotate --to` does it from the CLI because the
-library cannot tell a named set from one derived from wrap labels. A key that
-comes from repository data, by any route, is never auto-accepted. The local
-revoke commands remove the pair they revoke.
+they were given, minus any key in the current `[escrow]` (a command appends the
+escrow keys to the list it passes in, and those are not the user's choice); the
+CLI then records the keys the user named, so a named key that is also escrow
+survives its removal from `[escrow]`. `sc secret rotate --to` records from the
+CLI because the library cannot tell a named set from one derived from wrap
+labels. A key that comes from repository data, by any route, is never
+auto-accepted. The local revoke commands remove the pair they revoke, after
+validation and before the new ref is published, so an interruption leaves a
+revoke that did not land (retry it), never a landed revoke whose approval
+outlives it.
 
 ### Commands
 
@@ -104,7 +123,9 @@ revoke commands remove the pair they revoke.
 pairs. A key in neither `[recipients]` nor `[escrow]` needs `--allow-unknown`,
 so accepting a key you cannot identify takes a flag you typed. A `path:` scope
 needs the full key: pass the `scl-pk-` string, or an id that resolves through
-`[recipients]` or `[escrow]`.
+`[recipients]` or `[escrow]`. `--allow-unknown` does not lift that: an id with
+no key behind it is an error for a `path:` scope. The batch is checked as a
+whole and written once, so a bad entry leaves the record as it was.
 `sc policy forget <scope> <key>` removes one. Both touch only the local file,
 so both work while a merge, pick or rebase is stopped, and a refused
 completion can be retried after an accept.
