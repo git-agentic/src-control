@@ -1781,11 +1781,9 @@
    "message_contains": [
     "getorgbyname"
    ],
-   "ignore_fields": [
-    "errors"
-   ]
+   "ignore_body": true
   },
-  "reason": "sc-forge answers a private organization the caller cannot see exactly like a missing one (404 GetOrgByName); Gitea's 'HasOrgOrUserVisible' tells the two apart [ignore_fields: errors is the missing-organization list, not null]"
+  "reason": "sc-forge answers a private organization the caller cannot see exactly like a missing one (404 GetOrgByName); Gitea's 'HasOrgOrUserVisible' tells the two apart [ignore_body: `errors` is the missing-organization list, the recorded one is null]"
  },
  {
   "scenario": "K",
@@ -1797,10 +1795,8 @@
    "message_contains": [
     "getorgbyname"
    ],
-   "ignore_fields": [
-    "errors"
-   ]
+   "ignore_body": true
   },
-  "reason": "sc-forge answers a private organization the caller cannot see exactly like a missing one (404 GetOrgByName); Gitea's 'HasOrgOrUserVisible' tells the two apart [ignore_fields: errors is the missing-organization list, not null]"
+  "reason": "sc-forge answers a private organization the caller cannot see exactly like a missing one (404 GetOrgByName); Gitea's 'HasOrgOrUserVisible' tells the two apart [ignore_body: `errors` is the missing-organization list, the recorded one is null]"
  }
 ]
