@@ -17,6 +17,127 @@ use crate::stdio_transport::open_transport;
 use crate::transport::Transport;
 use crate::worktree;
 
+/// What a clone destination is, as [`claim_clone_dir`] found or made it: the
+/// directories this invocation created (missing parents first, then the
+/// destination itself) and whether it created `.sc/`, so a failed clone can
+/// remove exactly those and nothing else.
+#[derive(Debug)]
+pub struct CloneClaim {
+    dst: std::path::PathBuf,
+    made: Vec<std::path::PathBuf>,
+    /// `.sc/` was created by this invocation's exclusive `create_dir`.
+    sc_made: bool,
+}
+
+/// The empty-directory rule for an existing clone destination (as `git clone`
+/// requires). A non-empty one is refused, which also keeps a symlink or
+/// junction already inside it from redirecting the checkout's writes.
+fn ensure_empty_dir(dst: &Path) -> Result<()> {
+    if std::fs::metadata(dst).is_ok_and(|m| m.is_dir()) && std::fs::read_dir(dst)?.next().is_none()
+    {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "destination path '{}' already exists and is not an empty directory",
+        dst.display()
+    )))
+}
+
+/// Claim the clone destination. An existing destination must be an empty
+/// directory ([`ensure_empty_dir`]). Missing parents are created one
+/// `create_dir` at a time, and the destination itself always goes through
+/// `create_dir` too: `Ok` means this call made it and each such directory is
+/// recorded; `AlreadyExists` (it was there, or appeared since we looked) gets
+/// the empty-directory check instead of being trusted. Ownership never comes
+/// from `exists()`, which a race or a metadata error can get wrong.
+pub fn claim_clone_dir(dst: &Path) -> Result<CloneClaim> {
+    let mut claim = CloneClaim {
+        dst: dst.to_path_buf(),
+        made: Vec::new(),
+        sc_made: false,
+    };
+    // Missing ancestors of the destination, outermost first.
+    let mut parents: Vec<&Path> = dst
+        .ancestors()
+        .skip(1)
+        .take_while(|p| {
+            !p.as_os_str().is_empty()
+                && matches!(p.symlink_metadata(), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        })
+        .collect();
+    parents.reverse();
+    let result = (|| -> Result<()> {
+        for dir in parents {
+            match std::fs::create_dir(dir) {
+                Ok(()) => claim.made.push(dir.to_path_buf()),
+                // Made by someone else since we looked: theirs, not ours. A
+                // non-directory there fails the destination's `create_dir`.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        match std::fs::create_dir(dst) {
+            Ok(()) => claim.made.push(dst.to_path_buf()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => ensure_empty_dir(dst)?,
+            Err(e) => return Err(e.into()),
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok(claim),
+        Err(e) => {
+            discard_failed_clone(&claim);
+            Err(e)
+        }
+    }
+}
+
+impl CloneClaim {
+    /// Create the repository in the claimed destination, owning `.sc/` by
+    /// creating it exclusively (`create_dir`; `AlreadyExists` means another
+    /// process's, reported as `RepoExists`, and it is never removed by
+    /// [`discard_failed_clone`]). Two initializers can both pass an
+    /// existence check, so cleanup of `.sc/` is allowed only for the one whose
+    /// `create_dir` succeeded.
+    pub fn init_repo(&mut self) -> Result<Repo> {
+        let dot_sc = self.dst.join(".sc");
+        match std::fs::create_dir(&dot_sc) {
+            Ok(()) => self.sc_made = true,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(Error::RepoExists(dot_sc.display().to_string()));
+            }
+            Err(e) => return Err(e.into()),
+        }
+        Repo::init_in_claimed_dot_sc(&self.dst)
+    }
+}
+
+/// Take a failed clone back out of the claimed destination, removing only what
+/// this invocation made: its own `.sc/` (only if [`CloneClaim::init_repo`]
+/// created it), then the destination and any parents the claim created,
+/// deepest first, each only while empty (`remove_dir`, never `remove_dir_all`).
+/// A directory that is not empty is left in place and named on stderr. Best
+/// effort; the caller reports the clone's own error, not this one, and should
+/// call it while still holding the clone's repo lock (a concurrent open cannot
+/// then take the lock in a gap and have its repo deleted).
+pub fn discard_failed_clone(claim: &CloneClaim) {
+    if claim.sc_made {
+        let _ = std::fs::remove_dir_all(claim.dst.join(".sc"));
+    }
+    for dir in claim.made.iter().rev() {
+        if let Err(e) = std::fs::remove_dir(dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "sc: clone failed; left {} in place (not empty)",
+                    dir.display()
+                );
+                // A parent of a directory we could not remove cannot be empty.
+                break;
+            }
+        }
+    }
+}
+
 impl Repo {
     /// Add a named remote to `.sc/config`. The name becomes a path component
     /// under `refs/remotes/`, so it is validated like a branch name to keep a
@@ -73,8 +194,9 @@ impl Repo {
     /// gapped (never-transferred) out-of-filter blobs and fail with
     /// `NotFound` — the sparse spec is what tells `materialize` to skip them.
     ///
-    /// On `Err`, `dst` may be left with a partially-initialized `.sc/`; the
-    /// caller should remove it before retrying.
+    /// An existing destination must be an empty directory. On `Err` the clone
+    /// is taken back out ([`discard_failed_clone`]): its `.sc/`, and the
+    /// destination and parents this call created while they are empty.
     pub fn clone_url_filtered(
         src_url: &str,
         dst: impl AsRef<Path>,
@@ -122,123 +244,145 @@ impl Repo {
         let remote_refs = transport.list_refs()?;
         let head_branch = transport.head_branch()?;
 
-        let dst_repo = Repo::init(dst.as_ref())?;
-
-        // Transfer every (in-filter, when filtered) object reachable from
-        // the remote's branch tips.
-        let tips: Vec<ObjectId> = remote_refs.iter().map(|(_, id)| *id).collect();
-        {
-            let store_arc = dst_repo.vfs.store();
-            let mut store = store_arc.lock().unwrap();
-            // Fresh clone dst has no local refs yet → no haves → full transfer
-            // (of whatever `filter` scopes it to).
-            transfer_objects_opts(
-                &dst_repo.layout,
-                transport.as_ref(),
-                &mut store,
-                &tips,
-                &[],
-                filter,
-                no_transcripts,
-            )?;
-            // Clone-specific belt-and-suspenders (P22 Task 3): the transfer
-            // above already indexes every signature object it wrote via
-            // `index_incoming`, but a fresh clone is a wholesale copy of the
-            // whole (in-filter) reachable set — cheap and simplest to instead
-            // trust a full post-copy scan of what actually landed on disk,
-            // rather than depending on the transfer call site's exact
-            // bookkeeping. Idempotent: `reindex` rewrites the index from
-            // scratch, so running it after `index_incoming` already populated
-            // entries is a no-op on top of a no-op, not a double-count.
-            crate::signatures::reindex(&dst_repo.layout, &mut store)?;
-            // Clone-specific belt-and-suspenders (P30 Task 4): same
-            // full-store-scan reindex, for the transcript index.
-            crate::transcripts::reindex(&dst_repo.layout, &mut store)?;
-        }
-
-        // Copy branches + HEAD, and seed origin/* remote-tracking refs so
-        // `merge origin/<branch>` resolves immediately and `fetch` has a baseline.
-        // Filtered clones exclude private branches entirely (ADR-0044): the
-        // server dropped manifest wants from the pack, so a private ref's
-        // target never landed — skip the ref rather than minting a dangling
-        // one. Full clones carry private refs (ciphertext + manifest) intact.
-        for (branch, tip) in &remote_refs {
-            if filter.is_some() && !dst_repo.vfs.store().lock().unwrap().contains(tip) {
-                continue;
+        let mut claim = claim_clone_dir(dst.as_ref())?;
+        let dst_repo = match claim.init_repo() {
+            Ok(r) => r,
+            Err(e) => {
+                // Removes `.sc/` only if `init_repo` created it exclusively.
+                discard_failed_clone(&claim);
+                return Err(e);
             }
-            refs::write_branch_tip(&dst_repo.layout, branch, tip)?;
-            refs::write_remote_tip(&dst_repo.layout, "origin", branch, tip)?;
-        }
-        // The remote's HEAD branch may itself have been excluded (private):
-        // fall back to any branch that survived.
-        let head_branch = if dst_repo.layout.ref_path(&head_branch).exists() {
-            head_branch
-        } else {
-            dst_repo
-                .branches()?
-                .first()
-                .map(|(n, _)| n.clone())
-                .unwrap_or(head_branch)
         };
-        refs::write_head(&dst_repo.layout, &head_branch)?;
-
-        // Record origin.
-        dst_repo.remote_add("origin", src_url)?;
-
-        // Partial clone: persist the durable fetch-filter marker + a matching
-        // sparse spec BEFORE the final materialize (see doc comment above for
-        // why the ordering matters). A full clone keeps the pre-P27 behavior
-        // exactly: no `.sc/promisor`, and `Sparse::default()` (full
-        // materialization) rather than `dst_repo.sparse_spec()` — clone still
-        // doesn't transfer a pre-existing `.sc/sparse` from the source (out
-        // of P24 scope, sparse config is local like `.scignore`).
-        let sparse_spec = match filter {
-            Some(_) => {
-                let promisor = match blob_limit {
-                    Some(limit) => crate::promisor::Promisor::with_blob_limit(
-                        src_url,
-                        prefixes.to_vec(),
-                        limit,
-                    ),
-                    None => crate::promisor::Promisor::new(src_url, prefixes.to_vec()),
-                };
-                crate::promisor::store(&dst_repo.layout, &promisor)?;
-                // A size-only clone has no prefixes: the view stays full.
-                let sparse = crate::sparse::Sparse::new(prefixes.to_vec());
-                crate::sparse::store(&dst_repo.layout, &sparse)?;
-                sparse
+        // Anything that fails from here leaves a half-built clone: take it
+        // back out, as `git clone` does, while still holding the repo lock.
+        let result = (|| -> Result<()> {
+            // Transfer every (in-filter, when filtered) object reachable from
+            // the remote's branch tips.
+            let tips: Vec<ObjectId> = remote_refs.iter().map(|(_, id)| *id).collect();
+            {
+                let store_arc = dst_repo.vfs.store();
+                let mut store = store_arc.lock().unwrap();
+                // Fresh clone dst has no local refs yet → no haves → full transfer
+                // (of whatever `filter` scopes it to).
+                transfer_objects_opts(
+                    &dst_repo.layout,
+                    transport.as_ref(),
+                    &mut store,
+                    &tips,
+                    &[],
+                    filter,
+                    no_transcripts,
+                )?;
+                // Clone-specific belt-and-suspenders (P22 Task 3): the transfer
+                // above already indexes every signature object it wrote via
+                // `index_incoming`, but a fresh clone is a wholesale copy of the
+                // whole (in-filter) reachable set — cheap and simplest to instead
+                // trust a full post-copy scan of what actually landed on disk,
+                // rather than depending on the transfer call site's exact
+                // bookkeeping. Idempotent: `reindex` rewrites the index from
+                // scratch, so running it after `index_incoming` already populated
+                // entries is a no-op on top of a no-op, not a double-count.
+                crate::signatures::reindex(&dst_repo.layout, &mut store)?;
+                // Clone-specific belt-and-suspenders (P30 Task 4): same
+                // full-store-scan reindex, for the transcript index.
+                crate::transcripts::reindex(&dst_repo.layout, &mut store)?;
             }
-            None => crate::sparse::Sparse::default(),
-        };
 
-        // Materialize HEAD into the working tree. No identity is available at
-        // clone time, so PROTECTED files are skipped (ciphertext stays in objects
-        // but plaintext is not written to disk — correct for unauthorized clones).
-        // A private HEAD branch (manifest tip, ADR-0044) is not materialized at
-        // all: checkout needs a recipient identity — `sc switch <branch>
-        // --identity <key>` after the clone.
-        if let Some(head_tip) = dst_repo.head_tip()? {
-            if dst_repo.manifest_at(&head_tip)?.is_some() {
-                return Ok(dst_repo);
+            // Copy branches + HEAD, and seed origin/* remote-tracking refs so
+            // `merge origin/<branch>` resolves immediately and `fetch` has a baseline.
+            // Filtered clones exclude private branches entirely (ADR-0044): the
+            // server dropped manifest wants from the pack, so a private ref's
+            // target never landed — skip the ref rather than minting a dangling
+            // one. Full clones carry private refs (ciphertext + manifest) intact.
+            for (branch, tip) in &remote_refs {
+                if filter.is_some() && !dst_repo.vfs.store().lock().unwrap().contains(tip) {
+                    continue;
+                }
+                refs::write_branch_tip(&dst_repo.layout, branch, tip)?;
+                refs::write_remote_tip(&dst_repo.layout, "origin", branch, tip)?;
             }
-            let store_arc = dst_repo.vfs.store();
-            let mut store = store_arc.lock().unwrap();
-            let head_snap = store.get_snapshot(&head_tip)?;
-            let head_root = head_snap.root;
-            let head_protection = head_snap.protection;
-            // ensure-view-exempt: clone: the lazy marker is set after the clone, and the materialize preflight covers it
-            worktree::materialize(
-                &dst_repo.layout,
-                &mut store,
-                head_root,
-                None,
-                &head_protection,
-                None,
-                &sparse_spec,
-                None,
-            )?;
+            // The remote's HEAD branch may itself have been excluded (private):
+            // fall back to any branch that survived.
+            let head_branch = if dst_repo.layout.ref_path(&head_branch).exists() {
+                head_branch
+            } else {
+                dst_repo
+                    .branches()?
+                    .first()
+                    .map(|(n, _)| n.clone())
+                    .unwrap_or(head_branch)
+            };
+            refs::write_head(&dst_repo.layout, &head_branch)?;
+
+            // Record origin.
+            dst_repo.remote_add("origin", src_url)?;
+
+            // Partial clone: persist the durable fetch-filter marker + a matching
+            // sparse spec BEFORE the final materialize (see doc comment above for
+            // why the ordering matters). A full clone keeps the pre-P27 behavior
+            // exactly: no `.sc/promisor`, and `Sparse::default()` (full
+            // materialization) rather than `dst_repo.sparse_spec()` — clone still
+            // doesn't transfer a pre-existing `.sc/sparse` from the source (out
+            // of P24 scope, sparse config is local like `.scignore`).
+            let sparse_spec = match filter {
+                Some(_) => {
+                    let promisor = match blob_limit {
+                        Some(limit) => crate::promisor::Promisor::with_blob_limit(
+                            src_url,
+                            prefixes.to_vec(),
+                            limit,
+                        ),
+                        None => crate::promisor::Promisor::new(src_url, prefixes.to_vec()),
+                    };
+                    crate::promisor::store(&dst_repo.layout, &promisor)?;
+                    // A size-only clone has no prefixes: the view stays full.
+                    let sparse = crate::sparse::Sparse::new(prefixes.to_vec());
+                    crate::sparse::store(&dst_repo.layout, &sparse)?;
+                    sparse
+                }
+                None => crate::sparse::Sparse::default(),
+            };
+
+            // Materialize HEAD into the working tree. No identity is available at
+            // clone time, so PROTECTED files are skipped (ciphertext stays in objects
+            // but plaintext is not written to disk — correct for unauthorized clones).
+            // A private HEAD branch (manifest tip, ADR-0044) is not materialized at
+            // all: checkout needs a recipient identity — `sc switch <branch>
+            // --identity <key>` after the clone.
+            if let Some(head_tip) = dst_repo.head_tip()? {
+                if dst_repo.manifest_at(&head_tip)?.is_some() {
+                    return Ok(());
+                }
+                let store_arc = dst_repo.vfs.store();
+                let mut store = store_arc.lock().unwrap();
+                let head_snap = store.get_snapshot(&head_tip)?;
+                let head_root = head_snap.root;
+                let head_protection = head_snap.protection;
+                // ensure-view-exempt: clone: the lazy marker is set after the clone, and the materialize preflight covers it
+                worktree::materialize(
+                    &dst_repo.layout,
+                    &mut store,
+                    head_root,
+                    None,
+                    &head_protection,
+                    None,
+                    &sparse_spec,
+                    None,
+                )?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(dst_repo),
+            Err(e) => {
+                // Remove `.sc/` while `dst_repo` still holds the repo lock, so
+                // a concurrent `Repo::open` cannot take it in a gap and have
+                // its repo deleted; the lock file goes with the directory.
+                discard_failed_clone(&claim);
+                drop(dst_repo);
+                Err(e)
+            }
         }
-        Ok(dst_repo)
     }
 
     /// Backfill: widen a partial clone by fetching every object matching

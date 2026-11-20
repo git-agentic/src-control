@@ -208,6 +208,7 @@ fn walk_entries(
         } else {
             format!("{prefix}/{}", e.name)
         };
+        check_tree_entry_path(&path)?;
         match e.kind {
             EntryKind::Blob => {
                 out.insert(path, (e.id, e.mode));
@@ -286,6 +287,7 @@ fn walk_entries_with_perms_sparse(
         } else {
             format!("{prefix}/{}", e.name)
         };
+        check_tree_entry_path(&path)?;
         match e.kind {
             EntryKind::Blob => {
                 if sparse.matches(&path) {
@@ -456,6 +458,7 @@ fn walk_entries_with_perms(
         } else {
             format!("{prefix}/{}", e.name)
         };
+        check_tree_entry_path(&path)?;
         match e.kind {
             EntryKind::Blob => {
                 out.insert(path, (e.id, e.mode, e.perms));
@@ -544,6 +547,7 @@ fn walk_tree_sparse(
         } else {
             format!("{prefix}/{}", e.name)
         };
+        check_tree_entry_path(&path)?;
         match e.kind {
             EntryKind::Blob => {
                 if sparse.matches(&path) {
@@ -573,6 +577,7 @@ fn walk_tree(
         } else {
             format!("{prefix}/{}", e.name)
         };
+        check_tree_entry_path(&path)?;
         match e.kind {
             EntryKind::Blob => {
                 out.insert(path, e.id);
@@ -701,22 +706,43 @@ pub(crate) fn diff_worktree(
     Ok(diff)
 }
 
-/// Join a tree-relative path onto `root`, rejecting any component that could
-/// escape the repo root (`..`, `.`, empty, or an absolute path). A committed
-/// tree is attacker-influenced data, so an unsafe relpath is a hard error
-/// rather than a silent skip — otherwise a malicious tree could write or delete
-/// files anywhere on disk during `materialize`. `pub(crate)` so the conflicted
-/// merge path (Task 6, P15) can write plaintext marker files straight to the
-/// working tree with the same traversal guard.
-pub(crate) fn safe_join(root: &Path, rel: &str) -> Result<std::path::PathBuf> {
-    for comp in rel.split('/') {
-        if comp.is_empty() || comp == "." || comp == ".." {
-            return Err(crate::error::Error::BadRef(format!(
-                "unsafe path in tree: {rel}"
-            )));
+/// Refuse a tree path that must never be written under the working tree
+/// (traversal, NUL, the `.sc` control directory or an alias of it, and on
+/// Windows a separator or drive marker), as the typed
+/// [`scl_core::Error::UnsafePath`]. The flatteners below call it on every
+/// entry they produce, so a write-out refuses before its first write.
+pub(crate) fn check_tree_entry_path(rel: &str) -> Result<()> {
+    scl_core::check_tree_path(rel, cfg!(windows)).map_err(|reason| {
+        scl_core::Error::UnsafePath {
+            path: rel.to_string(),
+            reason,
         }
-    }
+        .into()
+    })
+}
+
+/// Join a tree-relative path onto `root`, rejecting any path
+/// [`check_tree_entry_path`] refuses: a component that could escape the repo
+/// root (`..`, `.`, empty, an absolute path, on Windows a `\` or drive
+/// prefix) or reach the `.sc` control directory. A committed tree is
+/// attacker-influenced data, so an unsafe relpath is a hard error rather than
+/// a silent skip. The flatteners already refuse before the first write; this
+/// is the backstop at the join itself. `pub(crate)` so the conflicted merge
+/// path (Task 6, P15) can write plaintext marker files straight to the working
+/// tree with the same guard.
+pub(crate) fn safe_join(root: &Path, rel: &str) -> Result<std::path::PathBuf> {
+    check_tree_entry_path(rel)?;
     Ok(root.join(rel))
+}
+
+/// Check that every path `root` lays out under `sparse` is one a checkout may
+/// write ([`check_tree_entry_path`]), for a command that changes the
+/// filesystem before its own materialize would refuse (`sc ws fork` clears the
+/// old session directory and mints `.sc/local-key`; `sc work` creates its
+/// session root). Reads only. Call it after [`preflight_view`], so on a partial
+/// clone the view's trees are known to be present.
+pub(crate) fn preflight_paths(store: &mut Store, root: ObjectId, sparse: &Sparse) -> Result<()> {
+    tree_file_entries_with_perms_sparse(store, root, sparse).map(|_| ())
 }
 
 /// Check, before anything is written, that every object the sparse view needs
@@ -784,6 +810,7 @@ pub(crate) fn preflight_view(
             } else {
                 format!("{path}/{}", e.name)
             };
+            check_tree_entry_path(&child)?;
             match e.kind {
                 EntryKind::Blob => {
                     if sparse.matches(&child) && !store.contains(&e.id) {
@@ -945,12 +972,16 @@ pub(crate) fn under_symlink(root: &Path, rel: &str) -> bool {
     let mut end = 0;
     while let Some(i) = rel[end..].find('/') {
         end += i;
-        if root
-            .join(&rel[..end])
-            .symlink_metadata()
-            .is_ok_and(|m| m.is_symlink())
-        {
-            return true;
+        // Fail closed: a lstat error other than "nothing there" (also when a
+        // parent is a file) reads as blocked, not as "not a symlink".
+        match root.join(&rel[..end]).symlink_metadata() {
+            Ok(m) if !m.is_symlink() => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            _ => return true,
         }
         end += 1;
     }
@@ -1238,10 +1269,28 @@ fn materialize_impl(
     // clone never fetched out-of-filter subtrees at all, so an unfiltered
     // walk here would `NotFound` on them.
     let target = tree_file_entries_with_perms_sparse(store, target_root, sparse)?;
+    // Before the first write, whatever `old_root` is (an unborn merge or a clone
+    // has none, so the obstruction checks below do not run): a symlink among a
+    // written path's parents would carry the write out of its directory, e.g.
+    // `link -> .sc` or a directory outside the checkout. Never followed. A
+    // forward operation refuses; a restore (an abort) finishes anyway, so it
+    // leaves such a path alone and reports it in `kept`.
+    let mut through_link: BTreeSet<String> = BTreeSet::new();
+    for path in target.keys().filter(|p| sparse.matches(p)) {
+        if under_symlink(&layout.root, path) {
+            if restore_owned.is_none() {
+                return Err(Error::InvalidArgument(format!(
+                    "cannot write {path}: a parent directory is a symlink; \
+                     move it away, then retry"
+                )));
+            }
+            through_link.insert(path.clone());
+        }
+    }
     // Set when an interrupted `sparse set`'s marker widened the removal bound;
     // cleared once this call has finished laying the tree out under `sparse`.
     let mut prev_marker_used = false;
-    let mut kept = Vec::new();
+    let mut kept: Vec<String> = through_link.iter().cloned().collect();
     // Paths the replaced tree tracks (within the removal walk's bound), with
     // their blob ids.
     let mut old_tracked: BTreeMap<String, ObjectId> = BTreeMap::new();
@@ -1310,7 +1359,10 @@ fn materialize_impl(
         // may hold only directories and files this pass is about to delete.
         // Anything else is the user's, and refusing now (rather than at the
         // write, after the pass and earlier writes) changes nothing (#247).
-        for path in target.keys().filter(|p| sparse.matches(p)) {
+        for path in target
+            .keys()
+            .filter(|p| sparse.matches(p) && !through_link.contains(*p))
+        {
             let full = safe_join(&layout.root, path)?;
             if full.symlink_metadata().is_ok_and(|m| m.is_dir())
                 && !dir_clearable(&full, path, &|c| removals.contains(c))
@@ -1323,7 +1375,9 @@ fn materialize_impl(
         }
         refuse_blocked_parents(
             &layout.root,
-            target.keys().filter(|p| sparse.matches(p)),
+            target
+                .keys()
+                .filter(|p| sparse.matches(p) && !through_link.contains(*p)),
             &|c| removals.contains(c),
         )?;
         for p in removals {
@@ -1340,7 +1394,7 @@ fn materialize_impl(
     }
     let mut skipped = Vec::new();
     for (path, (blob_id, mode, perms)) in &target {
-        if !sparse.matches(path) {
+        if !sparse.matches(path) || through_link.contains(path) {
             continue;
         }
         let full = safe_join(&layout.root, path)?;
@@ -1654,7 +1708,13 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(matches!(err, crate::error::Error::BadRef(_)), "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Core(scl_core::Error::UnsafePath { .. })
+            ),
+            "got {err:?}"
+        );
         // Nothing was written outside the repo root: the sibling "<root>.." path
         // would be the repo's parent dir; assert no stray "pwned" file landed there.
         let escaped = layout.root.parent().unwrap().join("pwned");

@@ -3996,21 +3996,42 @@ fn run_clone_git(url: &str, dst: &std::path::Path) -> Result<()> {
         );
     }
 
-    std::fs::create_dir_all(dst)?;
-    let repo = scl_repo::Repo::init(dst)?;
-    repo.remote_add_git("origin", url)?;
+    // An existing destination must be an empty directory (git parity).
+    let mut claim = scl_repo::sync::claim_clone_dir(dst)?;
+    let repo = match claim.init_repo() {
+        Ok(r) => r,
+        Err(e) => {
+            // Removes `.sc/` only if `init_repo` created it exclusively.
+            scl_repo::sync::discard_failed_clone(&claim);
+            return Err(e.into());
+        }
+    };
+    // A failed clone takes itself back out, as `git clone` does, while `repo`
+    // still holds the repo lock.
+    let adopted = (|| -> Result<String> {
+        repo.remote_add_git("origin", url)?;
 
-    // Sync the mirror, then point the unborn HEAD at the remote's default
-    // branch name BEFORE fetching, so the tracking ref and local branch agree.
-    let mirror = git_remote_effective_path(&repo, "origin", url, true)?;
-    let default = scl_gitio::bridge::remote_default_branch(&mirror)?;
-    scl_repo::refs::write_head(repo.layout(), &default)?;
+        // Sync the mirror, then point the unborn HEAD at the remote's default
+        // branch name BEFORE fetching, so the tracking ref and local branch agree.
+        let mirror = git_remote_effective_path(&repo, "origin", url, true)?;
+        let default = scl_gitio::bridge::remote_default_branch(&mirror)?;
+        scl_repo::refs::write_head(repo.layout(), &default)?;
 
-    run_fetch_git(&repo, "origin")?;
-    // Adopt: merge the tracking ref into the unborn branch (ADR-0018's
-    // unborn fast-forward). Author resolution mirrors run_merge's.
-    let author = resolve_author(None);
-    repo.merge(&format!("origin/{default}"), &author)?;
+        run_fetch_git(&repo, "origin")?;
+        // Adopt: merge the tracking ref into the unborn branch (ADR-0018's
+        // unborn fast-forward). Author resolution mirrors run_merge's.
+        let author = resolve_author(None);
+        repo.merge(&format!("origin/{default}"), &author)?;
+        Ok(default)
+    })();
+    let default = match adopted {
+        Ok(default) => default,
+        Err(e) => {
+            scl_repo::sync::discard_failed_clone(&claim);
+            drop(repo);
+            return Err(e);
+        }
+    };
     println!("cloned {url} into {} (branch {default})", dst.display());
     Ok(())
 }
@@ -5378,6 +5399,80 @@ mod tests {
              (spawn error should name $SC_SSH), got: {err}"
         );
 
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A Git repo that tracks `.sc/recipients.toml` must not get that file into
+    /// the cloner's `.sc/`: the clone fails and takes its directory back out.
+    #[test]
+    fn clone_of_a_git_repo_tracking_a_control_file_is_refused() {
+        let _g = GIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let root = std::env::temp_dir().join(format!("scl-cli-gitplant-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let hub = root.join("hub.git");
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "main", hub.to_str().unwrap()])
+            .status()
+            .unwrap();
+        let seed = root.join("seed");
+        std::process::Command::new("git")
+            .args(["init", "-b", "main", seed.to_str().unwrap()])
+            .status()
+            .unwrap();
+        std::fs::create_dir_all(seed.join(".sc")).unwrap();
+        std::fs::write(seed.join(".sc/recipients.toml"), "planted").unwrap();
+        std::fs::write(seed.join("a.txt"), "x").unwrap();
+        for args in [
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "seed",
+            ],
+        ] {
+            std::process::Command::new("git")
+                .current_dir(&seed)
+                .args(&args)
+                .status()
+                .unwrap();
+        }
+        std::process::Command::new("git")
+            .current_dir(&seed)
+            .args(["push", &format!("file://{}", hub.display()), "main"])
+            .status()
+            .unwrap();
+
+        let dst = root.join("victim");
+        let err = run_clone_git(&format!("file://{}", hub.display()), &dst).unwrap_err();
+        assert!(
+            err.to_string().contains("unsafe path"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!dst.exists(), "the failed clone removes its directory");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Git parity: `sc clone` into a non-empty directory is refused before any
+    /// network or write, so a symlink already in it cannot redirect the checkout.
+    #[test]
+    fn clone_git_into_a_non_empty_directory_is_refused() {
+        let root = std::env::temp_dir().join(format!("scl-cli-nonempty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("mine.txt"), "keep me").unwrap();
+        let err = run_clone_git("file:///nonexistent/hub.git", &root).unwrap_err();
+        assert!(
+            err.to_string().contains("not an empty directory"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(std::fs::read(root.join("mine.txt")).unwrap(), b"keep me");
+        assert!(!root.join(".sc").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

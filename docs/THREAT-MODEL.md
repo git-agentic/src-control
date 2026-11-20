@@ -785,9 +785,13 @@ protected paths, plaintext.
     before any write, to lay a file or directory onto an untracked or ignored
     one (`refuse_untracked_overwrite`), including a path outside the sparse
     view that the result adds (#248, #251). A refusal changes nothing; move the
-    file away and retry. Not guarded: merging into an unborn branch, and the
-    conflict stop of a merge into a private branch (it checks only out-of-view
-    paths, and refuses a `.theirs` sidecar onto an existing file).
+    file away and retry. Not guarded: merging into an unborn branch (and a
+    clone), except that every `materialize` refuses, before its first write, a
+    path with a symlink among its parent directories, so a remote entry
+    `link/x` cannot write through a user's `link -> .sc` or out of the
+    checkout; and the conflict stop of a merge into a private branch (it checks
+    only out-of-view paths, and refuses a `.theirs` sidecar onto an existing
+    file).
   - A stop's `materialize` deletes or overwrites a path only if the tree it
     replaces tracks it and the disk copy is a regular file with exactly the
     tracked bytes, or the stop itself recorded the path (`.sc/CONFLICT_PLAINTEXT`,
@@ -795,7 +799,9 @@ protected paths, plaintext.
     laid. An edit, a replacement or a symlink survives (#255, #256, #259).
   - `merge --abort`, `cherry-pick --abort` and `rebase --abort` finish past a
     kept resolution edit instead of refusing, so it cannot trap the user in the
-    stop (a directory holding untracked content, or a blocked parent, still refuses):
+    stop (a directory holding untracked content, or a file of yours where a
+    directory must be, still refuses; a path with a symlink among its parents is
+    left alone and reported in `kept`, never written through):
     they restore the tip, drop the stop's state and return an `AbortReport`
     whose `kept` paths (changed since the stop) and `skipped` protected paths
     `sc` prints. Recorded plaintext and sidecars are removed whatever their
@@ -813,6 +819,25 @@ protected paths, plaintext.
     private-branch) refuse it with `FileDirCollision` before any tree is written,
     for commit, merge completion, `sc ws harvest` and `sc ws refresh`. Remove the
     directory and retry.
+  - A tree path is never written if it could reach the `.sc/` control directory
+    or leave the checkout. A tree comes from a peer and decode accepts any entry
+    name, so `scl_core::check_tree_path` refuses, per component, an empty, `.`,
+    `..` or NUL name, `.sc` at any depth under its filesystem aliases (HFS
+    ignorable code points, NTFS `:stream`, trailing dots and spaces, Unicode case
+    folding such as `.ſc` on APFS, the 8.3 short names `sc~1` to `sc~4` and
+    `sc<4 hex>~1` to `~9`), and on Windows any `\` or `:`. The tree flatteners and
+    `safe_join` apply it before the first write (`sc ws fork` and `sc work` check
+    first, before they touch the filesystem), so clone, switch, merge, undo and
+    `scl_vfs::Worktree::checkout` refuse with `UnsafePath` before any
+    working-tree write or ref move; both tree builders refuse to commit such a
+    path. The guarantee covers working-tree writes and refs, not every file: an
+    unborn merge can mint `.sc/local-key` before the refusal, and a lazy fill can
+    keep the (hash-verified) objects it fetched. A native clone writes branch
+    refs and HEAD in its new `.sc/` before the path check; a failed clone removes
+    them with the `.sc/` (it holds the repo lock until then). It removes only
+    what it made: a `.sc/` it created exclusively, and the destination and
+    parents it created while they are empty. An existing clone destination must
+    be an empty directory.
 - **Not enforced (known limits):**
   - A user file whose bytes equal the tracked or laid ones cannot be told from
     the stop's own write, so it is removed.

@@ -299,7 +299,9 @@ fn abort_never_writes_through_a_symlink_where_a_directory_must_be() {
     std::fs::create_dir_all(&outside).unwrap();
     std::fs::remove_file(root.join("zz")).unwrap();
     std::os::unix::fs::symlink(&outside, root.join("zz")).unwrap();
-    repo.merge_abort().unwrap_err();
+    // The abort finishes: the path under the link is left alone and reported.
+    let report = repo.merge_abort().unwrap();
+    assert!(report.kept.contains(&"zz/a".to_string()), "{report:?}");
     assert!(!outside.join("a").exists(), "wrote through the symlink");
     std::fs::remove_dir_all(&outside).unwrap();
     finish(&root, repo);
@@ -354,6 +356,36 @@ fn abort_keeps_a_symlink_at_a_recorded_protected_path() {
         .is_symlink());
     assert_eq!(report.kept, vec!["secret/new.txt".to_string()]);
     finish(&root, repo);
+}
+
+/// The user replaced a tracked directory with a symlink after the stop: the
+/// abort still finishes, writes nothing through the link, and reports the
+/// paths under it as kept. (A forward operation refuses such a path.)
+#[cfg(unix)]
+#[test]
+fn abort_keeps_paths_under_a_symlink_that_replaced_a_tracked_directory() {
+    for op in OPS {
+        let (root, repo) = stopped("dir-symlink", op, false);
+        let outside = root_for("dir-symlink-outside", op);
+        std::fs::remove_dir_all(root.join("docs")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("docs")).unwrap();
+        let report = abort(&repo, op);
+        for p in ["docs/d.txt", "docs/e.txt"] {
+            assert!(report.kept.contains(&p.to_string()), "{op:?}: {report:?}");
+        }
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            0,
+            "{op:?}: nothing was written through the link"
+        );
+        assert!(root.join("docs").symlink_metadata().unwrap().is_symlink());
+        assert!(
+            !root.join(laid(op)).exists(),
+            "{op:?}: the rest still aborts"
+        );
+        std::fs::remove_dir_all(&outside).unwrap();
+        finish(&root, repo);
+    }
 }
 
 #[test]
