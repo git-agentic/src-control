@@ -39,6 +39,20 @@ too, not just the src-control-side metadata.
   same-user process can still read the child's descriptor table, and the child
   decides what to do with what it read. Env stays the default for `sc run`,
   `sc work --with-secrets` and `sc ws run --with-secrets`.
+- **The registry is repository data, so injection validates it.** `secret_add`
+  needs no key: any writer can register a secret sealed to your public key under
+  any name. A secret name must therefore match `[A-Za-z_][A-Za-z0-9_]*` and not
+  be a variable that changes how a process loads code or which program runs
+  (`PATH`, `LD_*`, `DYLD_*`, `NODE_OPTIONS`, `GIT_CONFIG*`, `SC_*`, and the other
+  names in `secrets.rs`). `secret_add` refuses such a name, and every injecting
+  path (`sc run`, `--secrets-fd`, `sc ws run --with-secrets`,
+  `sc work --with-secrets`) refuses the whole run, before decrypting anything and
+  before any child starts, when a registry key fails the rule or differs from the
+  `name` the secret was sealed under (the AEAD binds that name). **Residual:** a
+  writer can still replace the value of an allowed name (say `DATABASE_URL`) with
+  one sealed to you, so the child connects where the writer chose. The registry
+  is not authenticated; review registry changes like code, and use `sc verify
+  --require` on the commits you run from.
 - **Rotation ≠ erasure:** `sc secret rotate` re-seals under a fresh DEK and cuts
   off future reads through the current registry, but the old ciphertext object
   remains reachable and decryptable by anyone who kept the old DEK. `sc secret

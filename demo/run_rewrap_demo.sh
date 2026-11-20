@@ -46,9 +46,9 @@ printf '[recipients]\nalice = "%s"\nbob = "%s"\nescrow = "%s"\n' \
   "$alice_pk" "$bob_pk" "$escrow_pk" > .sc/recipients.toml
 
 # 1. A pre-escrow secret, sealed to alice only.
-"$SC" secret add db-pass --to alice --value hunter2 >/dev/null
-"$SC" secret list --json | grep -q '"name":"db-pass","recipients":1' \
-  || fail "db-pass must start with exactly 1 recipient (alice)"
+"$SC" secret add DB_PASS --to alice --value hunter2 >/dev/null
+"$SC" secret list --json | grep -q '"name":"DB_PASS","recipients":1' \
+  || fail "DB_PASS must start with exactly 1 recipient (alice)"
 
 # 2. Escrow: add a break-glass recipient key and confirm it's recorded.
 "$SC" escrow add escrow >/dev/null
@@ -89,11 +89,11 @@ grep -q "skipped (no key)" "$work/pre-rewrap-switch.err" \
 #    AND strips bob's re-attached wrap from the protected blob, in one commit.
 rewrap_out=$("$SC" rewrap --identity "$keys/alice" 2>"$work/rewrap.err")
 echo "$rewrap_out" | grep -q "rewrapped 1 secret(s)" \
-  || fail "rewrap must report exactly 1 secret rewrapped (db-pass), got: $rewrap_out"
+  || fail "rewrap must report exactly 1 secret rewrapped (DB_PASS), got: $rewrap_out"
 echo "$rewrap_out" | grep -Eq "rewrapped 1 secret\(s\), [1-9][0-9]* protected blob" \
   || fail "rewrap must report at least 1 protected blob rewrapped, got: $rewrap_out"
-"$SC" secret list --json | grep -q '"name":"db-pass","recipients":2' \
-  || fail "db-pass must now show 2 recipients (alice + escrow)"
+"$SC" secret list --json | grep -q '"name":"DB_PASS","recipients":2' \
+  || fail "DB_PASS must now show 2 recipients (alice + escrow)"
 
 # 5. ONE UNDO REVERTS THE WHOLE SWEEP. This check must run with NO other
 #    oplog-recording command in between: `sc switch` is itself an oplog
@@ -102,14 +102,14 @@ echo "$rewrap_out" | grep -Eq "rewrapped 1 secret\(s\), [1-9][0-9]* protected bl
 #    would undo that switch instead of the rewrap. Verified BEFORE the R1
 #    strip check below, which does need a switch.
 "$SC" undo >/dev/null
-"$SC" secret list --json | grep -q '"name":"db-pass","recipients":1' \
-  || fail "undo must restore db-pass to its pre-rewrap 1 recipient"
+"$SC" secret list --json | grep -q '"name":"DB_PASS","recipients":1' \
+  || fail "undo must restore DB_PASS to its pre-rewrap 1 recipient"
 # `sc undo` again = redo (documented in CLAUDE.md): back to the fully
 # rewrapped tip, so the R1 strip check below runs against the real
 # post-rewrap state.
 "$SC" undo >/dev/null
-"$SC" secret list --json | grep -q '"name":"db-pass","recipients":2' \
-  || fail "second undo (= redo) must restore db-pass to 2 recipients"
+"$SC" secret list --json | grep -q '"name":"DB_PASS","recipients":2' \
+  || fail "second undo (= redo) must restore DB_PASS to 2 recipients"
 
 # 6. THE R1 STRIP: bob's identity, which decrypted this same path a moment
 #    ago (step 3's precondition), must now fail to decrypt the post-rewrap

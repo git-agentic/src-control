@@ -105,6 +105,7 @@ impl Repo {
         if crate::rebase_state::in_progress(self.layout()) {
             return Err(Error::RebaseInProgress);
         }
+        check_secret_name(name)?;
         require_recipients(recipients)?;
         let secret = scl_crypto::seal(name, value, recipients);
         let id = {
@@ -370,9 +371,12 @@ impl Repo {
         identity: &SecretKey,
         strict: bool,
     ) -> Result<Vec<(String, scl_crypto::Zeroizing<Vec<u8>>)>> {
-        let reg = self.registry()?;
-        let mut out = Vec::new();
-        for (name, id) in reg {
+        // The registry is repository data any writer can edit, so nothing is
+        // decrypted until every entry has a name that may be injected and
+        // points at a secret sealed under that same name.
+        let mut entries = Vec::new();
+        for (name, id) in self.registry()? {
+            check_secret_name(&name)?;
             let obj = {
                 let arc = self.store_arc();
                 let o = arc.lock().unwrap().get(&id)?;
@@ -382,6 +386,18 @@ impl Repo {
                 Object::Secret(s) => s,
                 _ => continue,
             };
+            // The AEAD binds `secret.name`; without this check a value sealed
+            // as `B` could be served under the registry key `A`.
+            if secret.name != name {
+                return Err(Error::InvalidArgument(format!(
+                    "registry entry {name} points at a secret sealed as {:?}; refusing to run",
+                    secret.name
+                )));
+            }
+            entries.push((name, secret));
+        }
+        let mut out = Vec::new();
+        for (name, secret) in entries {
             match scl_crypto::open(&secret, identity) {
                 // Pin the type explicitly: if `scl_crypto::open` ever stops
                 // returning `Zeroizing<Vec<u8>>`, this line fails to compile.
@@ -633,6 +649,80 @@ fn feed_pipe(
             Err(_) => return, // the reader is gone (EPIPE)
         }
     }
+}
+
+/// Variables that change how a process loads code or which program runs; a
+/// secret may not be registered or injected under one of these names.
+const DENIED_NAMES: &[&str] = &[
+    "PATH",
+    "IFS",
+    "ENV",
+    "BASH_ENV",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "PS4",
+    "PROMPT_COMMAND",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "PYTHONSTARTUP",
+    "PYTHONINSPECT",
+    "PYTHONUSERBASE",
+    "PERL5OPT",
+    "PERL5LIB",
+    "PERLLIB",
+    "RUBYOPT",
+    "RUBYLIB",
+    "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",
+    "JDK_JAVA_OPTIONS",
+    "CLASSPATH",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_EXEC_PATH",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    "EDITOR",
+    "VISUAL",
+    "PAGER",
+    "HOME",
+    "SHELL",
+    "TMPDIR",
+];
+
+/// Prefixes denied for the same reason, plus `SC_` (sc's own knobs, such as
+/// `SC_SSH` and `SC_GIT`).
+const DENIED_PREFIXES: &[&str] = &["LD_", "DYLD_", "GIT_CONFIG", "SC_"];
+
+/// The one secret-name rule: `[A-Za-z_][A-Za-z0-9_]*`, and not a variable that
+/// changes how the child loads code or which program it runs. Applied when a
+/// secret is added and again at injection, because the registry is repository
+/// data a writer can edit without any key (THREAT-MODEL, committed secrets).
+/// Matching is case-sensitive, except on Windows where environment variable
+/// names are not.
+pub(crate) fn check_secret_name(name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let shape_ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let key = if cfg!(windows) {
+        name.to_ascii_uppercase()
+    } else {
+        name.to_string()
+    };
+    if !shape_ok
+        || DENIED_NAMES.contains(&key.as_str())
+        || DENIED_PREFIXES.iter().any(|p| key.starts_with(p))
+    {
+        return Err(Error::InvalidArgument(format!(
+            "secret name {name:?} is not allowed: use [A-Za-z_][A-Za-z0-9_]* and not a \
+             variable that changes how a process loads code or which program runs \
+             (PATH, LD_*, DYLD_*, NODE_OPTIONS, GIT_CONFIG*, SC_*, ...)"
+        )));
+    }
+    Ok(())
 }
 
 /// Refuse an empty recipient set on every seal/wrap path (`secret_add`,
@@ -1024,6 +1114,98 @@ mod tests {
         assert_eq!(envs[0].0, "DB_URL");
         assert_eq!(envs[0].1, std::ffi::OsString::from("postgres://secret"));
 
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Plant `name -> secret sealed as `sealed_as`` in the registry the way a
+    /// writer without any key can: through the store, bypassing `secret_add`.
+    fn plant(repo: &Repo, name: &str, sealed_as: &str, value: &[u8], pk: &PublicKey) {
+        let secret = scl_crypto::seal(sealed_as, value, std::slice::from_ref(pk));
+        let id = repo
+            .store()
+            .lock()
+            .unwrap()
+            .put(Object::Secret(secret))
+            .unwrap();
+        let mut reg = repo.registry().unwrap();
+        reg.insert(name.to_string(), id);
+        repo.commit_registry(reg, "mallory", "plant", "plant")
+            .unwrap();
+    }
+
+    #[test]
+    fn secret_add_enforces_the_name_rule() {
+        let root = tmp_root("name-rule");
+        let (_sk, pk) = scl_crypto::generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        for bad in [
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "PATH",
+            "NODE_OPTIONS",
+            "GIT_CONFIG_COUNT",
+            "SC_GIT",
+            "a-b",
+            "1X",
+            "",
+            "A=B",
+        ] {
+            assert!(
+                matches!(
+                    repo.secret_add(bad, b"v", std::slice::from_ref(&pk)),
+                    Err(Error::InvalidArgument(_))
+                ),
+                "{bad:?} must be refused"
+            );
+        }
+        assert!(repo.registry().unwrap().is_empty());
+        repo.secret_add("DATABASE_URL", b"v", std::slice::from_ref(&pk))
+            .unwrap();
+        repo.secret_add("_x9", b"v", std::slice::from_ref(&pk))
+            .unwrap();
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn injection_refuses_a_planted_denied_name_and_starts_no_child() {
+        let root = tmp_root("planted");
+        let (sk, pk) = scl_crypto::generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        repo.secret_add("DB_URL", b"v", std::slice::from_ref(&pk))
+            .unwrap();
+        plant(&repo, "LD_PRELOAD", "LD_PRELOAD", b"/tmp/evil.so", &pk);
+
+        let marker = root.join("child-ran");
+        let cmd = [
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("touch {}", marker.display()),
+        ];
+        let err = repo.run(&sk, &cmd).unwrap_err();
+        assert!(err.to_string().contains("LD_PRELOAD"), "{err}");
+        assert!(!marker.exists(), "no child may start");
+        assert!(repo.secret_values(&sk, false).is_err());
+        assert!(repo.secret_env(&sk, true).is_err());
+        #[cfg(unix)]
+        {
+            assert!(repo.run_with_secrets_fd(&sk, &cmd, 3).is_err());
+            assert!(!marker.exists(), "no child may start (fd mode)");
+        }
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn injection_refuses_a_registry_key_that_differs_from_the_sealed_name() {
+        let root = tmp_root("relabel");
+        let (sk, pk) = scl_crypto::generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        plant(&repo, "A", "B", b"value-of-b", &pk);
+        let err = repo.secret_values(&sk, false).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+        assert!(err.to_string().contains('A'), "{err}");
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
