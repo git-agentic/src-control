@@ -399,8 +399,12 @@ too, not just the src-control-side metadata.
     before authentication that held a connection slot for hours (8 KiB of opening
     at 29 s a byte), so 32 such peers filled the default `--max-connections`
     before any token check. The TLS handshake and the HTTP opening now share one
-    30 s deadline fixed at accept (every socket read narrows the timeout to the
-    time left); the session timeout replaces it after the 200 status. An empty
+    30 s deadline fixed at accept (every socket read and write narrows the timeout
+    to the time left); the session timeout replaces it after the 200 status. Known
+    limit: on macOS one blocking `send` can wait more than once with the same
+    relative timeout, so a `--tls-cert` chain larger than the socket send buffer
+    (over about 128 KiB) sent to a peer that reads slowly can outlast the deadline;
+    the minted identity is a few KiB and is not affected. An empty
     `ST_PACK_CHUNK` frame, which moves neither the `--max-pack-size` count nor the
     idle timeout, is a protocol error; the sender never emits one.
   - **Accept-loop hot-spin under fd exhaustion:** a hardcoded exponential backoff
