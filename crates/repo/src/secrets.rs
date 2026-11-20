@@ -175,10 +175,11 @@ impl Repo {
                 _ => return Err(Error::NoSuchSecret(format!("{name} is not a secret"))),
             }
         };
-        // The AEAD binds the sealed name. An entry registered under another
-        // name would be approved by the registry name and wrapped as the sealed
-        // one, so refuse it before recording or wrapping anything, as rotate
-        // and rewrap do.
+        // The AEAD binds the sealed name. Two names the repository controls
+        // (the registry key and the one in the secret's metadata) can be made
+        // to agree, so also open the secret with the identity: it opens only if
+        // it was really sealed under that name. Refuse before recording or
+        // wrapping anything, as rotate and rewrap do.
         if secret.name != name {
             return Err(Error::InvalidArgument(format!(
                 "registry entry {name} points at a secret sealed as {:?}; \
@@ -186,11 +187,23 @@ impl Repo {
                 secret.name
             )));
         }
+        match scl_crypto::open(&secret, authorized) {
+            Ok(_) => {}
+            Err(scl_crypto::Error::Decrypt) => {
+                return Err(Error::InvalidArgument(format!(
+                    "registry entry {name} does not open under that name (it was sealed \
+                     under another name, or is corrupt); rotate it with --value instead"
+                )))
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let regranted = scl_crypto::rewrap_for(&secret, authorized, new)?;
+        // The identity is authorized and the secret is sound: only now is the
+        // named key recorded, before the ref moves.
         self.accept_keys(
             &crate::accepted::secret_scope(name),
             std::slice::from_ref(new),
         )?;
-        let regranted = scl_crypto::rewrap_for(&secret, authorized, new)?;
         let new_id = {
             let arc = self.store_arc();
             let i = arc.lock().unwrap().put(Object::Secret(regranted))?;
@@ -272,6 +285,22 @@ impl Repo {
         recipients: &[PublicKey],
         identity: Option<&SecretKey>,
     ) -> Result<ObjectId> {
+        self.secret_rotate_with(name, new_value, recipients, &[], identity)
+    }
+
+    /// [`Repo::secret_rotate`] for a recipient set the user partly `named` on
+    /// the command line. The named keys count as accepted for this call only,
+    /// and are recorded once the secret has been found, opened (or the value
+    /// supplied) and the set checked, just before the ref moves. A refused
+    /// command records nothing.
+    pub fn secret_rotate_with(
+        &self,
+        name: &str,
+        new_value: Option<&[u8]>,
+        recipients: &[PublicKey],
+        named: &[PublicKey],
+        identity: Option<&SecretKey>,
+    ) -> Result<ObjectId> {
         self.refuse_on_private("sc secret rotate")?;
         // P21: same in-progress guard as `secret_add` — see its comment.
         if crate::merge_state::in_progress(self.layout()) {
@@ -285,10 +314,12 @@ impl Repo {
         }
         require_recipients(recipients)?;
         // The set may come from the secret's own wrap labels (repository
-        // data), so every key must be accepted for it (ADR-0059). A caller
-        // that named the keys accepts them first (`accept_keys`).
+        // data), so every key must be accepted for it (ADR-0059): by the record,
+        // by escrow, or by being named in this very call.
+        let scope = crate::accepted::secret_scope(name);
         self.accepted()?
-            .require(&crate::accepted::secret_scope(name), recipients)?;
+            .with_named(&scope, named)
+            .require(&scope, recipients)?;
         let mut reg = self.registry()?;
         let sid = *reg
             .get(name)
@@ -327,6 +358,7 @@ impl Repo {
             }
         };
 
+        self.accept_keys(&scope, named)?;
         let sealed = scl_crypto::seal(name, plaintext, recipients);
         let new_id = {
             let arc = self.store_arc();

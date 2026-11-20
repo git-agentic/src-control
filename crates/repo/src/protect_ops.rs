@@ -237,11 +237,6 @@ impl Repo {
             .position(|p| p.prefix == prefix)
             .ok_or_else(|| Error::NotProtected(prefix.to_string()))?;
 
-        // The caller named `new`, so it is accepted for this prefix.
-        self.accept_keys(
-            &crate::accepted::path_scope(prefix),
-            std::slice::from_ref(new),
-        )?;
         let protected_ids = self.protected_blob_ids_under(root, &protection, prefix)?;
         let authorized_id = authorized.public().recipient_id().to_string();
         let new_id = new.recipient_id().to_string();
@@ -270,6 +265,12 @@ impl Repo {
                 .push(new_wk);
         }
 
+        // Every unwrap above authorized the identity: only now is the named key
+        // recorded, before the ref moves.
+        self.accept_keys(
+            &crate::accepted::path_scope(prefix),
+            std::slice::from_ref(new),
+        )?;
         let rule = &mut protection.prefixes[rule_idx];
         let epoch = rule.next_epoch();
         rule.set_standing(new.to_bytes(), epoch, scl_core::RecipientState::Granted);

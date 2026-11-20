@@ -394,15 +394,18 @@ impl Repo {
                 (false, _) => id.to_string(),
             });
         }
-        let mut pairs = read_pairs(&self.layout)?;
-        let before = pairs.len();
-        pairs.extend(recorded.into_iter().map(|e| (scope.to_string(), e)));
-        if pairs.len() != before {
-            write_pairs(&self.layout, &pairs)?;
-        } else {
-            self.sync_unchanged()?;
-        }
-        Ok(())
+        // Read, change and write under one lock, or two callers on this handle
+        // could each read the old record and one change would be lost.
+        crate::lock::with_index_lock(&self.layout, || {
+            let mut pairs = read_pairs(&self.layout)?;
+            let before = pairs.len();
+            pairs.extend(recorded.into_iter().map(|e| (scope.to_string(), e)));
+            if pairs.len() != before {
+                write_pairs(&self.layout, &pairs)
+            } else {
+                self.sync_unchanged()
+            }
+        })
     }
 
     /// [`Repo::accept_recipients`] for keys the user named on the command line.
@@ -426,16 +429,18 @@ impl Repo {
     /// Remove every accepted pair of `scope` for this recipient (`sc policy
     /// forget`, and every local revoke). Returns whether there was one.
     pub fn forget_recipient(&self, scope: &str, id: &RecipientId) -> Result<bool> {
-        let mut pairs = read_pairs(&self.layout)?;
-        let before = pairs.len();
-        pairs.retain(|(s, e)| s != scope || entry_id(s, e).as_ref() != Some(id));
-        let removed = pairs.len() != before;
-        if removed {
-            write_pairs(&self.layout, &pairs)?;
-        } else {
-            self.sync_unchanged()?;
-        }
-        Ok(removed)
+        crate::lock::with_index_lock(&self.layout, || {
+            let mut pairs = read_pairs(&self.layout)?;
+            let before = pairs.len();
+            pairs.retain(|(s, e)| s != scope || entry_id(s, e).as_ref() != Some(id));
+            let removed = pairs.len() != before;
+            if removed {
+                write_pairs(&self.layout, &pairs)?;
+            } else {
+                self.sync_unchanged()?;
+            }
+            Ok(removed)
+        })
     }
 }
 
@@ -1650,6 +1655,135 @@ mod tests {
         assert!(!repo
             .forget_recipient("secret:S", &other.recipient_id())
             .unwrap());
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // Two names the repository controls can be made to agree: the metadata name
+    // of a secret sealed under another name is edited to match the registry.
+    // The AEAD still binds the name it was sealed under, so `secret grant`,
+    // which opens the secret with the identity, refuses it.
+    #[test]
+    fn secret_grant_refuses_a_secret_whose_name_metadata_was_edited() {
+        let root = dir("grant-edited");
+        let (sk, pk) = generate_keypair();
+        let (_, new) = generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        let mut secret = scl_crypto::seal("B", b"value-of-b", std::slice::from_ref(&pk));
+        secret.name = "A".to_string();
+        let sid = repo
+            .vfs()
+            .store()
+            .lock()
+            .unwrap()
+            .put(Object::Secret(secret))
+            .unwrap();
+        let root_id = repo.vfs().write_tree(&[]).unwrap();
+        let mut secrets = std::collections::BTreeMap::new();
+        secrets.insert("A".to_string(), sid);
+        let tip = repo
+            .commit_snapshot(
+                root_id,
+                vec![],
+                secrets,
+                scl_core::Protection::default(),
+                "w",
+                "plant",
+            )
+            .unwrap();
+
+        let err = repo.secret_grant("A", &sk, &new).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+        assert!(
+            err.to_string().contains("does not open under that name"),
+            "{err}"
+        );
+        assert!(!repo.layout().accepted_recipients_path().exists());
+        assert_eq!(repo.head_tip().unwrap(), Some(tip), "the registry moved");
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // A refused grant or rotate leaves the record alone: the named key is
+    // recorded only after the identity is authorized and the operation validated.
+    #[test]
+    fn a_refused_grant_or_rotate_records_no_approval() {
+        let root = dir("refused-approval");
+        let (sk, a) = generate_keypair();
+        let (wrong, _) = generate_keypair();
+        let (_, new) = generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        put(&root, "p/x.txt", "x\n");
+        repo.protect("p/", std::slice::from_ref(&a), None).unwrap();
+        repo.secret_add("S", b"v", std::slice::from_ref(&a))
+            .unwrap();
+        let record = || std::fs::read(repo.layout().accepted_recipients_path()).unwrap();
+        let before = record();
+
+        assert!(matches!(
+            repo.grant("p/", &wrong, &new).unwrap_err(),
+            Error::NotAuthorized(_)
+        ));
+        assert_eq!(
+            record(),
+            before,
+            "a refused path grant recorded an approval"
+        );
+        assert!(repo.secret_grant("S", &wrong, &new).is_err());
+        assert_eq!(
+            record(),
+            before,
+            "a refused secret grant recorded an approval"
+        );
+        let both = [a.clone(), new.clone()];
+        assert!(repo
+            .secret_rotate_with("S", None, &both, std::slice::from_ref(&new), Some(&wrong))
+            .is_err());
+        assert_eq!(record(), before, "a refused rotate recorded an approval");
+        assert!(repo
+            .secret_rotate_with("NOPE", None, &both, std::slice::from_ref(&new), Some(&sk))
+            .is_err());
+        assert_eq!(record(), before, "a rotate of nothing recorded an approval");
+
+        // With the right identity each lands and records the named key.
+        repo.grant("p/", &sk, &new).unwrap();
+        repo.secret_grant("S", &sk, &new).unwrap();
+        let acc = repo.accepted().unwrap();
+        for scope in ["path:p/", "secret:S"] {
+            assert!(acc.unaccepted(scope, std::slice::from_ref(&new)).is_empty());
+        }
+        let (_, third) = generate_keypair();
+        let set = [a.clone(), new.clone(), third.clone()];
+        repo.secret_rotate_with("S", None, &set, std::slice::from_ref(&third), Some(&sk))
+            .unwrap();
+        assert!(repo
+            .accepted()
+            .unwrap()
+            .unaccepted("secret:S", std::slice::from_ref(&third))
+            .is_empty());
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // The record is read, changed and written under one lock: callers on one
+    // handle cannot lose each other's change.
+    #[test]
+    fn concurrent_accepts_on_one_handle_all_land() {
+        let root = dir("concurrent");
+        let repo = Repo::init(&root).unwrap();
+        let keys: Vec<PublicKey> = (0..32).map(|_| generate_keypair().1).collect();
+        std::thread::scope(|s| {
+            for chunk in keys.chunks(8) {
+                let repo = &repo;
+                s.spawn(move || {
+                    for k in chunk {
+                        repo.accept_keys("secret:S", std::slice::from_ref(k))
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(repo.accepted().unwrap().pairs.len(), keys.len());
         drop(repo);
         let _ = std::fs::remove_dir_all(root);
     }

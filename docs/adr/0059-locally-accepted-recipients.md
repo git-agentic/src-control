@@ -51,8 +51,9 @@ It is local state like `.sc/local-key`: written atomically and durably
 (`fsutil::atomic_write_durable`: fsynced temp file, rename, fsynced directory,
 as durable as the ref write it precedes; an accept or forget that changes
 nothing still syncs the directory, so a retry after a failed sync does not report
-success on an unsynced record) by a command that holds the repo lock,
-never part of a snapshot, never
+success on an unsynced record) by a command that holds the repo lock and
+reads, changes and writes the record under the short `.sc/index.lock` (so callers
+on one handle cannot lose each other's change), never part of a snapshot, never
 in a pack, never sent by clone, fetch or push, and not read by `sc gc`. `sc ws`
 and `sc work` commit through the host repo, so they use the host's record. Its
 integrity depends on the working-tree path guard (a checkout never writes under
@@ -100,7 +101,7 @@ carry that copies existing wraps is never gated:
 | callers: `snapshot_files` (commit, amend, merge/pick/rebase completion, `sc ws harvest`, `sc work`, `ws refresh`), the clean merge, `replay_commit` (cherry-pick, rebase), `branch_publish` (private-branch protected files) | | inherit it |
 | `sc protect` | `path:<prefix>` | validates the candidate rule before anything moves (even with nothing to seal), then builds the rule's snapshot and the sealing commit with the pending approvals passed to that call's seal gate only (no state shared with other operations on the handle), records them, and only then moves the refs (it advanced the ref before its sealing commit), so a refusal under any rule leaves refs, oplog and record alone |
 | `secret_rotate` | `secret:<NAME>` | refuses on the final recipient set |
-| `rewrap` (secrets and protected paths) | `secret:<NAME>`, `path:<prefix>` | an entry with an unaccepted key is skipped and reported, the rest is committed, the exit code is non-zero (ADR-0027 skip-and-report). A secret registered under a name other than the one it is sealed under is skipped before it is opened (the registry name would pick the approvals, the sealed name the reseal); `secret grant` and `secret rotate` refuse it the same way. The record is read only for an entry that mints a wrap, and for a re-seal only after its ciphertext has opened (a corrupt blob is skipped as that whatever the record's state): a secret that opens, a path re-sealed or rotated, or a target with no wrap yet; a randomized path whose every wrap is reused copies them and needs no approval |
+| `rewrap` (secrets and protected paths) | `secret:<NAME>`, `path:<prefix>` | an entry with an unaccepted key is skipped and reported, the rest is committed, the exit code is non-zero (ADR-0027 skip-and-report). A secret registered under a name other than the one it is sealed under is skipped before it is opened (the registry name would pick the approvals, the sealed name the reseal); `secret grant` and `secret rotate` refuse it the same way, and `secret grant` also opens the secret with the identity, because two names the repository controls can be made to agree and only the AEAD binds the name the secret was sealed under. The record is read only for an entry that mints a wrap, and for a re-seal only after its ciphertext has opened (a corrupt blob is skipped as that whatever the record's state): a secret that opens, a path re-sealed or rotated, or a target with no wrap yet; a randomized path whose every wrap is reused copies them and needs no approval |
 | `branch_revoke` | `branch:<name>` | refuses on the remaining set |
 
 A conflict stop writes plaintext and seals nothing, so it is not gated; its
@@ -116,9 +117,12 @@ escrow keys it appends to the library separately (`protect_with_escrow`,
 `secret_add_with_escrow`, `branch_private`), and only the named keys are
 recorded, before any ref moves, so a named key that is also escrow survives its
 removal from `[escrow]` and a failed record write leaves the operation unlanded.
-`sc secret rotate --to` records from the CLI, before the rotate, because the
-library cannot tell a named set from one derived from wrap labels. A key that comes from repository data, by any route, is never
-auto-accepted. The local revoke commands remove the pair they revoke, after
+`sc secret rotate --to` passes its named keys to `secret_rotate_with`, because
+the library cannot tell a named set from one derived from wrap labels. The named
+key of `grant`, `secret grant` and `secret rotate --to` is recorded only after the
+identity is authorized and the operation validated, still before the ref moves,
+so a refused command leaves no approval. A key that comes from repository data,
+by any route, is never auto-accepted. The local revoke commands remove the pair they revoke, after
 validation and before the new ref is published, so an interruption leaves a
 revoke that did not land (retry it), never a landed revoke whose approval
 outlives it.
@@ -194,6 +198,10 @@ stays 6.
   keys; the cure is to revoke or accept, never silent.
 - **`sc policy status` and `--all`** (list the record, accept every pending
   pair) are not built.
+- **An interruption after the approval write and before the ref move leaves an
+  approval.** It is for a key the user named on that very command, so it
+  reflects their own choice in this clone; journaling the pair with the ref move
+  is out of proportion.
 - **The printed Remove command does not always work.** `sc revoke` refuses to
   revoke a rule's last recipient (the attacker's own narrower rule: run
   `sc grant <prefix> --to <name>` first) and refuses while a merge, pick or

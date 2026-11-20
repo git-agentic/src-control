@@ -3349,6 +3349,7 @@ fn run_secret(op: SecretOp) -> Result<()> {
             let dir = load_recipients(&recipients_path)?;
             let escrows = load_escrows(&recipients_path)?;
             // Recipient set: explicit --to, else the secret's current recipients.
+            let mut named: Vec<scl_crypto::PublicKey> = Vec::new();
             let pks = if to.is_empty() {
                 let ids = repo.secret_recipients(&name)?;
                 // Pool = named recipients + escrow, so an escrow-only id resolves.
@@ -3356,13 +3357,14 @@ fn run_secret(op: SecretOp) -> Result<()> {
                 pool.extend(escrows.iter().cloned());
                 resolve_ids_to_pubkeys(&ids, &pool)?
             } else {
-                // Named on the command line, so accepted for this secret. The
-                // derived set above is not: it comes from the secret's own
-                // wrap labels, and `secret_rotate` refuses one with a key
-                // this clone never accepted.
-                let named = resolve_names(&dir, &to)?;
-                repo.accept_keys(&format!("secret:{name}"), &named)?;
-                named
+                // Named on the command line, so accepted for this secret, but
+                // recorded by `secret_rotate_with` only once the rotate has
+                // validated (a refused command records nothing). The derived
+                // set above is not: it comes from the secret's own wrap labels,
+                // and `secret_rotate_with` refuses one with a key this clone
+                // never accepted.
+                named = resolve_names(&dir, &to)?;
+                named.clone()
             };
             let pks = append_escrow(pks, &escrows);
             let new_value = value.as_deref().map(|s| s.as_bytes());
@@ -3370,7 +3372,7 @@ fn run_secret(op: SecretOp) -> Result<()> {
                 Some(_) => None, // sealing a new value needs no decryption
                 None => Some(load_identity(identity)?),
             };
-            repo.secret_rotate(&name, new_value, &pks, identity.as_ref())?;
+            repo.secret_rotate_with(&name, new_value, &pks, &named, identity.as_ref())?;
             println!("rotated secret {name} for {} recipient(s)", pks.len());
             eprintln!(
                 "note: rotation cuts off future reads via the current registry; the old \

@@ -139,7 +139,11 @@ too, not just the src-control-side metadata.
   unaccepted key is skipped, the rest commits, the exit code is non-zero) and
   `branch_revoke`. The record is written durably (fsynced, as durable as the ref
   write). `sc rewrap` skips, and `sc secret grant` refuses, a secret registered under a
-  name other than the one it is sealed under. The record loads only when something is sealed, so a commit
+  name other than the one it is sealed under (grant also opens the secret with the
+  identity, since the AEAD binds the sealed name and the metadata name can be edited).
+  The named key of a grant or rotate is recorded only after the identity is
+  authorized. An interruption after the approval write and before the ref move can
+  leave an approval for a key the user named on that command (accepted). The record loads only when something is sealed, so a commit
   that wraps nothing does not depend on it. Escrow keys are never recorded: they
   count from the current `[escrow]` section, so removing one withdraws it. A
   scope in a refusal comes from the repository, so it is escaped and a scope
