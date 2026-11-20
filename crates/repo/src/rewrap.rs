@@ -84,6 +84,10 @@ impl Repo {
         let tip = self.head_tip()?.ok_or(Error::Unborn)?;
         let snap = self.snapshot(&tip)?;
         let mut skipped: Vec<(String, String)> = Vec::new();
+        // Wraps minted here come from repository data (wrap labels, rules), so
+        // an entry whose target set holds a key this clone never accepted is
+        // skipped, not sealed (ADR-0059). The escrow set passed in is local.
+        let accepted = self.accepted()?.with_escrow(escrows);
 
         // ---- Secrets half: fresh-DEK reseal to current set + escrow. ----
         let mut registry = snap.secrets.clone();
@@ -134,6 +138,14 @@ impl Repo {
                 continue;
             }
             let targets = crate::secrets::append_dedup(targets, escrows);
+            let pending = accepted.unaccepted(&crate::accepted::secret_scope(&name), &targets);
+            if !pending.is_empty() {
+                skipped.push((
+                    format!("secret {name}"),
+                    crate::accepted::describe_inline(&pending),
+                ));
+                continue;
+            }
             let value = match scl_crypto::open(&secret, identity) {
                 Ok(v) => v,
                 Err(_) => {
@@ -200,6 +212,7 @@ impl Repo {
                 continue;
             };
             let granted = rule.granted_keys();
+            let scope = crate::accepted::path_scope(&rule.prefix);
             if granted.is_empty() {
                 skipped.push((
                     format!("path {path}"),
@@ -241,6 +254,14 @@ impl Repo {
                 {
                     target_pks.push(e.clone());
                 }
+            }
+            let pending = accepted.unaccepted(&scope, &target_pks);
+            if !pending.is_empty() {
+                skipped.push((
+                    format!("path {path}"),
+                    crate::accepted::describe_inline(&pending),
+                ));
+                continue;
             }
             let convergent = perms & scl_core::RANDOMIZED == 0;
             if convergent || rotate {
@@ -722,6 +743,9 @@ mod tests {
         rule_pk: &scl_crypto::PublicKey,
         entries: &[(&str, &[u8], &scl_crypto::PublicKey, bool)],
     ) {
+        // The test names the rule's key, like `protect --to` does.
+        repo.accept_keys("path:secret/", std::slice::from_ref(rule_pk))
+            .unwrap();
         let mut prot = Protection::default();
         prot.prefixes.push(ProtectPrefix {
             prefix: "secret/".into(),

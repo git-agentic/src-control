@@ -1,0 +1,967 @@
+//! Locally accepted recipients (ADR-0059).
+//!
+//! Protection rules, secret wrap lists and private-branch KEK wrap labels are
+//! repository data, so a writer without a key can make your next seal wrap a
+//! DEK to them. `.sc/accepted-recipients` is the local answer: one
+//! `<scope>\t<key>` line per key YOU accepted for a scope (`path:<prefix>`
+//! with the full public key, `secret:<NAME>` and `branch:<name>` with the
+//! recipient id). A seal that would wrap to a key not accepted for its scope
+//! (and not in the local `[escrow]`) refuses before anything is written.
+//!
+//! The file is local state like `.sc/local-key`: written atomically under the
+//! repo lock, never committed, never in a pack, never transferred, never read
+//! by gc. Sessions (`sc ws`, `sc work`) commit through the host repo, so they
+//! read the host's record.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use scl_crypto::{PublicKey, RecipientId};
+
+use crate::error::{Error, Result};
+use crate::layout::Layout;
+use crate::repo::Repo;
+
+/// Scope of a protected-path rule: the rule's own prefix string.
+pub(crate) fn path_scope(prefix: &str) -> String {
+    format!("path:{prefix}")
+}
+
+/// Scope of a committed secret's wrap list.
+pub(crate) fn secret_scope(name: &str) -> String {
+    format!("secret:{name}")
+}
+
+/// Scope of a private branch's KEK wrap list.
+pub(crate) fn branch_scope(name: &str) -> String {
+    format!("branch:{name}")
+}
+
+/// What `scope` records for `key`: the full public key for a path rule (a rule
+/// holds full keys), the recipient id for a secret or a branch (a wrap label
+/// is an id).
+fn entry(scope: &str, key: &PublicKey) -> String {
+    if scope.starts_with("path:") {
+        key.to_key_string()
+    } else {
+        key.recipient_id().to_string()
+    }
+}
+
+/// A recipient a seal would wrap to that this clone never accepted for the scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unaccepted {
+    pub scope: String,
+    /// What `sc policy accept --key` takes for this scope: the full public key
+    /// for `path:`, the recipient id otherwise.
+    pub key: String,
+    pub id: String,
+    /// The local `[recipients]` name for the key, if there is one.
+    pub name: Option<String>,
+}
+
+impl Unaccepted {
+    fn label(&self) -> &str {
+        self.name.as_deref().unwrap_or("UNKNOWN")
+    }
+
+    /// The exact `sc policy accept` command; an unknown key needs
+    /// `--allow-unknown`.
+    pub fn accept_command(&self) -> String {
+        let unknown = if self.name.is_none() {
+            " --allow-unknown"
+        } else {
+            ""
+        };
+        format!(
+            "sc policy accept {} --key {}{unknown}",
+            sh_quote(&self.scope),
+            self.key
+        )
+    }
+
+    /// The command that removes the recipient from the repository data.
+    pub fn remove_command(&self) -> String {
+        let (kind, target) = self.scope.split_once(':').unwrap_or(("", &self.scope));
+        let target = sh_quote(target);
+        match kind {
+            "path" => format!("sc revoke {target} --recipient-id {}", self.id),
+            "secret" => format!("sc secret revoke {target} --recipient-id {}", self.id),
+            _ => format!(
+                "sc branch revoke {target} --recipient-id {} --identity <key>",
+                self.id
+            ),
+        }
+    }
+}
+
+/// Quote `s` for a POSIX shell unless it is plainly safe.
+fn sh_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_./:@%+=,-".contains(c))
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+/// The text of [`Error::UnacceptedRecipients`].
+pub(crate) fn describe(pairs: &[Unaccepted]) -> String {
+    let mut out = String::new();
+    for p in pairs {
+        out.push_str(&format!(
+            "{} grants a recipient you have not accepted: {} ({}).\n  Accept: {}\n  Remove: {}\n",
+            p.scope,
+            p.id,
+            p.label(),
+            p.accept_command(),
+            p.remove_command()
+        ));
+    }
+    out.push_str("Nothing was written.");
+    out
+}
+
+/// One-line form for a skipped `rewrap` entry.
+pub(crate) fn describe_inline(pairs: &[Unaccepted]) -> String {
+    pairs
+        .iter()
+        .map(|p| {
+            format!(
+                "grants a recipient you have not accepted: {} ({}); accept: {}; remove: {}",
+                p.id,
+                p.label(),
+                p.accept_command(),
+                p.remove_command()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// This clone's accepted pairs plus the local escrow keys (accepted in every
+/// scope) and `[recipients]` names, as read from `.sc/`.
+#[derive(Default, Clone)]
+pub(crate) struct Accepted {
+    pairs: BTreeSet<(String, String)>,
+    escrow: BTreeSet<String>,
+    names: BTreeMap<String, String>,
+}
+
+impl Accepted {
+    pub(crate) fn load(layout: &Layout) -> Result<Accepted> {
+        let mut out = Accepted {
+            pairs: read_pairs(layout)?,
+            ..Default::default()
+        };
+        // An unreadable or malformed recipients file yields no escrow and no
+        // names: fewer keys count as accepted, never more.
+        #[derive(serde::Deserialize, Default)]
+        struct Escrow {
+            key: Option<String>,
+            #[serde(default)]
+            keys: Vec<String>,
+        }
+        #[derive(serde::Deserialize, Default)]
+        struct File {
+            #[serde(default)]
+            recipients: BTreeMap<String, String>,
+            escrow: Option<Escrow>,
+        }
+        let file: File = std::fs::read_to_string(layout.dot_sc.join("recipients.toml"))
+            .ok()
+            .and_then(|t| toml::from_str(&t).ok())
+            .unwrap_or_default();
+        for (name, k) in file.recipients {
+            if let Ok(pk) = PublicKey::from_key_string(&k) {
+                out.names.insert(pk.recipient_id().to_string(), name);
+            }
+        }
+        let escrow = file.escrow.unwrap_or_default();
+        for k in escrow.key.iter().chain(escrow.keys.iter()) {
+            if let Ok(pk) = PublicKey::from_key_string(k) {
+                out.escrow.insert(pk.recipient_id().to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Also count `keys` as escrow: the break-glass set a caller passes in.
+    pub(crate) fn with_escrow(mut self, keys: &[PublicKey]) -> Accepted {
+        self.escrow
+            .extend(keys.iter().map(|k| k.recipient_id().to_string()));
+        self
+    }
+
+    /// Also count `keys` as accepted for `scope` (the ones the user just named).
+    pub(crate) fn with_named(mut self, scope: &str, keys: &[PublicKey]) -> Accepted {
+        for k in keys {
+            self.pairs.insert((scope.to_string(), entry(scope, k)));
+        }
+        self
+    }
+
+    fn is_accepted(&self, scope: &str, key: &PublicKey) -> bool {
+        self.escrow.contains(key.recipient_id().as_str())
+            || self.pairs.contains(&(scope.to_string(), entry(scope, key)))
+    }
+
+    /// The keys in `keys` not accepted for `scope`, deduped, in input order.
+    pub(crate) fn unaccepted(&self, scope: &str, keys: &[PublicKey]) -> Vec<Unaccepted> {
+        let mut out: Vec<Unaccepted> = Vec::new();
+        for k in keys {
+            let key = entry(scope, k);
+            if self.is_accepted(scope, k) || out.iter().any(|u| u.key == key) {
+                continue;
+            }
+            let id = k.recipient_id().to_string();
+            out.push(Unaccepted {
+                scope: scope.to_string(),
+                key,
+                name: self.names.get(&id).cloned(),
+                id,
+            });
+        }
+        out
+    }
+
+    /// Refuse (nothing written) unless every key in `keys` is accepted for `scope`.
+    pub(crate) fn require(&self, scope: &str, keys: &[PublicKey]) -> Result<()> {
+        refuse_if_any(self.unaccepted(scope, keys))
+    }
+}
+
+/// `Err` naming every pair, or `Ok` when there is none.
+pub(crate) fn refuse_if_any(pairs: Vec<Unaccepted>) -> Result<()> {
+    if pairs.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::UnacceptedRecipients { pairs })
+    }
+}
+
+/// Scope text goes through a line-oriented file and a path prefix can hold any
+/// byte but NUL, so escape the three characters the format uses.
+fn esc(s: &str) -> String {
+    s.replace('%', "%25")
+        .replace('\t', "%09")
+        .replace('\n', "%0A")
+        .replace('\r', "%0D")
+}
+
+fn unesc(s: &str) -> String {
+    s.replace("%0D", "\r")
+        .replace("%0A", "\n")
+        .replace("%09", "\t")
+        .replace("%25", "%")
+}
+
+/// The recipient id behind a recorded entry, or `None` when the entry is not a
+/// valid key or id for its scope.
+fn entry_id(scope: &str, entry: &str) -> Option<RecipientId> {
+    if scope.starts_with("path:") {
+        PublicKey::from_key_string(entry)
+            .ok()
+            .map(|k| k.recipient_id())
+    } else {
+        RecipientId::from_hex(entry).ok()
+    }
+}
+
+/// A missing file is an empty record; a line that does not parse is skipped
+/// (an unreadable pair is never an accepted one).
+fn read_pairs(layout: &Layout) -> Result<BTreeSet<(String, String)>> {
+    let text = match std::fs::read_to_string(layout.accepted_recipients_path()) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(text
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .map(|(s, e)| (unesc(s), e.to_string()))
+        .filter(|(s, e)| entry_id(s, e).is_some())
+        .collect())
+}
+
+fn write_pairs(layout: &Layout, pairs: &BTreeSet<(String, String)>) -> Result<()> {
+    let body: String = pairs
+        .iter()
+        .map(|(s, e)| format!("{}\t{e}\n", esc(s)))
+        .collect();
+    let tmp = layout.dot_sc.join("accepted-recipients.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, layout.accepted_recipients_path())?;
+    Ok(())
+}
+
+/// `path:<prefix>`, `secret:<NAME>` or `branch:<name>`, with something after the colon.
+fn validate_scope(scope: &str) -> Result<()> {
+    let ok = ["path:", "secret:", "branch:"]
+        .iter()
+        .any(|k| scope.strip_prefix(k).is_some_and(|rest| !rest.is_empty()));
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgument(format!(
+            "bad scope {scope:?}: use path:<prefix>, secret:<NAME> or branch:<name>"
+        )))
+    }
+}
+
+impl Repo {
+    pub(crate) fn accepted(&self) -> Result<Accepted> {
+        Accepted::load(&self.layout)
+    }
+
+    /// Record `id` as accepted for `scope` (`sc policy accept`; idempotent).
+    /// `key` is the full public key when the caller has it; a `path:` scope
+    /// records full keys, so it is required there. Local file only: allowed
+    /// while a merge, pick or rebase is stopped.
+    pub fn accept_recipient(
+        &self,
+        scope: &str,
+        id: &RecipientId,
+        key: Option<&PublicKey>,
+    ) -> Result<()> {
+        validate_scope(scope)?;
+        let recorded = match (scope.starts_with("path:"), key) {
+            (true, Some(k)) => entry(scope, k),
+            (true, None) => {
+                return Err(Error::InvalidArgument(format!(
+                    "{scope} records full public keys: pass the scl-pk- key of {id}, \
+                     or a recipient id that is in .sc/recipients.toml"
+                )))
+            }
+            (false, _) => id.to_string(),
+        };
+        let mut pairs = read_pairs(&self.layout)?;
+        if pairs.insert((scope.to_string(), recorded)) {
+            write_pairs(&self.layout, &pairs)?;
+        }
+        Ok(())
+    }
+
+    /// [`Repo::accept_recipient`] for keys the user named on the command line.
+    pub fn accept_keys(&self, scope: &str, keys: &[PublicKey]) -> Result<()> {
+        for k in keys {
+            self.accept_recipient(scope, &k.recipient_id(), Some(k))?;
+        }
+        Ok(())
+    }
+
+    /// Remove every accepted pair of `scope` for this recipient (`sc policy
+    /// forget`, and every local revoke). Returns whether there was one.
+    pub fn forget_recipient(&self, scope: &str, id: &RecipientId) -> Result<bool> {
+        let mut pairs = read_pairs(&self.layout)?;
+        let before = pairs.len();
+        pairs.retain(|(s, e)| s != scope || entry_id(s, e).as_ref() != Some(id));
+        let removed = pairs.len() != before;
+        if removed {
+            write_pairs(&self.layout, &pairs)?;
+        }
+        Ok(removed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scl_core::{Object, WrappedKey};
+    use scl_crypto::{generate_keypair, SecretKey};
+    use std::path::{Path, PathBuf};
+
+    fn dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("scl-accepted-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn put(root: &Path, rel: &str, body: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
+    fn id_of(pk: &PublicKey) -> String {
+        pk.recipient_id().to_string()
+    }
+
+    /// The error's pairs, when it is a refusal that wrote nothing.
+    fn refused(r: Result<impl std::fmt::Debug>) -> Vec<Unaccepted> {
+        match r {
+            Err(Error::UnacceptedRecipients { pairs }) => pairs,
+            other => panic!("expected an unaccepted-recipients refusal, got {other:?}"),
+        }
+    }
+
+    /// Is a wrap addressed to `id` recorded in any snapshot in the store?
+    fn wrapped_to(repo: &Repo, id: &str) -> bool {
+        let store_arc = repo.vfs().store();
+        let mut s = store_arc.lock().unwrap();
+        for oid in s.list_loose().unwrap() {
+            if let Ok(Object::Snapshot(snap)) = s.get(&oid) {
+                if snap
+                    .protection
+                    .wrapped
+                    .values()
+                    .flatten()
+                    .any(|w| w.recipient_id == id)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// A victim repo with `secret/` protected for the victim, cloned by a writer
+    /// who holds no key (`attack` runs in that clone), then fetched back as
+    /// remote `a`.
+    struct World {
+        v: Repo,
+        v_root: PathBuf,
+        a_root: PathBuf,
+        vsk: SecretKey,
+        atk: PublicKey,
+    }
+
+    fn world(tag: &str, attack: impl FnOnce(&Repo, &PublicKey)) -> World {
+        let v_root = dir(&format!("{tag}-v"));
+        let a_root = dir(&format!("{tag}-a"));
+        std::fs::remove_dir_all(&a_root).unwrap();
+        let (vsk, vpk) = generate_keypair();
+        let (_, atk) = generate_keypair();
+        let v = Repo::init(&v_root).unwrap();
+        put(&v_root, "secret/a.txt", "victim data\n");
+        put(&v_root, "readme.txt", "hello\n");
+        v.protect("secret/", &[vpk], None).unwrap();
+        drop(v);
+        let a = Repo::clone_to(&v_root, &a_root).unwrap();
+        attack(&a, &atk);
+        drop(a);
+        let v = Repo::open(&v_root).unwrap();
+        v.remote_add("a", a_root.to_str().unwrap()).unwrap();
+        v.fetch("a").unwrap();
+        World {
+            v,
+            v_root,
+            a_root,
+            vsk,
+            atk,
+        }
+    }
+
+    impl World {
+        fn pull(&self) {
+            self.v
+                .merge_with_identity("a/main", "me", Some(&self.vsk))
+                .unwrap();
+        }
+        fn cleanup(self) {
+            let (v, a) = (self.v_root.clone(), self.a_root.clone());
+            drop(self);
+            let _ = std::fs::remove_dir_all(v);
+            let _ = std::fs::remove_dir_all(a);
+        }
+    }
+
+    // 1. A narrower rule from a keyless writer: the victim fast-forwards, edits
+    // under it and commits. Refused, nothing moved, no wrap to the attacker in
+    // the store; after an explicit accept it passes.
+    #[test]
+    fn a_narrower_rule_from_a_writer_is_refused_until_accepted() {
+        let w = world("narrow", |a, atk| {
+            a.protect("secret/sub/", std::slice::from_ref(atk), None)
+                .unwrap();
+        });
+        w.pull();
+        let atk_id = id_of(&w.atk);
+        put(&w.v_root, "secret/sub/x.txt", "new victim data\n");
+        let tip = w.v.head_tip().unwrap();
+        let pairs = refused(w.v.commit("me", "edit"));
+        assert_eq!(
+            pairs,
+            vec![Unaccepted {
+                scope: "path:secret/sub/".into(),
+                key: w.atk.to_key_string(),
+                id: atk_id.clone(),
+                name: None
+            }]
+        );
+        assert_eq!(w.v.head_tip().unwrap(), tip, "the ref did not move");
+        assert!(!wrapped_to(&w.v, &atk_id), "no wrap to the attacker stored");
+
+        w.v.accept_keys("path:secret/sub/", std::slice::from_ref(&w.atk))
+            .unwrap();
+        w.v.commit("me", "edit").unwrap();
+        assert!(wrapped_to(&w.v, &atk_id), "sealed to the accepted key");
+        w.cleanup();
+    }
+
+    // 2a. The same on a fresh clone, and the error names the local recipient
+    // (a key listed in recipients.toml is still not an accepted one).
+    #[test]
+    fn a_fresh_clone_refuses_and_names_the_local_recipient() {
+        let w = world("fresh", |a, atk| {
+            a.protect("secret/sub/", std::slice::from_ref(atk), None)
+                .unwrap();
+        });
+        let c_root = dir("fresh-c");
+        std::fs::remove_dir_all(&c_root).unwrap();
+        let c = Repo::clone_to(&w.a_root, &c_root).unwrap();
+        put(&c_root, "secret/sub/x.txt", "data\n");
+        let atk_id = id_of(&w.atk);
+        let unknown = refused(c.commit("me", "m"));
+        assert_eq!(unknown[0].name, None);
+        let text = Error::UnacceptedRecipients { pairs: unknown }.to_string();
+        assert!(
+            text.contains(&format!(
+                "sc policy accept path:secret/sub/ --key {} --allow-unknown",
+                w.atk.to_key_string()
+            )) && text.contains(&format!("sc revoke secret/sub/ --recipient-id {atk_id}"))
+                && text.contains("(UNKNOWN)")
+                && text.contains("Nothing was written."),
+            "{text}"
+        );
+
+        put(
+            &c_root,
+            ".sc/recipients.toml",
+            &format!("[recipients]\nmallory = \"{}\"\n", w.atk.to_key_string()),
+        );
+        let named = refused(c.commit("me", "m"));
+        assert_eq!(named[0].name.as_deref(), Some("mallory"));
+        assert!(!named[0].accept_command().contains("--allow-unknown"));
+        drop(c);
+        let _ = std::fs::remove_dir_all(c_root);
+        w.cleanup();
+    }
+
+    // 2b. A merge where only theirs has the rule: ours' plain file under it must
+    // be sealed by the merge, which wraps to their key.
+    #[test]
+    fn a_merge_that_brings_in_a_rule_refuses_to_seal_to_its_key() {
+        let v_root = dir("merge-v");
+        let a_root = dir("merge-a");
+        std::fs::remove_dir_all(&a_root).unwrap();
+        let (_, atk) = generate_keypair();
+        let v = Repo::init(&v_root).unwrap();
+        put(&v_root, "readme.txt", "hello\n");
+        v.commit("me", "base").unwrap();
+        drop(v);
+        let a = Repo::clone_to(&v_root, &a_root).unwrap();
+        a.protect("docs/", std::slice::from_ref(&atk), None)
+            .unwrap();
+        drop(a);
+        let v = Repo::open(&v_root).unwrap();
+        put(&v_root, "docs/q.txt", "ours only\n");
+        v.commit("me", "docs").unwrap();
+        v.remote_add("a", a_root.to_str().unwrap()).unwrap();
+        v.fetch("a").unwrap();
+
+        let tip = v.head_tip().unwrap();
+        let atk_id = id_of(&atk);
+        let pairs = refused(v.merge("a/main", "me"));
+        assert_eq!(pairs[0].scope, "path:docs/");
+        assert_eq!(pairs[0].id, atk_id);
+        assert_eq!(v.head_tip().unwrap(), tip);
+        assert_eq!(
+            std::fs::read_to_string(v_root.join("docs/q.txt")).unwrap(),
+            "ours only\n"
+        );
+        assert!(!wrapped_to(&v, &atk_id));
+
+        v.accept_keys("path:docs/", std::slice::from_ref(&atk))
+            .unwrap();
+        v.merge("a/main", "me").unwrap();
+        assert!(wrapped_to(&v, &atk_id));
+        drop(v);
+        let _ = std::fs::remove_dir_all(v_root);
+        let _ = std::fs::remove_dir_all(a_root);
+    }
+
+    /// Plant a wrap label for `atk_id` (no usable wrap bytes) on a secret.
+    fn plant_secret_label(repo: &Repo, name: &str, atk_id: &str) {
+        let tip = repo.head_tip().unwrap().unwrap();
+        let snap = repo.snapshot(&tip).unwrap();
+        let store_arc = repo.vfs().store();
+        let mut s = store_arc.lock().unwrap();
+        let Object::Secret(mut secret) = s.get(&snap.secrets[name]).unwrap() else {
+            panic!("not a secret")
+        };
+        secret.wrapped_keys.push(WrappedKey {
+            recipient_id: atk_id.into(),
+            wrapped_dek: vec![0; 48],
+        });
+        let sid = s.put(Object::Secret(secret)).unwrap();
+        drop(s);
+        let mut secrets = snap.secrets.clone();
+        secrets.insert(name.into(), sid);
+        repo.commit_snapshot(snap.root, vec![tip], secrets, snap.protection, "w", "x")
+            .unwrap();
+    }
+
+    // 3. A bogus wrap label on a secret: rotate without --to would re-seal to
+    // that key; rewrap skips the entry, keeps the rest and reports it.
+    #[test]
+    fn a_planted_secret_label_blocks_rotate_and_is_skipped_by_rewrap() {
+        let root = dir("secret-label");
+        let (vsk, vpk) = generate_keypair();
+        let (_, atk) = generate_keypair();
+        let v = Repo::init(&root).unwrap();
+        v.secret_add("API_TOKEN", b"t", std::slice::from_ref(&vpk))
+            .unwrap();
+        v.secret_add("OTHER", b"o", std::slice::from_ref(&vpk))
+            .unwrap();
+        let atk_id = id_of(&atk);
+        plant_secret_label(&v, "API_TOKEN", &atk_id);
+
+        // What the CLI derives from the labels with the key in recipients.toml.
+        let both = [vpk.clone(), atk.clone()];
+        let pairs = refused(v.secret_rotate("API_TOKEN", None, &both, Some(&vsk)));
+        assert_eq!(pairs[0].scope, "secret:API_TOKEN");
+        assert_eq!(pairs[0].id, atk_id);
+        assert!(pairs[0]
+            .remove_command()
+            .starts_with("sc secret revoke API_TOKEN --recipient-id"));
+
+        let report = v.rewrap(&vsk, &[], &both, false).unwrap();
+        assert_eq!(report.secrets_rewrapped, vec!["OTHER".to_string()]);
+        assert!(report.commit.is_some(), "partial success is kept");
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].0, "secret API_TOKEN");
+        assert!(
+            report.skipped[0].1.contains(&atk_id),
+            "{:?}",
+            report.skipped
+        );
+
+        // Accepting it is the user's call; then the rotate goes through.
+        v.accept_keys("secret:API_TOKEN", std::slice::from_ref(&atk))
+            .unwrap();
+        v.secret_rotate("API_TOKEN", None, &both, Some(&vsk))
+            .unwrap();
+        drop(v);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // 4. A bogus kek_wraps label: revoke would hand the fresh KEK to that key.
+    #[test]
+    fn a_planted_branch_label_blocks_revoke() {
+        let root = dir("branch-label");
+        let (vsk, vpk) = generate_keypair();
+        let (_, bob) = generate_keypair();
+        let (_, atk) = generate_keypair();
+        let v = Repo::init(&root).unwrap();
+        put(&root, "a.txt", "a\n");
+        v.commit("me", "base").unwrap();
+        v.branch_private("emb", &vsk, std::slice::from_ref(&bob), &[])
+            .unwrap();
+        let atk_id = id_of(&atk);
+        let (mid, mut m) = v.branch_manifest("emb").unwrap().unwrap();
+        m.kek_wraps.push(WrappedKey {
+            recipient_id: atk_id.clone(),
+            wrapped_dek: vec![0; 48],
+        });
+        m.prev = Some(mid);
+        let planted = {
+            let store_arc = v.vfs().store();
+            let id = store_arc.lock().unwrap().put(Object::Manifest(m)).unwrap();
+            id
+        };
+        crate::refs::write_branch_tip(v.layout(), "emb", &planted).unwrap();
+
+        let remaining = [vpk.clone(), atk.clone()];
+        let pairs = refused(v.branch_revoke("emb", &vsk, &bob.recipient_id(), &remaining));
+        assert_eq!(pairs[0].scope, "branch:emb");
+        assert_eq!(pairs[0].id, atk_id);
+        assert_eq!(
+            crate::refs::read_branch_tip(v.layout(), "emb").unwrap(),
+            Some(planted),
+            "the manifest did not change"
+        );
+
+        v.accept_keys("branch:emb", std::slice::from_ref(&atk))
+            .unwrap();
+        v.branch_revoke("emb", &vsk, &bob.recipient_id(), &remaining)
+            .unwrap();
+        // A local revoke drops the pair, so a later reappearance is refused again.
+        assert_eq!(
+            v.accepted()
+                .unwrap()
+                .unaccepted("branch:emb", std::slice::from_ref(&bob))
+                .len(),
+            1
+        );
+        drop(v);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // The writer adds its key to the victim's existing rule.
+    fn world_with_foreign_key_in_rule(tag: &str) -> World {
+        world(tag, |a, atk| {
+            // Built by hand: an honest `sc protect` in this clone would refuse
+            // the victim's own key, which the writer has not accepted. The
+            // writer cannot unwrap any DEK, so the sealed file keeps its wrap
+            // list; only the rule changes.
+            let tip = a.head_tip().unwrap().unwrap();
+            let snap = a.snapshot(&tip).unwrap();
+            let mut prot = snap.protection;
+            let rule = prot
+                .prefixes
+                .iter_mut()
+                .find(|p| p.prefix == "secret/")
+                .unwrap();
+            let epoch = rule.next_epoch();
+            rule.set_standing(atk.to_bytes(), epoch, scl_core::RecipientState::Granted);
+            a.commit_snapshot(snap.root, vec![tip], snap.secrets, prot, "w", "x")
+                .unwrap();
+        })
+    }
+
+    // 5. Own `protect --to` then commit needs no accept; protect over a merged-in
+    // foreign key refuses before any ref move.
+    #[test]
+    fn protect_accepts_its_own_keys_but_refuses_a_foreign_one_before_moving_a_ref() {
+        let w = world_with_foreign_key_in_rule("protect");
+        let (_, me) = generate_keypair();
+        // Own protect, own commit: no accept anywhere.
+        put(&w.v_root, "mine/x.txt", "x\n");
+        w.v.protect("mine/", std::slice::from_ref(&me), None)
+            .unwrap();
+        put(&w.v_root, "mine/x.txt", "y\n");
+        w.v.commit("me", "again").unwrap();
+
+        w.pull();
+        let tip = w.v.head_tip().unwrap();
+        let oplog = w.v.oplog().unwrap().len();
+        let pairs = refused(w.v.protect("secret/", std::slice::from_ref(&me), None));
+        assert_eq!(pairs[0].scope, "path:secret/");
+        assert_eq!(pairs[0].id, id_of(&w.atk));
+        assert_eq!(w.v.head_tip().unwrap(), tip, "no ref move");
+        assert_eq!(w.v.oplog().unwrap().len(), oplog, "no oplog record");
+
+        w.v.accept_keys("path:secret/", std::slice::from_ref(&w.atk))
+            .unwrap();
+        w.v.protect("secret/", std::slice::from_ref(&me), None)
+            .unwrap();
+        w.cleanup();
+    }
+
+    // protect also builds its sealing commit before moving any ref, so a seal
+    // that another rule's unaccepted key refuses leaves no policy-only commit.
+    #[test]
+    fn protect_leaves_no_policy_commit_when_another_rule_refuses_its_seal() {
+        let w = world("protect-atomic", |a, atk| {
+            a.protect("secret/sub/", std::slice::from_ref(atk), None)
+                .unwrap();
+        });
+        w.pull();
+        let (_, me) = generate_keypair();
+        put(&w.v_root, "secret/sub/x.txt", "victim data\n");
+        put(&w.v_root, "docs/y.txt", "y\n");
+        let tip = w.v.head_tip().unwrap();
+        let oplog = w.v.oplog().unwrap().len();
+        let pairs = refused(w.v.protect("docs/", std::slice::from_ref(&me), None));
+        assert_eq!(pairs[0].scope, "path:secret/sub/");
+        assert_eq!(w.v.head_tip().unwrap(), tip, "no ref move");
+        assert_eq!(w.v.oplog().unwrap().len(), oplog, "no oplog record");
+        assert!(w
+            .v
+            .protected_prefixes()
+            .unwrap()
+            .iter()
+            .all(|(p, _)| p != "docs/"));
+        w.cleanup();
+    }
+
+    // 6. A commit that only carries sealed content passes with an unaccepted key
+    // in the rule; the same commit sealing a changed file does not.
+    #[test]
+    fn a_carry_only_commit_passes_with_an_unaccepted_key_in_the_rule() {
+        let w = world_with_foreign_key_in_rule("carry");
+        w.pull();
+        put(&w.v_root, "readme.txt", "edited\n");
+        w.v.commit("me", "carry only").unwrap();
+        assert!(
+            !wrapped_to(&w.v, &id_of(&w.atk)),
+            "carrying minted no wrap for the planted key"
+        );
+
+        put(&w.v_root, "secret/a.txt", "changed\n");
+        let pairs = refused(w.v.commit("me", "seals"));
+        assert_eq!(pairs[0].id, id_of(&w.atk));
+        w.cleanup();
+    }
+
+    // 7. A secret added in this clone can be rotated with the default recipient
+    // set; a key outside it cannot.
+    #[test]
+    fn secret_add_then_default_rotate_passes() {
+        let root = dir("rotate");
+        let (vsk, vpk) = generate_keypair();
+        let (_, other) = generate_keypair();
+        let v = Repo::init(&root).unwrap();
+        v.secret_add("S1", b"v", std::slice::from_ref(&vpk))
+            .unwrap();
+        v.secret_rotate("S1", None, std::slice::from_ref(&vpk), Some(&vsk))
+            .unwrap();
+        refused(v.secret_rotate("S1", None, &[vpk, other], Some(&vsk)));
+        drop(v);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // 8. A stopped merge refuses on an unaccepted key; accepting while stopped
+    // lets the completion retry.
+    #[test]
+    fn a_stopped_merge_completes_after_an_accept_made_during_the_stop() {
+        let v_root = dir("stop-v");
+        let a_root = dir("stop-a");
+        std::fs::remove_dir_all(&a_root).unwrap();
+        let (_, atk) = generate_keypair();
+        let v = Repo::init(&v_root).unwrap();
+        put(&v_root, "n.txt", "base\n");
+        v.commit("me", "base").unwrap();
+        drop(v);
+        let a = Repo::clone_to(&v_root, &a_root).unwrap();
+        put(&a_root, "n.txt", "theirs\n");
+        a.protect("docs/", std::slice::from_ref(&atk), None)
+            .unwrap();
+        drop(a);
+        let v = Repo::open(&v_root).unwrap();
+        put(&v_root, "n.txt", "ours\n");
+        put(&v_root, "docs/q.txt", "ours only\n");
+        v.commit("me", "ours").unwrap();
+        v.remote_add("a", a_root.to_str().unwrap()).unwrap();
+        v.fetch("a").unwrap();
+        assert!(matches!(
+            v.merge("a/main", "me"),
+            Err(Error::MergeConflicts(1))
+        ));
+        put(&v_root, "n.txt", "resolved\n");
+
+        let atk_id = id_of(&atk);
+        let pairs = refused(v.commit("me", "merge"));
+        assert_eq!(pairs[0].id, atk_id);
+        assert!(
+            crate::merge_state::in_progress(v.layout()),
+            "the stop is intact"
+        );
+
+        v.accept_keys("path:docs/", std::slice::from_ref(&atk))
+            .unwrap();
+        let id = v.commit("me", "merge").unwrap();
+        assert!(!crate::merge_state::in_progress(v.layout()));
+        assert_eq!(v.snapshot(&id).unwrap().parents.len(), 2);
+        assert!(wrapped_to(&v, &atk_id));
+        drop(v);
+        let _ = std::fs::remove_dir_all(v_root);
+        let _ = std::fs::remove_dir_all(a_root);
+    }
+
+    // 9. The record never travels: not in a clone, not by push or fetch, and gc
+    // leaves it alone.
+    #[test]
+    fn the_record_never_appears_in_clone_fetch_or_push() {
+        let v_root = dir("travel-v");
+        let c_root = dir("travel-c");
+        std::fs::remove_dir_all(&c_root).unwrap();
+        let (_, pk) = generate_keypair();
+        let v = Repo::init(&v_root).unwrap();
+        put(&v_root, "secret/a.txt", "x\n");
+        v.protect("secret/", &[pk], None).unwrap();
+        let record = v.layout().accepted_recipients_path();
+        let bytes = std::fs::read(&record).unwrap();
+        assert!(!bytes.is_empty(), "premise: protect recorded its key");
+        drop(v);
+
+        let c = Repo::clone_to(&v_root, &c_root).unwrap();
+        let c_record = c.layout().accepted_recipients_path();
+        assert!(!c_record.exists(), "a clone starts with an empty record");
+        // What the origin accepted is not inherited: sealing to its key is
+        // refused here until this clone accepts it.
+        put(&c_root, "secret/b.txt", "b\n");
+        refused(c.commit("me", "seal"));
+        std::fs::remove_file(c_root.join("secret/b.txt")).unwrap();
+        put(&c_root, "more.txt", "m\n");
+        c.commit("me", "more").unwrap();
+        c.push("origin").unwrap();
+        assert!(!c_record.exists(), "a push does not create it either");
+        assert_eq!(std::fs::read(&record).unwrap(), bytes, "push left it alone");
+        drop(c);
+
+        let v = Repo::open(&v_root).unwrap();
+        v.remote_add("c", c_root.to_str().unwrap()).unwrap();
+        v.fetch("c").unwrap();
+        v.gc(std::time::Duration::from_secs(0)).unwrap();
+        assert_eq!(std::fs::read(&record).unwrap(), bytes, "fetch and gc too");
+        drop(v);
+        let _ = std::fs::remove_dir_all(v_root);
+        let _ = std::fs::remove_dir_all(c_root);
+    }
+
+    // A prefix may hold tabs, newlines and `%`; the file format must survive it.
+    // A path scope records the full key, the others the id.
+    #[test]
+    fn a_scope_with_control_characters_round_trips() {
+        let root = dir("escape");
+        let (_, pk) = generate_keypair();
+        let (_, other) = generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        let scope = "path:we\tird\n%0A\r/";
+        repo.accept_keys(scope, std::slice::from_ref(&pk)).unwrap();
+        repo.accept_keys("secret:S", std::slice::from_ref(&pk))
+            .unwrap();
+        let text = std::fs::read_to_string(repo.layout().accepted_recipients_path()).unwrap();
+        assert!(text.contains(&format!(
+            "path:we%09ird%0A%250A%0D/\t{}",
+            pk.to_key_string()
+        )));
+        assert!(text.contains(&format!("secret:S\t{}", id_of(&pk))));
+        let acc = repo.accepted().unwrap();
+        assert!(acc.unaccepted(scope, std::slice::from_ref(&pk)).is_empty());
+        assert_eq!(acc.unaccepted(scope, std::slice::from_ref(&other)).len(), 1);
+        assert_eq!(acc.pairs.len(), 2);
+        // A path scope needs the full key; a bad scope is refused.
+        assert!(repo
+            .accept_recipient("path:x/", &pk.recipient_id(), None)
+            .is_err());
+        repo.accept_recipient("secret:T", &pk.recipient_id(), None)
+            .unwrap();
+        assert!(repo.accept_keys("nope", std::slice::from_ref(&pk)).is_err());
+        // Forgetting goes by recipient id, whichever form was recorded.
+        assert!(repo.forget_recipient(scope, &pk.recipient_id()).unwrap());
+        assert!(!repo.forget_recipient(scope, &pk.recipient_id()).unwrap());
+        assert!(repo
+            .forget_recipient("secret:S", &pk.recipient_id())
+            .unwrap());
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // Escrow is accepted in every scope.
+    #[test]
+    fn local_escrow_counts_as_accepted_everywhere() {
+        let root = dir("escrow");
+        let (_, escrow) = generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        put(
+            &root,
+            ".sc/recipients.toml",
+            &format!("[escrow]\nkeys = [\"{}\"]\n", escrow.to_key_string()),
+        );
+        let acc = repo.accepted().unwrap();
+        let (_, other) = generate_keypair();
+        for scope in ["path:a/", "secret:X", "branch:b"] {
+            assert!(acc
+                .unaccepted(scope, std::slice::from_ref(&escrow))
+                .is_empty());
+            assert_eq!(acc.unaccepted(scope, std::slice::from_ref(&other)).len(), 1);
+        }
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

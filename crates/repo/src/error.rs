@@ -30,6 +30,12 @@ pub enum Error {
     NotAuthorized(String),
     #[error("invalid argument: {}", scl_core::sanitize_display_line(.0))]
     InvalidArgument(String),
+    /// A seal would wrap a key to a recipient this clone never accepted for the
+    /// scope (ADR-0059). Raised before any ref moves.
+    #[error("{}", crate::accepted::describe(.pairs))]
+    UnacceptedRecipients {
+        pairs: Vec<crate::accepted::Unaccepted>,
+    },
     #[error("operation requires at least one commit (branch is unborn)")]
     Unborn,
     #[error("a merge is already in progress (resolve and `sc commit`, or `sc merge --abort`)")]

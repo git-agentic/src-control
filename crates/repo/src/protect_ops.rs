@@ -82,9 +82,29 @@ impl Repo {
                     .collect(),
             }),
         }
+        // The candidate rule holds the keys just named plus any already in it
+        // (a merged-in foreign one), and the sealing commit would wrap to all of
+        // them, so refuse before anything moves (ADR-0059). This catches a rule
+        // with nothing to seal yet too.
+        let scope = crate::accepted::path_scope(prefix);
+        if let Some(rule) = protection.prefixes.iter().find(|p| p.prefix == prefix) {
+            let granted: Vec<scl_crypto::PublicKey> = rule
+                .granted_keys()
+                .iter()
+                .map(|k| scl_crypto::PublicKey::from_bytes(*k))
+                .collect();
+            self.accepted()?
+                .with_named(&scope, recipients)
+                .require(&scope, &granted)?;
+        }
+        self.accept_keys(&scope, recipients)?;
         let head = crate::refs::current_branch(self.layout())?;
         let before = crate::refs::read_branch_tip(self.layout(), &head)?;
-        let id = self.commit_snapshot(
+        // Build the rule's snapshot and the sealing commit on top of it before
+        // either ref moves, so a seal the gate refuses under ANY rule leaves the
+        // ref and the oplog untouched. (`commit` does the same work, but only
+        // after the rule's own ref move.)
+        let policy_id = self.build_snapshot(
             root,
             parents,
             secrets,
@@ -92,17 +112,42 @@ impl Repo {
             "system",
             &format!("protect {prefix}"),
         )?;
+        let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
+        let mut cache = self.open_protected_cache()?;
+        let message = format!("encrypt under {prefix}");
+        let id = self.snapshot_files(
+            files,
+            Some(policy_id),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &self.sparse_spec()?,
+            &self.layout.root,
+            Some(&mut cache),
+            "system",
+            &message,
+        )?;
+        crate::refs::write_branch_tip(self.layout(), &head, &policy_id)?;
         crate::oplog::record(
             self.layout(),
             &format!("protect {prefix}"),
             &head,
             &head,
-            &[(head.clone(), before, Some(id))],
+            &[(head.clone(), before, Some(policy_id))],
         )?;
-        // Now encrypt matching working-tree files under the freshly-recorded rule.
-        // `commit` (repo.rs) logs its own oplog record ("commit: encrypt under
-        // <prefix>") — a second, distinct ref move, so no double-logging here.
-        self.commit("system", &format!("encrypt under {prefix}"))
+        // The sealing commit logs its own record, like `commit`.
+        crate::refs::write_branch_tip(self.layout(), &head, &id)?;
+        cache.save_best_effort();
+        crate::oplog::record(
+            self.layout(),
+            &format!("commit: {message}"),
+            &head,
+            &head,
+            &[(head.clone(), Some(policy_id), Some(id))],
+        )?;
+        Ok(id)
     }
 
     /// Collect the PROTECTED blob ids in the tip tree whose path is governed by
@@ -163,6 +208,11 @@ impl Repo {
             .position(|p| p.prefix == prefix)
             .ok_or_else(|| Error::NotProtected(prefix.to_string()))?;
 
+        // The caller named `new`, so it is accepted for this prefix.
+        self.accept_keys(
+            &crate::accepted::path_scope(prefix),
+            std::slice::from_ref(new),
+        )?;
         let protected_ids = self.protected_blob_ids_under(root, &protection, prefix)?;
         let authorized_id = authorized.public().recipient_id().to_string();
         let new_id = new.recipient_id().to_string();
@@ -299,6 +349,7 @@ impl Repo {
             &head,
             &[(head.clone(), before, Some(id))],
         )?;
+        self.forget_recipient(&crate::accepted::path_scope(prefix), recipient_id)?;
         Ok(id)
     }
 

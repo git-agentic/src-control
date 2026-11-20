@@ -110,6 +110,12 @@ impl Layout {
     pub fn transcript_pending_trust_path(&self) -> PathBuf {
         self.dot_sc.join("transcript-pending-trust")
     }
+    /// `.sc/accepted-recipients` — the keys this clone accepted per scope
+    /// (ADR-0059). Local state like `.sc/local-key`: never committed, packed,
+    /// transferred or read by gc.
+    pub fn accepted_recipients_path(&self) -> PathBuf {
+        self.dot_sc.join("accepted-recipients")
+    }
     /// `.sc/tmp` — scratch space for transient files (P25 streaming pack
     /// transfer: spilled sender/receiver pack bodies). Never durable state —
     /// safe to delete at any time; callers that write here are responsible

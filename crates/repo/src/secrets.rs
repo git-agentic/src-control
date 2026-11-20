@@ -107,6 +107,8 @@ impl Repo {
         }
         check_secret_name(name)?;
         require_recipients(recipients)?;
+        // The caller named these keys, so they are accepted for this secret.
+        self.accept_keys(&crate::accepted::secret_scope(name), recipients)?;
         let secret = scl_crypto::seal(name, value, recipients);
         let id = {
             let arc = self.store_arc();
@@ -155,6 +157,10 @@ impl Repo {
                 _ => return Err(Error::NoSuchSecret(format!("{name} is not a secret"))),
             }
         };
+        self.accept_keys(
+            &crate::accepted::secret_scope(name),
+            std::slice::from_ref(new),
+        )?;
         let regranted = scl_crypto::rewrap_for(&secret, authorized, new)?;
         let new_id = {
             let arc = self.store_arc();
@@ -213,12 +219,14 @@ impl Repo {
             i
         };
         reg.insert(name.to_string(), new_id);
-        self.commit_registry(
+        let id = self.commit_registry(
             reg,
             "secret",
             &format!("revoke from {name}"),
             &format!("secret revoke {name}"),
-        )
+        )?;
+        self.forget_recipient(&crate::accepted::secret_scope(name), recipient)?;
+        Ok(id)
     }
 
     /// Rotate a secret's value under a **fresh DEK**, re-sealing for `recipients`.
@@ -247,6 +255,11 @@ impl Repo {
             return Err(Error::RebaseInProgress);
         }
         require_recipients(recipients)?;
+        // The set may come from the secret's own wrap labels (repository
+        // data), so every key must be accepted for it (ADR-0059). A caller
+        // that named the keys accepts them first (`accept_keys`).
+        self.accepted()?
+            .require(&crate::accepted::secret_scope(name), recipients)?;
         let mut reg = self.registry()?;
         let sid = *reg
             .get(name)
@@ -1384,6 +1397,8 @@ mod tests {
         let (sk, pk) = scl_crypto::generate_keypair();
         let repo = Repo::init(&root).unwrap();
         plant(&repo, "A", "B", b"value-of-b", &pk);
+        repo.accept_keys("secret:A", std::slice::from_ref(&pk))
+            .unwrap();
         let err = repo
             .secret_rotate("A", None, std::slice::from_ref(&pk), Some(&sk))
             .unwrap_err();

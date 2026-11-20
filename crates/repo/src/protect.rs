@@ -124,8 +124,9 @@ pub(crate) fn decrypt_with(
 }
 
 /// A working-tree file headed for sealing: `(path, plaintext, mode, recipient
-/// pubkeys)`.
-pub(crate) type SealInput = (String, Vec<u8>, FileMode, Vec<[u8; 32]>);
+/// pubkeys, winning rule's prefix)`. The prefix names the scope the recipients
+/// must be accepted for (ADR-0059).
+pub(crate) type SealInput = (String, Vec<u8>, FileMode, Vec<[u8; 32]>, String);
 /// A sealed (or carried) protected file: `(path, ciphertext, mode, perms)`.
 pub(crate) type SealedFile = (String, Vec<u8>, FileMode, u8);
 /// Wrapped DEKs keyed by the ciphertext blob they unlock.
@@ -141,11 +142,32 @@ pub(crate) type WrapMap = BTreeMap<ObjectId, Vec<WrappedKey>>;
 /// file's recipient list is empty: a rule whose every recipient is
 /// tombstoned (e.g. crossed revokes merged together) must fail the seal
 /// loudly — sealing to nobody mints permanently unreadable ciphertext.
-pub(crate) fn encrypt_protected(plaintexts: Vec<SealInput>) -> Result<(Vec<SealedFile>, WrapMap)> {
+///
+/// The one place a rule's recipients become wraps, so it is also the gate
+/// (ADR-0059): every recipient must be accepted in this clone for the winning
+/// rule's scope (or be local escrow), else the call refuses, naming every
+/// unaccepted pair, before any file is sealed.
+pub(crate) fn encrypt_protected(
+    plaintexts: Vec<SealInput>,
+    accepted: &crate::accepted::Accepted,
+) -> Result<(Vec<SealedFile>, WrapMap)> {
+    let mut unaccepted: Vec<crate::accepted::Unaccepted> = Vec::new();
+    for (_, _, _, recipients, prefix) in &plaintexts {
+        let keys: Vec<scl_crypto::PublicKey> = recipients
+            .iter()
+            .map(|k| scl_crypto::PublicKey::from_bytes(*k))
+            .collect();
+        for u in accepted.unaccepted(&crate::accepted::path_scope(prefix), &keys) {
+            if !unaccepted.contains(&u) {
+                unaccepted.push(u);
+            }
+        }
+    }
+    crate::accepted::refuse_if_any(unaccepted)?;
     // Encrypt protected files; accumulate fresh wrapped DEKs keyed by blob id.
     let mut all: Vec<(String, Vec<u8>, FileMode, u8)> = Vec::new();
     let mut fresh_wrapped: BTreeMap<ObjectId, Vec<WrappedKey>> = BTreeMap::new();
-    for (path, bytes, mode, recipients) in plaintexts {
+    for (path, bytes, mode, recipients, _) in plaintexts {
         if recipients.is_empty() {
             return Err(Error::InvalidArgument(format!(
                 "{path} is protected but its rule has no granted recipients \
@@ -202,12 +224,17 @@ mod tests {
     fn encrypt_protected_seals_randomized() {
         let (_sk, pk) = scl_crypto::generate_keypair();
         let f = |v: &[u8]| {
-            encrypt_protected(vec![(
-                "secret/x".into(),
-                v.to_vec(),
-                FileMode::FILE,
-                vec![pk.to_bytes()],
-            )])
+            encrypt_protected(
+                vec![(
+                    "secret/x".into(),
+                    v.to_vec(),
+                    FileMode::FILE,
+                    vec![pk.to_bytes()],
+                    "secret/".into(),
+                )],
+                &crate::accepted::Accepted::default()
+                    .with_named("path:secret/", std::slice::from_ref(&pk)),
+            )
             .unwrap()
         };
         let (a1, _) = f(b"same");
@@ -403,12 +430,16 @@ mod tests {
 
     #[test]
     fn encrypt_protected_refuses_empty_recipient_list() {
-        let err = encrypt_protected(vec![(
-            "secret/x".into(),
-            b"v".to_vec(),
-            FileMode::FILE,
-            vec![],
-        )])
+        let err = encrypt_protected(
+            vec![(
+                "secret/x".into(),
+                b"v".to_vec(),
+                FileMode::FILE,
+                vec![],
+                "secret/".into(),
+            )],
+            &crate::accepted::Accepted::default(),
+        )
         .unwrap_err();
         assert!(
             matches!(err, Error::InvalidArgument(_)),

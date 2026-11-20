@@ -481,7 +481,9 @@ impl Repo {
         let mut protected: Vec<ProtectedFile> = Vec::new();
         for (path, bytes, mode) in files {
             match crate::protect::matching_prefix(&protection, &path) {
-                Some(rule) => protected.push((path, bytes, mode, rule.granted_keys())),
+                Some(rule) => {
+                    protected.push((path, bytes, mode, rule.granted_keys(), rule.prefix.clone()))
+                }
                 None => plain.push((path, bytes, mode)),
             }
         }
@@ -580,7 +582,7 @@ impl Repo {
             Some(h) if cache.is_some() => Some(self.snapshot(&h)?.root),
             _ => None,
         };
-        for (path, bytes, mode, granted) in protected {
+        for (path, bytes, mode, granted, prefix) in protected {
             // Does `blob_id` (a protected blob with `perms`) provably hold
             // exactly `bytes`? A convergent prior is proven by re-encrypting
             // and comparing; a randomized one can't be, so it consults the
@@ -674,18 +676,19 @@ impl Repo {
                         // fall back to sealing rather than dropping content.
                         None => {
                             sealed_plaintexts.push((path.clone(), bytes.clone()));
-                            to_seal.push((path, bytes, mode, granted));
+                            to_seal.push((path, bytes, mode, granted, prefix));
                         }
                     }
                 }
                 None => {
                     sealed_plaintexts.push((path.clone(), bytes.clone()));
-                    to_seal.push((path, bytes, mode, granted));
+                    to_seal.push((path, bytes, mode, granted, prefix));
                 }
             }
         }
 
-        let (protected_all, sealed_wrapped) = crate::protect::encrypt_protected(to_seal)?;
+        let (protected_all, sealed_wrapped) =
+            crate::protect::encrypt_protected(to_seal, &self.accepted()?)?;
         // Record every freshly sealed path's new blob id into the cache; the
         // committing caller persists it only after the ref actually moves.
         if let Some(c) = cache {
@@ -1784,10 +1787,15 @@ impl Repo {
         let mut to_encrypt: Vec<crate::protect::SealInput> = Vec::new();
         for f in &merge_result.files {
             if f.needs_encrypt {
-                let recipients = crate::protect::matching_prefix(&union_prot, &f.path)
-                    .map(|r| r.granted_keys())
+                let rule = crate::protect::matching_prefix(&union_prot, &f.path)
                     .ok_or_else(|| Error::NotProtected(f.path.clone()))?;
-                to_encrypt.push((f.path.clone(), f.bytes.clone(), f.mode, recipients));
+                to_encrypt.push((
+                    f.path.clone(),
+                    f.bytes.clone(),
+                    f.mode,
+                    rule.granted_keys(),
+                    rule.prefix.clone(),
+                ));
             } else if f.perms & scl_core::PROTECTED == 0 {
                 match crate::protect::matching_prefix(&union_prot, &f.path) {
                     Some(rule) => to_encrypt.push((
@@ -1795,6 +1803,7 @@ impl Repo {
                         f.bytes.clone(),
                         f.mode,
                         rule.granted_keys(),
+                        rule.prefix.clone(),
                     )),
                     None => carried.push((f.path.clone(), f.bytes.clone(), f.mode, 0)),
                 }
@@ -1868,7 +1877,8 @@ impl Repo {
             return Err(Error::MergeConflicts(merge_result.conflicts.len()));
         }
 
-        let (encrypted, fresh_wrapped) = crate::protect::encrypt_protected(to_encrypt)?;
+        let (encrypted, fresh_wrapped) =
+            crate::protect::encrypt_protected(to_encrypt, &self.accepted()?)?;
         carried.extend(encrypted);
         let all = carried;
 
@@ -2215,7 +2225,7 @@ impl Repo {
             &self.layout,
             &sidecars.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>(),
         )?;
-        for (path, bytes, mode, _recipients) in to_encrypt {
+        for (path, bytes, mode, ..) in to_encrypt {
             let full = worktree::safe_join(&self.layout.root, path)?;
             worktree::clear_dir_obstruction(&full, path)?;
             if let Some(parent) = full.parent() {
@@ -3049,6 +3059,8 @@ impl Repo {
                 (root, vec![], BTreeMap::new(), Protection::default())
             }
         };
+        // The test names these keys, like `protect --to` does.
+        self.accept_keys(&crate::accepted::path_scope(prefix), recipients)?;
         protection.prefixes.retain(|p| p.prefix != prefix);
         protection.prefixes.push(ProtectPrefix {
             prefix: prefix.to_string(),
