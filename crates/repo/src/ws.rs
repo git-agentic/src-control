@@ -452,6 +452,9 @@ impl Repo {
             let store_arc = self.vfs().store();
             let mut store = store_arc.lock().unwrap();
             crate::worktree::preflight_view(self.layout(), &mut store, tip_root, &sparse)?;
+            // A full clone returns above without looking at paths: refuse an
+            // unsafe tree before the old session directory is cleared.
+            crate::worktree::preflight_paths(&mut store, tip_root, &sparse)?;
         }
 
         let root = ws_dir(self.layout(), name);

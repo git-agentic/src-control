@@ -32,6 +32,8 @@ mod partial_sessions;
 mod partial_size;
 #[cfg(test)]
 mod partial_walks;
+#[cfg(test)]
+mod path_guard;
 pub mod pick_state;
 pub mod private;
 #[cfg(test)]

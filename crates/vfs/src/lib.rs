@@ -231,6 +231,12 @@ impl Repo {
                 .map(String::as_str)
                 .chain(carried.keys().map(String::as_str)),
         )?;
+        check_new_paths(
+            files
+                .keys()
+                .map(String::as_str)
+                .chain(carried.keys().map(String::as_str)),
+        )?;
         self.build_subtree_inner(files, carried, "")
     }
 
@@ -325,6 +331,26 @@ pub fn check_file_dir_collisions<'a>(paths: impl IntoIterator<Item = &'a str>) -
                 });
             }
         }
+    }
+    Ok(())
+}
+
+/// Refuse a path a snapshot must not carry: traversal components, a NUL, or
+/// the `.sc` control directory under any alias (see
+/// [`scl_core::check_tree_path`]). Checked before any tree object is written,
+/// so a new snapshot can never hold what every checkout refuses. The Windows
+/// rule is not applied: `:` and `\` are legal names on unix. Public so the
+/// private-branch tree builder applies the same rule.
+pub fn check_new_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    check_paths(paths, false)
+}
+
+fn check_paths<'a>(paths: impl IntoIterator<Item = &'a str>, windows: bool) -> Result<()> {
+    for p in paths {
+        scl_core::check_tree_path(p, windows).map_err(|reason| scl_core::Error::UnsafePath {
+            path: p.to_string(),
+            reason,
+        })?;
     }
     Ok(())
 }
@@ -494,9 +520,12 @@ impl Worktree {
     /// the only operation in the engine that writes files; the caller owns the
     /// destination and is responsible for removing it.
     pub fn checkout(&self, dest: &Path) -> Result<usize> {
+        // Refuse before the first write: a base tree may come from a peer.
+        let paths = self.list()?;
+        check_paths(paths.iter().map(String::as_str), cfg!(windows))?;
         std::fs::create_dir_all(dest)?;
         let mut count = 0;
-        for path in self.list()? {
+        for path in paths {
             let bytes = self.read(&path)?;
             let full = dest.join(&path);
             if let Some(parent) = full.parent() {
@@ -843,5 +872,71 @@ mod tests {
         assert!(!dest.join("DB_URL").exists());
         std::fs::remove_dir_all(&dest).unwrap();
         assert!(!dest.exists());
+    }
+
+    #[test]
+    fn a_new_snapshot_refuses_control_dir_aliases_and_nul() {
+        let r = repo();
+        let f = |p: &str| (p.to_string(), b"x".to_vec(), FileMode::FILE, 0u8);
+        for bad in [".sc/recipients.toml", "a/.SC/b", "sc~1", ".sc.", "a\0b"] {
+            let err = r.write_tree_with_perms(&[f("ok.txt"), f(bad)]).unwrap_err();
+            assert!(
+                matches!(&err, Error::Core(scl_core::Error::UnsafePath { .. })),
+                "{bad:?}: {err:?}"
+            );
+        }
+        // `:` and `\` are legal unix names, and `.scignore` is not `.sc`.
+        assert!(r
+            .write_tree_with_perms(&[f("a:b"), f("a\\b"), f(".scignore")])
+            .is_ok());
+    }
+
+    #[test]
+    fn checkout_of_a_planted_control_path_refuses_before_writing() {
+        let r = repo();
+        let store = r.store();
+        let snap = {
+            let mut s = store.lock().unwrap();
+            let blob = s.put(Object::blob(b"planted".to_vec())).unwrap();
+            let entry = |name: &str, kind, id| scl_core::TreeEntry {
+                name: name.into(),
+                kind,
+                id,
+                mode: FileMode::FILE,
+                perms: 0,
+            };
+            let sub = s
+                .put(Object::Tree(Tree::new(vec![entry(
+                    "recipients.toml",
+                    EntryKind::Blob,
+                    blob,
+                )])))
+                .unwrap();
+            let root = s
+                .put(Object::Tree(Tree::new(vec![
+                    entry(".sc", EntryKind::Tree, sub),
+                    entry("a.txt", EntryKind::Blob, blob),
+                ])))
+                .unwrap();
+            s.put(Object::Snapshot(Snapshot {
+                root,
+                parents: vec![],
+                author: "t".into(),
+                timestamp: 0,
+                message: "planted".into(),
+                secrets: Default::default(),
+                protection: Protection::default(),
+            }))
+            .unwrap()
+        };
+        let wt = r.fork(snap, "evil").unwrap();
+        let dest = std::env::temp_dir().join(format!("scl-planted-co-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dest);
+        let err = wt.checkout(&dest).unwrap_err();
+        assert!(
+            matches!(&err, Error::Core(scl_core::Error::UnsafePath { .. })),
+            "{err:?}"
+        );
+        assert!(!dest.exists(), "nothing is written, not even the directory");
     }
 }

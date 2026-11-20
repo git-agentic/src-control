@@ -31,6 +31,15 @@ pub enum Error {
     #[error("bad pack index: {0}")]
     BadPackIndex(String),
 
+    /// A tree path that must never be written under a checkout (traversal,
+    /// NUL, the `.sc` control directory or an alias of it, and on Windows a
+    /// separator or drive marker); see [`crate::check_tree_path`].
+    #[error("unsafe path in tree: {path:?}: {reason}")]
+    UnsafePath {
+        path: String,
+        reason: crate::pathname::PathRefusal,
+    },
+
     #[error("backend io error: {0}")]
     Io(#[from] std::io::Error),
 }

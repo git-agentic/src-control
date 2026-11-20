@@ -223,6 +223,7 @@ impl Repo {
                 } else {
                     format!("{prefix}/{}", e.name)
                 };
+                worktree::check_tree_entry_path(&path)?;
                 match e.kind {
                     EntryKind::Blob => {
                         out.insert(path, (e.id, e.mode, e.perms));
@@ -1106,6 +1107,7 @@ pub(crate) fn build_tree_objects(
     entries: &BTreeMap<String, (ObjectId, FileMode, u8)>,
 ) -> Result<(ObjectId, Vec<Object>)> {
     scl_vfs::check_file_dir_collisions(entries.keys().map(String::as_str))?;
+    scl_vfs::check_new_paths(entries.keys().map(String::as_str))?;
     let mut trees = Vec::new();
     let root = build_subtree(entries, "", &mut trees);
     Ok((root, trees))
