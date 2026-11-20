@@ -243,11 +243,15 @@ pub fn read_object_at_bounded(
 /// before it's ever used to slice `pack` — shared by [`read_object_at`]
 /// (`max = None`) and [`read_object_at_bounded`] (`max = Some(cap)`).
 fn record_bounds(pack: &[u8], offset: u64, max: Option<usize>) -> Result<(usize, usize)> {
-    let off = offset as usize;
-    if off + 4 > pack.len() {
-        return Err(Error::PackCorrupt(format!("offset {offset} past end")));
-    }
-    let len = u32::from_le_bytes(pack[off..off + 4].try_into().unwrap()) as usize;
+    // Offset and length come from an untrusted index or record: no unchecked
+    // addition on either.
+    let past_end = || Error::PackCorrupt(format!("offset {offset} past end"));
+    let off = usize::try_from(offset).map_err(|_| past_end())?;
+    let start = off
+        .checked_add(4)
+        .filter(|&s| s <= pack.len())
+        .ok_or_else(past_end)?;
+    let len = u32::from_le_bytes(pack[off..start].try_into().unwrap()) as usize;
     if let Some(max) = max {
         if len > max {
             return Err(Error::PackCorrupt(format!(
@@ -256,13 +260,10 @@ fn record_bounds(pack: &[u8], offset: u64, max: Option<usize>) -> Result<(usize,
             )));
         }
     }
-    let start = off + 4;
-    let end = start + len;
-    if end > pack.len() {
-        return Err(Error::PackCorrupt(format!(
-            "record at {offset} runs past end"
-        )));
-    }
+    let end = start
+        .checked_add(len)
+        .filter(|&e| e <= pack.len())
+        .ok_or_else(|| Error::PackCorrupt(format!("record at {offset} runs past end")))?;
     Ok((start, end))
 }
 
@@ -281,9 +282,12 @@ fn decompress_and_decode(payload: &[u8], id: &ObjectId, max: Option<usize>) -> R
         Some(max) => {
             let mut decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(payload))
                 .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
-            let canonical =
-                crate::read_limited(&mut decoder, max + 1, payload.len().saturating_mul(4))
-                    .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
+            let canonical = crate::read_limited(
+                &mut decoder,
+                max.saturating_add(1),
+                payload.len().saturating_mul(4),
+            )
+            .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
             if canonical.len() > max {
                 return Err(Error::PackCorrupt(format!(
                     "decompressed object exceeds the {max}-byte object size limit ({})",
@@ -431,8 +435,12 @@ pub fn parse_pack_reader_max<R: Read>(
         let canonical = {
             let mut decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(&payload))
                 .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
-            crate::read_limited(&mut decoder, max + 1, payload.len().saturating_mul(4))
-                .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?
+            crate::read_limited(
+                &mut decoder,
+                max.saturating_add(1),
+                payload.len().saturating_mul(4),
+            )
+            .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?
         };
         // Release the compressed copy before decoding, so peak per record is
         // decompressed + decoded (about 2 x cap), not three copies.
@@ -462,6 +470,30 @@ mod tests {
 
     fn enc(o: &Object) -> (crate::id::ObjectId, Vec<u8>) {
         (o.id(), o.encode())
+    }
+
+    /// A hostile index offset or record length near the integer limits must
+    /// be a corrupt-pack error, never an overflow panic (debug) or wrap
+    /// (release).
+    #[test]
+    fn record_bounds_rejects_overflowing_offsets_and_lengths() {
+        let id = crate::id::ObjectId::from_bytes([0u8; 32]);
+        let pack = [0u8; 48];
+        for offset in [u64::MAX, u64::MAX - 3, usize::MAX as u64 - 3, 45, 48] {
+            for max in [None, Some(1 << 20)] {
+                let err = record_bounds(&pack, offset, max).unwrap_err();
+                assert!(matches!(err, Error::PackCorrupt(_)), "{offset}: {err:?}");
+            }
+            assert!(read_object_at(&pack, offset, &id).is_err());
+            assert!(read_object_at_bounded(&pack, offset, &id, 1 << 20).is_err());
+        }
+        // Length prefix claims u32::MAX bytes from a valid offset.
+        let mut long = vec![0u8; 16];
+        long[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            record_bounds(&long, 0, None).unwrap_err(),
+            Error::PackCorrupt(_)
+        ));
     }
 
     #[test]
