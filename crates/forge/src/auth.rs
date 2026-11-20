@@ -162,8 +162,12 @@ pub fn by_password(app: &App, conn: &Connection, req: &Req, cred: &Cred) -> Resu
         let Some(_slot) = app.gate.acquire_timeout(VERIFY_WAIT) else {
             // Our own load says nothing about the credential: give the reservation back.
             app.backoff.cancel(req.source);
-            return Err(error(&app.base, 503, "too many password checks in flight, try again")
-                .with("retry-after", "5".into()));
+            return Err(error(
+                &app.base,
+                503,
+                "too many password checks in flight, try again",
+            )
+            .with("retry-after", "5".into()));
         };
         verify_password(pass, found.as_ref().map(|u| u.password_hash.as_str()))
     };
