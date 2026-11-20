@@ -103,6 +103,15 @@ too, not just the src-control-side metadata.
   protected blob under a fresh key (ADR-0051), whereas a plain `sc rewrap` only
   replaces wrap lists and leaves the key a revoked holder already has. History
   keeps the old wraps and ciphertext regardless.
+- **A dropped rule cannot turn a recipient's commit into a plaintext leak:**
+  protection rules are repository data, so a writer can hand-build a tip that
+  keeps a path's `PROTECTED` entry but omits its rule. A recipient who checks
+  that tip out holds the plaintext, and an unguarded `sc commit` would store it
+  unsealed. Every commit-building path (commit, amend, merge/pick/rebase
+  completion, `sc ws harvest`, `sc work`) therefore refuses, before writing any
+  object, when a working-tree path is `PROTECTED` on a parent (the tip, and the
+  merge or pick head on a completion) and no rule in the resulting policy covers
+  it; restore the rule with `sc protect`.
 - **Local cache key, `sc keygen` identity and TLS serve key are owner-only on
   unix and Windows (P33, #214, #281):** the
   unchanged-detection cache is keyed by `.sc/local-key`, created owner-only from
