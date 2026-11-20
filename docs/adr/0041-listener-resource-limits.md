@@ -209,3 +209,19 @@ before closing. Closing with unread bytes makes the OS reset the socket and
 can destroy the reply; the drain keeps it deliverable when the client
 overshoots by less than the cap. A malformed frame still tears down at once.
 
+## Addendum: one deadline for the TLS handshake and the HTTP opening
+
+The 30 s opening bound was a per-read socket timeout. It bounded silence, not
+time: a client sending one byte every 29 s kept the opening open for about 66 h
+(8 KiB at 29 s a byte), before any token check, and 32 such connections filled
+the default `--max-connections`. The TLS handshake ran under the same per-read
+bound. Now the deadline (30 s) is fixed at accept and covers the handshake and
+the opening together: before each socket read the timeout is set to the time
+left, and at zero the read fails as timed out. For `sc+https` the narrowing sits
+in the socket under rustls (`scl_tlsio::server_stream` takes the deadline),
+because rustls reads one record in as many socket reads as the peer splits it
+into. The session timeout (decision 2) replaces the deadline after the `200`.
+The client's own connect bound is unchanged. Alongside it, `read_pack_stream`
+refuses an empty `ST_PACK_CHUNK` frame as a protocol error: it advanced neither
+the `--max-pack-size` count nor the idle timeout, and the sender never emits one.
+
