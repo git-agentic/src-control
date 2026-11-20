@@ -3,6 +3,7 @@ corpus/*
 !corpus/pack_decode/
 corpus/pack_decode/*
 !corpus/pack_decode/valid_record
+!corpus/pack_decode/raw_pack
 artifacts/
 coverage/
 Cargo.lock
