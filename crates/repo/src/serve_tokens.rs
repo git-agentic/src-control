@@ -53,12 +53,19 @@ struct TokenFile {
     tokens: Vec<TokenEntry>,
 }
 
+/// Parse the text of `serve-tokens.toml`. Public only so the fuzz crate can
+/// reach the parser without touching disk.
+#[doc(hidden)]
+pub fn parse_tokens(s: &str) -> Result<Vec<TokenEntry>> {
+    Ok(toml::from_str::<TokenFile>(s)
+        .map_err(|e| Error::BadConfig(format!("bad serve-tokens.toml: {e}")))?
+        .tokens)
+}
+
 /// Load all tokens (empty when the file is absent — the "no auth" state).
 pub fn load(layout: &Layout) -> Result<Vec<TokenEntry>> {
     match std::fs::read_to_string(layout.serve_tokens_path()) {
-        Ok(s) => Ok(toml::from_str::<TokenFile>(&s)
-            .map_err(|e| Error::BadConfig(format!("bad serve-tokens.toml: {e}")))?
-            .tokens),
+        Ok(s) => parse_tokens(&s),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(Error::Io(e)),
     }

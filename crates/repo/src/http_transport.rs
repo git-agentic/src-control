@@ -169,6 +169,15 @@ pub(crate) fn write_status(w: &mut impl Write, code: u16) -> Result<()> {
         .map_err(|e| Error::InvalidArgument(format!("HTTP status write failed: {e}")))
 }
 
+/// Run the three untrusted-opening parsers over `data`. Public only so the
+/// fuzz crate can reach the crate-private readers.
+#[doc(hidden)]
+pub fn fuzz_openings(data: &[u8]) {
+    let _ = read_client_opening(&mut &data[..]);
+    let _ = read_status(&mut &data[..]);
+    let _ = read_bounded_opening(&mut &data[..]);
+}
+
 /// CLIENT: read the status line + headers up to the blank line (bounded).
 /// Returns the numeric status code.
 pub(crate) fn read_status(r: &mut impl Read) -> Result<u16> {
