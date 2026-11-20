@@ -506,25 +506,26 @@ pub fn list_org_repos(ctx: &mut Ctx) -> Resp {
             };
             // A caller who cannot see the organization and can read nothing in it gets what a
             // missing organization gets (recorded departure from K#55); one who can read a
-            // repository there already knows it exists.
-            match crate::api::org_visible(ctx, &org) {
-                Ok(true) => {}
-                Ok(false) => match repos::list_visible(
-                    ctx.conn,
-                    &ctx.who.user,
-                    token_public_only(ctx),
-                    &filter,
-                    Sort::Id,
-                    1,
-                    1,
-                ) {
-                    Ok((_, 0)) => return crate::api::org_missing(ctx.app, &name),
-                    Ok(_) => {}
-                    Err(e) => return ctx.app.internal(&e),
-                },
+            // repository there already knows it exists. Decided from the very listing that is
+            // paginated, so a repository lost in between cannot leave a `200 []`.
+            let hidden = match crate::api::org_visible(ctx, &org) {
+                Ok(visible) => !visible,
                 Err(e) => return ctx.app.internal(&e),
+            };
+            let (page, limit) = page_params(ctx);
+            match repos::list_visible(
+                ctx.conn,
+                &ctx.who.user,
+                token_public_only(ctx),
+                &filter,
+                Sort::Id,
+                page,
+                limit,
+            ) {
+                Ok((_, 0)) if hidden => crate::api::org_missing(ctx.app, &name),
+                Ok((rows, total)) => list_response(ctx, &path, &rows, total, page, limit, false),
+                Err(e) => ctx.app.internal(&e),
             }
-            query_list(ctx, &filter, Sort::Id, &path, false)
         }
         Ok(_) => crate::api::org_missing(ctx.app, &name),
         Err(e) => ctx.app.internal(&e),
