@@ -525,6 +525,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (tcp, _) = listener.accept().unwrap();
+        // Fallback so a regression (no narrowing) fails the timing assertion
+        // instead of blocking in `write` forever.
+        tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
         let deadline = Duration::from_millis(600);
         let t0 = Instant::now();
         let mut dt = DeadlineTcp {
