@@ -3741,8 +3741,38 @@ fn run_ws(op: WsOp) -> Result<()> {
 /// is this function with `.enc` projected out — same file format handling,
 /// same errors, just a narrower return type so none of those call sites had
 /// to change shape.
+/// Whether a unix file mode lets group or others read or write the file (ssh's test for a private key).
+#[cfg(unix)]
+fn mode_open_to_group_or_others(mode: u32) -> bool {
+    mode & 0o077 != 0
+}
+
+/// Warn once on stderr when the identity file is accessible to group or others, as ssh does for keys.
+/// A warning only: an existing setup keeps working.
+#[cfg(unix)]
+fn warn_if_identity_too_open(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    if mode_open_to_group_or_others(mode)
+        && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        eprintln!(
+            "warning: identity file {} is accessible to other users (mode {mode:04o}); \
+             run `chmod 600 {}`",
+            path.display(),
+            path.display()
+        );
+    }
+}
+
 fn load_identity_full(flag: Option<PathBuf>) -> Result<scl_crypto::Identity> {
     let path = resolve_identity_path(flag);
+    #[cfg(unix)]
+    warn_if_identity_too_open(&path);
     let contents = scl_crypto::Zeroizing::new(
         std::fs::read_to_string(&path)
             .with_context(|| format!("reading identity {}", path.display()))?,
@@ -4890,6 +4920,17 @@ fn run_rewrap(identity: Option<PathBuf>, dry_run: bool, rotate: bool) -> Result<
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_mode_predicate_flags_group_and_other_access() {
+        for open in [0o644, 0o640, 0o604, 0o660, 0o666, 0o700 | 0o001, 0o620] {
+            assert!(mode_open_to_group_or_others(open), "{open:o}");
+        }
+        for private in [0o600, 0o400, 0o700, 0o500] {
+            assert!(!mode_open_to_group_or_others(private), "{private:o}");
+        }
+    }
 
     #[test]
     fn log_line_escapes_terminal_controls_from_author_and_message() {
