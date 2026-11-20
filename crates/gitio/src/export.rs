@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use scl_core::{EntryKind, Object, ObjectId, Snapshot, Store, PROTECTED};
+use scl_core::{EntryKind, FileMode, Object, ObjectId, Snapshot, Store, PROTECTED};
 
 /// A Git repository we write objects and refs into.
 pub(crate) struct GitTarget {
@@ -27,11 +27,12 @@ pub(crate) struct GitTreeEntry {
     pub oid: gix::ObjectId,
 }
 
-/// The Git entry kinds we emit. sc has no symlinks, so there is no link kind.
+/// The four Git entry kinds we emit.
 #[derive(Clone, Copy)]
 pub(crate) enum GitMode {
     File,
     Exec,
+    Link,
     Tree,
 }
 
@@ -48,6 +49,7 @@ impl GitMode {
         match self {
             GitMode::File => EntryKind::Blob,
             GitMode::Exec => EntryKind::BlobExecutable,
+            GitMode::Link => EntryKind::Link,
             GitMode::Tree => EntryKind::Tree,
         }
         .into()
@@ -262,12 +264,10 @@ fn map_tree(
                 map_tree(store, target, e.id, tree_memo, blob_memo, protected_count)?,
             ),
             EntryKind::Blob => {
-                // Only 100644 / 100755: a hostile tree must not smuggle in a symlink (120000)
-                // or gitlink mode, so the owner exec bit alone decides.
-                let mode = if e.mode.0 & 0o100 != 0 {
-                    GitMode::Exec
-                } else {
-                    GitMode::File
+                let mode = match e.mode {
+                    m if m == FileMode::EXEC => GitMode::Exec,
+                    FileMode(0o120000) => GitMode::Link,
+                    _ => GitMode::File,
                 };
                 (mode, map_blob(store, target, e.id, blob_memo)?)
             }
@@ -447,46 +447,96 @@ fn count_transcripts(
     Ok(count)
 }
 
-/// Code points HFS+ ignores when it compares names, so `.g\u{200c}it` is `.git` on a Mac.
-fn hfs_ignorable(c: char) -> bool {
-    matches!(c, '\u{200c}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}')
-}
-
-/// The names `fsck` treats as the special file `.<name>`: the dotted name, and on NTFS the 8.3 short
-/// names `<first six>~1` to `~4` and `<hash prefix>~1` to `~9`. `hash` is NTFS's fall-back short-name
-/// prefix for that file (`gi7eba` for `.gitmodules`).
-fn special_names(name: &str, hash: Option<&str>) -> Vec<String> {
-    let mut v = vec![format!(".{name}")];
-    v.extend((1..=4).map(|n| format!("{}~{n}", &name[..6])));
-    if let Some(h) = hash {
-        v.extend((1..=9).map(|n| format!("{h}~{n}")));
-    }
-    v
-}
-
-/// Whether a path component is one of `names` on any filesystem git runs on.
-fn is_alias(component: &str, names: &[String]) -> bool {
-    let c: String = component.chars().filter(|c| !hfs_ignorable(*c)).collect();
-    // NTFS ignores trailing dots and spaces and treats `name:stream` as the file `name`.
-    let c = c.split(':').next().unwrap_or("");
-    let c = c.trim_end_matches([' ', '.']).to_ascii_lowercase();
-    names.contains(&c)
-}
-
 /// Refuse a tree entry name git's `fsck` would refuse (or that a checkout would resolve into `.git`
-/// or `.gitmodules`), so a hostile sc tree cannot become a hostile Git tree.
+/// or `.gitmodules`), so a hostile sc tree cannot become a hostile Git tree. The `.git`, HFS and NTFS
+/// alias rules are git's own, via `gix::validate`; the Windows-only rules (reserved names, `:`, `?`)
+/// are left off because they are legal on Unix, which a repository may target. `.gitmodules` is
+/// refused for any entry kind (the validator only does so for symlinks, so it is told it is one).
 fn check_entry_name(name: &str) -> anyhow::Result<()> {
-    let bad = name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.contains(['/', '\\', '\0'])
-        || is_alias(name, &[".git".into(), "git~1".into()])
-        || is_alias(name, &special_names("gitmodules", Some("gi7eba")));
+    use gix::validate::path::component::{Mode, Options};
+    let opts = Options {
+        protect_windows: false,
+        protect_hfs: true,
+        protect_ntfs: true,
+    };
+    let bad = name.contains(['\\', '\0'])
+        || gix::validate::path::component(name.as_bytes().into(), Some(Mode::Symlink), opts)
+            .is_err();
     anyhow::ensure!(
         !bad,
         "refusing to export: tree entry name {name:?} is not a safe Git path component"
     );
     Ok(())
+}
+
+/// Check the entry names of every tree of every snapshot that an export would WRITE: the DAG from
+/// `tip`, not descending into `stop` (commits the destination already holds, whose trees are never
+/// rewritten). Read-only, so a refusal leaves the destination untouched.
+fn check_pending_names(
+    store: &mut Store,
+    tip: ObjectId,
+    stop: &std::collections::HashSet<ObjectId>,
+) -> anyhow::Result<()> {
+    let mut seen_snaps = std::collections::HashSet::new();
+    let mut seen_trees = std::collections::HashSet::new();
+    let mut snaps = vec![tip];
+    while let Some(sid) = snaps.pop() {
+        if stop.contains(&sid) || !seen_snaps.insert(sid) {
+            continue;
+        }
+        let snap = store.get_snapshot(&sid)?;
+        let mut trees = vec![snap.root];
+        while let Some(id) = trees.pop() {
+            if !seen_trees.insert(id) {
+                continue;
+            }
+            for e in &store.get_tree(&id)?.entries {
+                check_entry_name(&e.name)?;
+                if let EntryKind::Tree = e.kind {
+                    trees.push(e.id);
+                }
+            }
+        }
+        snaps.extend(snap.parents.iter().copied());
+    }
+    Ok(())
+}
+
+/// For a network push: refuse unsafe names in the commits the push would upload, that is the history
+/// of `tip` minus everything the server already has (`server_tip` and its ancestors; `None` means the
+/// whole history). This covers commits the local mirror already holds (exported by an earlier or
+/// older client, so skipped by [`export_branch`]) but the server does not.
+pub fn check_names_pending_upload(
+    store: &mut Store,
+    tip: ObjectId,
+    server_tip: Option<ObjectId>,
+) -> anyhow::Result<()> {
+    let mut on_server = std::collections::HashSet::new();
+    let mut stack: Vec<ObjectId> = server_tip.into_iter().collect();
+    while let Some(sid) = stack.pop() {
+        if on_server.insert(sid) {
+            stack.extend(store.get_snapshot(&sid)?.parents.iter().copied());
+        }
+    }
+    check_pending_names(store, tip, &on_server)
+}
+
+/// Marked commits that still exist in the Git repo at `path` (so a later export reuses them). Reads
+/// only, and creates nothing: a missing repo has none.
+fn reusable_commits(
+    path: &Path,
+    known: &HashMap<ObjectId, String>,
+) -> std::collections::HashSet<ObjectId> {
+    let Ok(repo) = gix::open(path) else {
+        return Default::default();
+    };
+    known
+        .iter()
+        .filter(|(_, hex)| {
+            gix::ObjectId::from_hex(hex.as_bytes()).is_ok_and(|g| repo.has_object(g))
+        })
+        .map(|(id, _)| *id)
+        .collect()
 }
 
 /// Record PROTECTED entry paths under `prefix`, recursing into subtrees. Uses an
@@ -507,7 +557,6 @@ fn scan_tree(
         }
         let tree = store.get_tree(&id)?;
         for e in &tree.entries {
-            check_entry_name(&e.name)?;
             let path = if pre.is_empty() {
                 e.name.clone()
             } else {
@@ -545,6 +594,13 @@ pub fn export_branch(
         );
     }
     let secrets_dropped = secret_names.len();
+    // Unsafe names fail closed too, but only in snapshots this export will write: history the
+    // destination already holds (reused marks) is not ours to judge.
+    check_pending_names(
+        store,
+        tip,
+        &reusable_commits(opts.to, opts.known_git_commits),
+    )?;
     // Signatures have no fail-closed gate (unlike protected content/secrets,
     // a dropped signature is a provenance-completeness loss, not a
     // confidentiality one) — always counted, exported or not.
@@ -653,7 +709,6 @@ pub fn read_ref(path: &Path, ref_name: &str) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scl_core::FileMode;
     use std::process::Command;
 
     fn git(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
@@ -722,7 +777,7 @@ mod tests {
 
     #[test]
     fn single_snapshot_exports_files_and_modes() {
-        use scl_core::{EntryKind, Object, Store, StoreConfig, Tree, TreeEntry};
+        use scl_core::{EntryKind, FileMode, Object, Store, StoreConfig, Tree, TreeEntry};
         use std::collections::{BTreeMap, HashMap};
         let mut store = Store::new(StoreConfig::default());
         let blob = store.put(Object::blob(b"fn main(){}".to_vec())).unwrap();
@@ -963,7 +1018,7 @@ mod tests {
 
     // Helper: a snapshot with one PROTECTED entry and one registry secret.
     fn encrypted_snapshot(store: &mut scl_core::Store) -> scl_core::ObjectId {
-        use scl_core::{EntryKind, Object, Secret, Snapshot, Tree, TreeEntry, PROTECTED};
+        use scl_core::{EntryKind, FileMode, Object, Secret, Snapshot, Tree, TreeEntry, PROTECTED};
         use std::collections::BTreeMap;
         let ct = store
             .put(Object::blob(b"ciphertext-bytes".to_vec()))
@@ -1551,6 +1606,9 @@ mod tests {
             ".GitModules",
             "gitmod~1",
             "gi7eba~1",
+            "gi7eba~9",
+            "gi7eb~10",
+            "gi7eb~12",
             "a/b",
             "a\\b",
             "a\0b",
@@ -1564,6 +1622,10 @@ mod tests {
             "main.rs",
             ".github",
             "..a",
+            // Legal on Unix, refused only by the Windows rules, which are off.
+            "a:b",
+            "what?.txt",
+            "con",
         ] {
             assert!(check_entry_name(ok).is_ok(), "{ok:?} must be allowed");
         }
@@ -1598,10 +1660,12 @@ mod tests {
     }
 
     #[test]
-    fn export_never_emits_symlink_or_odd_modes() {
+    fn export_keeps_a_recorded_symlink_mode_as_a_git_symlink() {
+        // Changing this would change re-synthesized tree ids for repos imported from git with
+        // symlinks, and break the round trip.
         let mut store = scl_core::Store::new(scl_core::StoreConfig::default());
         let snap = one_entry_snapshot(&mut store, "link", FileMode(0o120000), false);
-        let dir = std::env::temp_dir().join(format!("scl-nolink-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("scl-link-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let empty = HashMap::new();
         let opts = ExportOptions {
@@ -1616,7 +1680,110 @@ mod tests {
             .output()
             .unwrap();
         let listing = String::from_utf8(out.stdout).unwrap();
-        assert!(listing.starts_with("100644 blob"), "{listing}");
+        assert!(listing.starts_with("120000 blob"), "{listing}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A snapshot whose root holds one blob named `name`, on top of `parent` if given.
+    fn commit_with(
+        store: &mut scl_core::Store,
+        name: &str,
+        parent: Option<ObjectId>,
+        msg: &str,
+    ) -> ObjectId {
+        use scl_core::{Snapshot, Tree, TreeEntry};
+        let blob = store.put(Object::blob(msg.as_bytes().to_vec())).unwrap();
+        let root = store
+            .put(Object::Tree(Tree::new(vec![TreeEntry {
+                name: name.into(),
+                kind: EntryKind::Blob,
+                id: blob,
+                mode: FileMode::FILE,
+                perms: 0,
+            }])))
+            .unwrap();
+        store
+            .put(Object::Snapshot(Snapshot {
+                root,
+                parents: parent.into_iter().collect(),
+                author: "t".into(),
+                timestamp: 1,
+                message: msg.into(),
+                secrets: Default::default(),
+                protection: Default::default(),
+            }))
+            .unwrap()
+    }
+
+    #[test]
+    fn only_snapshots_that_will_be_written_are_name_checked() {
+        let mut store = scl_core::Store::new(scl_core::StoreConfig::default());
+        // `old` (with .gitmodules) is already on the destination; `fixed` removed it.
+        let old = commit_with(&mut store, ".gitmodules", None, "old");
+        let fixed = commit_with(&mut store, "a.txt", Some(old), "fixed");
+        let bad_new = commit_with(&mut store, ".gitmodules", Some(fixed), "readded");
+
+        // Put `old` on the destination as a real Git commit, as an earlier push would have.
+        let dir = std::env::temp_dir().join(format!("scl-pending-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let target = GitTarget::open_or_init_bare(&dir).unwrap();
+        let snap = store.get_snapshot(&old).unwrap();
+        let tree = map_tree(
+            &mut store,
+            &target,
+            snap.root,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut 0,
+        )
+        .unwrap();
+        let old_git = map_commit(&target, &snap, tree, &[]).unwrap();
+        let known: HashMap<ObjectId, String> = HashMap::from([(old, old_git.to_hex().to_string())]);
+        let export = |store: &mut scl_core::Store, tip, known| {
+            export_branch(
+                store,
+                tip,
+                &ExportOptions {
+                    to: &dir,
+                    ref_name: "refs/heads/main",
+                    include_encrypted: false,
+                    known_git_commits: known,
+                },
+            )
+        };
+
+        // Old, already-pushed history is not judged; the new clean commit goes through.
+        export(&mut store, fixed, &known).unwrap();
+        // A new commit that adds it again is refused, and nothing of it is written.
+        let err = export(&mut store, bad_new, &known).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not a safe Git path"),
+            "{err:#}"
+        );
+        // Without the mark the old commit is re-synthesized, so it is checked.
+        let none = HashMap::new();
+        assert!(export(&mut store, fixed, &none).is_err());
+        // A stale mark (commit pruned from the destination) is also re-synthesized and checked.
+        let stale = HashMap::from([(old, "1".repeat(40))]);
+        assert!(export(&mut store, fixed, &stale).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn network_pending_check_skips_what_the_server_has() {
+        let mut store = scl_core::Store::new(scl_core::StoreConfig::default());
+        let old = commit_with(&mut store, ".gitmodules", None, "old");
+        let fixed = commit_with(&mut store, "a.txt", Some(old), "fixed");
+        // The server has `old`: only `fixed` is uploaded.
+        check_names_pending_upload(&mut store, fixed, Some(old)).unwrap();
+        // The server has nothing, or has something else: all of it is uploaded.
+        assert!(check_names_pending_upload(&mut store, fixed, None).is_err());
+        let other = commit_with(&mut store, "b.txt", None, "other");
+        assert!(check_names_pending_upload(&mut store, fixed, Some(other)).is_err());
+        // The server is at `fixed` already: nothing to upload.
+        check_names_pending_upload(&mut store, fixed, Some(fixed)).unwrap();
+        // A hostile commit the server lacks is refused.
+        let bad_new = commit_with(&mut store, ".gitmodules", Some(fixed), "readded");
+        assert!(check_names_pending_upload(&mut store, bad_new, Some(fixed)).is_err());
     }
 }
