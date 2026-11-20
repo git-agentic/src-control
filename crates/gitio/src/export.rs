@@ -1685,6 +1685,11 @@ mod tests {
             format!("{err:#}").contains("not a safe Git path"),
             "{err:#}"
         );
+        assert_eq!(
+            read_ref(&dir, "refs/heads/main").unwrap().as_deref(),
+            Some(rep.git_commit.as_str()),
+            "the ref must not move on refusal"
+        );
         // Without the mark the old commit is re-synthesized, so it is checked.
         let none = HashMap::new();
         assert!(export(&mut store, fixed, &none).is_err());
