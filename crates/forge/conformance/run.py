@@ -498,10 +498,8 @@ def apply_override(exp, act, ov, bij, match=None):
             if not isinstance(ab, dict) or set(ab) != set(e["body"]):
                 d.append(("fail", f"unexpected: body keys {sorted(e['body'])} expected, got "
                                   f"{sorted(ab) if isinstance(ab, dict) else type(ab).__name__}"))
-            else:
-                found = []
-                cmp_json(e["body"], ab, "", found, set(), bij)
-                d += [x for x in found if x[0] == "fail"]
+            elif not eq_val(e["body"], ab, bij):
+                d.append(("fail", f"unexpected: body {e['body']!r} expected, got {ab!r}"))
         for h in e.get("absent_headers", []):
             if h in act.get("headers", {}):
                 d.append(("fail", f"unexpected: header {h} must be absent, got {act['headers'][h]!r}"))
