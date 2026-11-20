@@ -69,19 +69,23 @@ impl Repo {
     /// Create a new repo at `root` (errors if `.sc/` already exists).
     pub fn init(root: impl AsRef<Path>) -> Result<Repo> {
         let layout = Layout::at(root.as_ref());
-        // The exists-check then create_dir_all is a benign TOCTOU: under the
-        // single-writer assumption (one `sc` process per repo at a time) no
-        // concurrent creator can race between the two; a second `init` either
-        // sees `.sc` and errors here or loses the lock in `open_layout`.
-        if layout.dot_sc.exists() {
-            return Err(Error::RepoExists(layout.dot_sc.display().to_string()));
+        // `.sc/` is owned only by whoever creates it: an exclusive `create_dir`
+        // (`AlreadyExists` = someone else's, e.g. a clone still building it),
+        // not an existence check that two initializers can both pass.
+        std::fs::create_dir_all(&layout.root)?;
+        match std::fs::create_dir(&layout.dot_sc) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(Error::RepoExists(layout.dot_sc.display().to_string()));
+            }
+            Err(e) => return Err(e.into()),
         }
         Self::init_in_new_dot_sc(layout)
     }
 
     /// [`Repo::init`] for a caller that has just created `.sc/` itself with an
     /// exclusive `create_dir` (clone, via [`crate::sync::CloneClaim`]) and so
-    /// knows it owns the directory: there is no existence check left to race.
+    /// knows it owns the directory.
     pub(crate) fn init_in_claimed_dot_sc(root: &Path) -> Result<Repo> {
         Self::init_in_new_dot_sc(Layout::at(root))
     }

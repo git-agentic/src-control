@@ -826,7 +826,9 @@ protected paths, plaintext.
     working-tree write or ref move; both tree builders refuse to commit such a
     path. The guarantee covers working-tree writes and refs, not every file: an
     unborn merge can mint `.sc/local-key` before the refusal, and a lazy fill can
-    keep the (hash-verified) objects it fetched. A clone that fails removes only
+    keep the (hash-verified) objects it fetched. A native clone writes branch
+    refs and HEAD in its new `.sc/` before the path check; a failed clone removes
+    them with the `.sc/` (it holds the repo lock until then). It removes only
     what it made: a `.sc/` it created exclusively, and the destination and
     parents it created while they are empty. An existing clone destination must
     be an empty directory.

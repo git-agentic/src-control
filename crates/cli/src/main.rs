@@ -4006,9 +4006,9 @@ fn run_clone_git(url: &str, dst: &std::path::Path) -> Result<()> {
             return Err(e.into());
         }
     };
-    // A failed clone takes itself back out, as `git clone` does; the closure
-    // owns `repo`, so its lock is released before the directory goes.
-    let adopted = (move || -> Result<String> {
+    // A failed clone takes itself back out, as `git clone` does, while `repo`
+    // still holds the repo lock.
+    let adopted = (|| -> Result<String> {
         repo.remote_add_git("origin", url)?;
 
         // Sync the mirror, then point the unborn HEAD at the remote's default
@@ -4028,6 +4028,7 @@ fn run_clone_git(url: &str, dst: &std::path::Path) -> Result<()> {
         Ok(default) => default,
         Err(e) => {
             scl_repo::sync::discard_failed_clone(&claim);
+            drop(repo);
             return Err(e);
         }
     };

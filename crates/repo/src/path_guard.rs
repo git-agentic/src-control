@@ -292,6 +292,26 @@ fn a_dot_sc_we_did_not_create_is_never_removed() {
     std::fs::remove_dir_all(&dst).unwrap();
 }
 
+#[test]
+fn plain_init_never_enters_a_dot_sc_it_did_not_create() {
+    // A clone's freshly made `.sc/` must not be adopted by `sc init`.
+    let parent = tmp_root("init-race");
+    let dst = parent.join("dst");
+    let mut claim = crate::sync::claim_clone_dir(&dst).unwrap();
+    let repo = claim.init_repo().unwrap();
+    let err = Repo::init(&dst).err().expect("init must refuse");
+    assert!(matches!(err, Error::RepoExists(_)), "{err:?}");
+    // The clone fails and cleans up while it still holds its repo lock.
+    crate::sync::discard_failed_clone(&claim);
+    assert!(!dst.exists());
+    drop(repo);
+    assert!(
+        !dst.exists(),
+        "dropping the lock after cleanup recreates nothing"
+    );
+    std::fs::remove_dir_all(&parent).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn a_dangling_symlink_destination_is_refused() {

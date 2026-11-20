@@ -44,57 +44,52 @@ fn ensure_empty_dir(dst: &Path) -> Result<()> {
 }
 
 /// Claim the clone destination. An existing destination must be an empty
-/// directory ([`ensure_empty_dir`]). A missing one is created, parents
-/// included, one `create_dir` at a time, and each directory that call made is
-/// recorded. Ownership comes from a `create_dir` that returned `Ok`, never from
-/// `exists()`, which a race or a metadata error can get wrong; a destination
-/// that appears between our look and our `create_dir` (`AlreadyExists`) gets
-/// the same empty-directory check instead of being trusted.
+/// directory ([`ensure_empty_dir`]). Missing parents are created one
+/// `create_dir` at a time, and the destination itself always goes through
+/// `create_dir` too: `Ok` means this call made it and each such directory is
+/// recorded; `AlreadyExists` (it was there, or appeared since we looked) gets
+/// the empty-directory check instead of being trusted. Ownership never comes
+/// from `exists()`, which a race or a metadata error can get wrong.
 pub fn claim_clone_dir(dst: &Path) -> Result<CloneClaim> {
     let mut claim = CloneClaim {
         dst: dst.to_path_buf(),
         made: Vec::new(),
         sc_made: false,
     };
-    match dst.symlink_metadata() {
-        Ok(_) => {
-            ensure_empty_dir(dst)?;
-            return Ok(claim);
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
-    // Missing ancestors, outermost first.
-    let mut missing: Vec<&Path> = dst
+    // Missing ancestors of the destination, outermost first.
+    let mut parents: Vec<&Path> = dst
         .ancestors()
+        .skip(1)
         .take_while(|p| {
             !p.as_os_str().is_empty()
                 && matches!(p.symlink_metadata(), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
         })
         .collect();
-    missing.reverse();
-    for dir in missing {
-        let made = match std::fs::create_dir(dir) {
-            Ok(()) => {
-                claim.made.push(dir.to_path_buf());
-                continue;
+    parents.reverse();
+    let result = (|| -> Result<()> {
+        for dir in parents {
+            match std::fs::create_dir(dir) {
+                Ok(()) => claim.made.push(dir.to_path_buf()),
+                // Made by someone else since we looked: theirs, not ours. A
+                // non-directory there fails the destination's `create_dir`.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.into()),
             }
-            // Someone else made it between our look and now: theirs, not ours.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if dir == dst {
-                    ensure_empty_dir(dst)
-                } else {
-                    Ok(())
-                }
-            }
-            Err(e) => Err(e.into()),
-        };
-        if let Err(e) = made {
+        }
+        match std::fs::create_dir(dst) {
+            Ok(()) => claim.made.push(dst.to_path_buf()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => ensure_empty_dir(dst)?,
+            Err(e) => return Err(e.into()),
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok(claim),
+        Err(e) => {
             discard_failed_clone(&claim);
-            return Err(e);
+            Err(e)
         }
     }
-    Ok(claim)
 }
 
 impl CloneClaim {
@@ -122,8 +117,9 @@ impl CloneClaim {
 /// created it), then the destination and any parents the claim created,
 /// deepest first, each only while empty (`remove_dir`, never `remove_dir_all`).
 /// A directory that is not empty is left in place and named on stderr. Best
-/// effort; the caller must have dropped its [`Repo`] (the repo lock lives in
-/// `.sc/`) and reports the clone's own error, not this one.
+/// effort; the caller reports the clone's own error, not this one, and should
+/// call it while still holding the clone's repo lock (a concurrent open cannot
+/// then take the lock in a gap and have its repo deleted).
 pub fn discard_failed_clone(claim: &CloneClaim) {
     if claim.sc_made {
         let _ = std::fs::remove_dir_all(claim.dst.join(".sc"));
@@ -258,9 +254,8 @@ impl Repo {
             }
         };
         // Anything that fails from here leaves a half-built clone: take it
-        // back out, as `git clone` does. The closure owns `dst_repo`, so its
-        // repo lock is released before the directory goes.
-        let result = (|| -> Result<Repo> {
+        // back out, as `git clone` does, while still holding the repo lock.
+        let result = (|| -> Result<()> {
             // Transfer every (in-filter, when filtered) object reachable from
             // the remote's branch tips.
             let tips: Vec<ObjectId> = remote_refs.iter().map(|(_, id)| *id).collect();
@@ -356,7 +351,7 @@ impl Repo {
             // --identity <key>` after the clone.
             if let Some(head_tip) = dst_repo.head_tip()? {
                 if dst_repo.manifest_at(&head_tip)?.is_some() {
-                    return Ok(dst_repo);
+                    return Ok(());
                 }
                 let store_arc = dst_repo.vfs.store();
                 let mut store = store_arc.lock().unwrap();
@@ -375,12 +370,19 @@ impl Repo {
                     None,
                 )?;
             }
-            Ok(dst_repo)
+            Ok(())
         })();
-        if result.is_err() {
-            discard_failed_clone(&claim);
+        match result {
+            Ok(()) => Ok(dst_repo),
+            Err(e) => {
+                // Remove `.sc/` while `dst_repo` still holds the repo lock, so
+                // a concurrent `Repo::open` cannot take it in a gap and have
+                // its repo deleted; the lock file goes with the directory.
+                discard_failed_clone(&claim);
+                drop(dst_repo);
+                Err(e)
+            }
         }
-        result
     }
 
     /// Backfill: widen a partial clone by fetching every object matching

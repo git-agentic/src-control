@@ -53,9 +53,10 @@ fn hfs_ignorable(c: char) -> bool {
 /// `.\u{17f}c` (LATIN SMALL LETTER LONG S) to `.sc`, and
 /// `'\u{17f}'.to_uppercase()` is `S`. NTFS's checksum short name, `SC` + four
 /// hex digits + `~1` to `~9` (the base of `.sc` is only two characters once the
-/// dot is stripped, so NTFS may use that form), is matched on the original
-/// characters with ASCII folding only: full Unicode uppercase would turn an
-/// ordinary name such as `sc\u{fb00}12~1` (ff ligature) into `SCFF12~1`.
+/// dot is stripped, so NTFS may use that form), folds its `SC` prefix the same
+/// way (NTFS upcases `\u{17f}` too) but matches the four hex digits and the
+/// `~N` on the original characters, ASCII only: uppercasing the whole name
+/// would turn an ordinary `sc\u{fb00}12~1` (ff ligature) into `SCFF12~1`.
 fn is_control_dir(component: &str) -> bool {
     let c: String = component.chars().filter(|c| !hfs_ignorable(*c)).collect();
     let c = c.split(':').next().unwrap_or("");
