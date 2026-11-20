@@ -11,6 +11,10 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+[lib]
+name = "scl_fuzz"
+path = "src/lib.rs"
+
 [dependencies]
 libfuzzer-sys = "0.4"
 scl-core = { path = "../crates/core" }
@@ -22,6 +26,41 @@ glib = { path = "../vendor/glib-0.18.5-patched" }
 [[bin]]
 name = "wire_decode"
 path = "fuzz_targets/wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pack_decode"
+path = "fuzz_targets/pack_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pack_stream"
+path = "fuzz_targets/pack_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "walfmt_decode"
+path = "fuzz_targets/walfmt_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_opening"
+path = "fuzz_targets/http_opening.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text_files"
+path = "fuzz_targets/text_files.rs"
 test = false
 doc = false
 bench = false

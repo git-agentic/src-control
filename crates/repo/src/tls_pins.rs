@@ -350,6 +350,13 @@ fn parse_line(line: &str) -> Option<PinEntry> {
     })
 }
 
+/// Parse pin-file text the way [`list`] does. Public only so the fuzz crate
+/// can reach the line parser without touching disk.
+#[doc(hidden)]
+pub fn parse_pin_text(text: &str) -> Vec<PinEntry> {
+    text.lines().filter_map(parse_line).collect()
+}
+
 fn read_pin_file(file: &Path) -> Result<String> {
     match std::fs::read_to_string(file) {
         Ok(t) => Ok(t),
@@ -365,10 +372,7 @@ fn read_pin_file(file: &Path) -> Result<String> {
 /// comments and malformed lines are skipped). A host that was pinned twice is
 /// listed twice: a connection uses the first.
 pub fn list(file: &Path) -> Result<Vec<PinEntry>> {
-    Ok(read_pin_file(file)?
-        .lines()
-        .filter_map(parse_line)
-        .collect())
+    Ok(parse_pin_text(&read_pin_file(file)?))
 }
 
 /// Drop every pin for `host:port` (hostnames compare case-insensitively) and
