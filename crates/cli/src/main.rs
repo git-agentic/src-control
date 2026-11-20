@@ -518,6 +518,13 @@ enum Cmd {
         #[command(subcommand)]
         op: EscrowOp,
     },
+    /// Manage which recipients this clone has accepted (local, never
+    /// transferred): a seal refuses to wrap to a key a rule, secret or private
+    /// branch lists but you never accepted for it.
+    Policy {
+        #[command(subcommand)]
+        op: PolicyOp,
+    },
     /// Re-seal every secret and protected file's wrap list at the tip to the
     /// current recipient + escrow sets, in one undoable commit.
     Rewrap {
@@ -735,6 +742,29 @@ enum EscrowOp {
     Remove { id_or_name: String },
     /// List the configured escrow keys.
     Show,
+}
+
+#[derive(Subcommand)]
+enum PolicyOp {
+    /// Accept recipients for a scope: `path:<prefix>`, `secret:<NAME>` or
+    /// `branch:<name>`. Allowed while a merge, pick or rebase is stopped.
+    Accept {
+        /// The scope the keys are accepted for.
+        scope: String,
+        /// Public keys (`scl-pk-...`) or recipient ids to accept.
+        #[arg(long, required = true, value_delimiter = ',')]
+        key: Vec<String>,
+        /// Accept a key that is in neither `[recipients]` nor `[escrow]`.
+        #[arg(long)]
+        allow_unknown: bool,
+    },
+    /// Stop accepting a recipient for a scope.
+    Forget {
+        /// The scope the key was accepted for.
+        scope: String,
+        /// Public key (`scl-pk-...`) or recipient id.
+        key: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1276,6 +1306,7 @@ fn real_main() -> Result<()> {
             include_encrypted,
         } => run_export(to, r#ref, include_encrypted),
         Cmd::Escrow { op } => run_escrow(op),
+        Cmd::Policy { op } => run_policy(op),
         Cmd::Rewrap {
             identity,
             dry_run,
@@ -3316,7 +3347,13 @@ fn run_secret(op: SecretOp) -> Result<()> {
                 pool.extend(escrows.iter().cloned());
                 resolve_ids_to_pubkeys(&ids, &pool)?
             } else {
-                resolve_names(&dir, &to)?
+                // Named on the command line, so accepted for this secret. The
+                // derived set above is not: it comes from the secret's own
+                // wrap labels, and `secret_rotate` refuses one with a key
+                // this clone never accepted.
+                let named = resolve_names(&dir, &to)?;
+                repo.accept_keys(&format!("secret:{name}"), &named)?;
+                named
             };
             let pks = append_escrow(pks, &escrows);
             let new_value = value.as_deref().map(|s| s.as_bytes());
@@ -3331,6 +3368,66 @@ fn run_secret(op: SecretOp) -> Result<()> {
                        ciphertext stays in history and anyone holding the old DEK keeps it — \
                        rotate the underlying credential too"
             );
+        }
+    }
+    Ok(())
+}
+
+/// A `--key` argument: a `scl-pk-...` public key or a 32-hex recipient id, as
+/// the id plus the key when the argument was one.
+fn parse_recipient_ref(
+    s: &str,
+) -> Result<(scl_crypto::RecipientId, Option<scl_crypto::PublicKey>)> {
+    match scl_crypto::PublicKey::from_key_string(s) {
+        Ok(pk) => Ok((pk.recipient_id(), Some(pk))),
+        Err(_) => scl_crypto::RecipientId::from_hex(s)
+            .map(|id| (id, None))
+            .map_err(|_| {
+                anyhow::anyhow!("'{s}' is neither a scl-pk- public key nor a recipient id")
+            }),
+    }
+}
+
+/// `sc policy accept/forget`: the local record of accepted recipients
+/// (ADR-0059). Touches only `.sc/accepted-recipients`, so it works while a
+/// merge, pick or rebase is stopped.
+fn run_policy(op: PolicyOp) -> Result<()> {
+    let repo = open_repo()?;
+    match op {
+        PolicyOp::Accept {
+            scope,
+            key,
+            allow_unknown,
+        } => {
+            let path = repo.layout().dot_sc.join("recipients.toml");
+            let mut known: Vec<scl_crypto::PublicKey> = load_recipients(&path)
+                .map(|m| m.into_values().collect())
+                .unwrap_or_default();
+            known.extend(load_escrows(&path).unwrap_or_default());
+            let mut resolved = Vec::new();
+            for k in &key {
+                let (id, given) = parse_recipient_ref(k)?;
+                let local = known.iter().find(|pk| pk.recipient_id() == id).cloned();
+                if local.is_none() && !allow_unknown {
+                    anyhow::bail!(
+                        "{id} is in neither [recipients] nor [escrow] of .sc/recipients.toml; \
+                         check whose key it is, then pass --allow-unknown to accept it anyway"
+                    );
+                }
+                resolved.push((id, given.or(local)));
+            }
+            for (id, pk) in &resolved {
+                repo.accept_recipient(&scope, id, pk.as_ref())?;
+            }
+            println!("accepted {} recipient(s) for {scope}", resolved.len());
+        }
+        PolicyOp::Forget { scope, key } => {
+            let (id, _) = parse_recipient_ref(&key)?;
+            if repo.forget_recipient(&scope, &id)? {
+                println!("forgot {id} for {scope}");
+            } else {
+                println!("{id} was not accepted for {scope}");
+            }
         }
     }
     Ok(())
@@ -4923,7 +5020,10 @@ fn run_rewrap(identity: Option<PathBuf>, dry_run: bool, rotate: bool) -> Result<
         } else {
             "sc rewrap"
         };
-        eprintln!("re-run `{again}` with an identity that can open them to complete the sweep");
+        eprintln!(
+            "re-run `{again}` to complete the sweep: with an identity that can open them, \
+             or after `sc policy accept` for the recipients listed as not accepted"
+        );
     }
     eprintln!(
         "note: rewrap cuts the live tip only — snapshots already in history keep \
