@@ -949,7 +949,11 @@ unless said otherwise).
   the start of the request: revoking a token or a collaborator does not cancel a push already running (it is bounded
   by `--git-timeout`, 30 minutes by default).
 - **Existence oracles.** A repository the caller may not see, one that does not exist, and one being deleted give the
-  same 404 body on both services (`missing_and_invisible_repositories_answer_identically`); a token restricted to
+  same 404 body on both services (`missing_and_invisible_repositories_answer_identically`); a private organization the
+  caller cannot see answers like a missing one on `GET /orgs/{o}`, `GET /users/{u}/orgs/{o}/permissions` and
+  `GET /orgs/{o}/repos` (the last only while the caller can read nothing in it; a collaborator of a repository there still
+  lists it), where Gitea 1.22 answers `HasOrgOrUserVisible` or 200 and so confirms the name (recorded departures for
+  B#32, K#54 and K#55; `private_org_permissions_are_hidden_from_outsiders`); a token restricted to
   public repositories is refused before the repository is looked up, and a read-only collaborator is refused at the
   `receive-pack` advertisement (`scopes_and_permissions_gate_each_service`).
 - **Tenant isolation.** The directory a transport can reach is built from the integer repository id
@@ -970,7 +974,9 @@ unless said otherwise).
   `the_hook_binary_fails_closed`). Known gap: NFC/NFD-equivalent spellings of a non-ASCII default branch are not
   folded (a macOS-filesystem quirk; marked `shortcut:` in `policy.rs`). A push in flight read the default branch when it
   started, so `PATCH default_branch` commits only while no push has registered on the repository since it checked the
-  branch, else 503 (`a_push_in_flight_keeps_the_default_branch_off_a_branch_it_deletes`, #316).
+  branch, else 503 (`a_push_in_flight_keeps_the_default_branch_off_a_branch_it_deletes`, #316). Only a `receive-pack`
+  run registers as a writer: a fetch or a dumb-protocol GET (read permission, no service) does not, so a slow reader can
+  neither stall that change nor hold off run-time lock cleanup (`cgi::tests::only_receive_pack_registers_as_a_writer`).
 - **Hook integrity.** `core.hooksPath` is pinned on every spawn to `<data>/hooks`, whose `pre-receive` is a symlink to
   the `sc-forge` binary, re-pointed at every start; repositories are created with `--template=` and carry no hooks of
   their own. The hook reads the database through a read-only opener (no create, `query_only`, schema version checked),
@@ -993,6 +999,15 @@ unless said otherwise).
   (`gzip_request_bodies_are_inflated_by_the_server_under_a_cap`; other encodings and gzip on a push are 415). Server
   memory is bounded per transport by about twice the cap while a gzip body is inflated (the buffer plus its chunked
   copy) and a few fixed channel buffers otherwise; with `--max-transports` 64 the worst case is the product.
+- **Password verification.** Argon2 checks run under a global gate (`--argon2-concurrency`); a check waits at most 2 s for a
+  slot, then answers 503 + `Retry-After: 5` and hands its per-source attempt back, so a burst of logins cannot pin the
+  blocking pool or count against honest sources (`a_busy_password_gate_answers_503_and_refunds_the_attempt`).
+- **Client address behind a proxy.** The forwarded-for header is read only from a trusted peer, from the right: addresses
+  of our own proxies are skipped, entries may carry a port (`ip:port`, `[v6]:port`), and the first entry that does not
+  parse ends the walk on the last trusted hop instead of falling through to text the client chose
+  (`limits::tests::forwarded_for_ports_are_parsed_and_junk_stops_the_walk`).
+- **Decided and unchanged.** Repository scopes are not required on `/user/repos` and `/orgs/{o}/repos` (Gitea's requirement is
+  unrecorded, see #316). Access tokens never expire and survive a password change (Gitea 1.22 parity); revoke tokens by hand.
 - **Cache policy.** Everything served is authenticated, so nothing may be cached publicly: git's `public,
   max-age=31536000` on loose objects and packs is replaced with Gitea's private policy and its `Expires` dropped, and RPC
   results and 401s carry the same private policy (`authenticated_object_reads_are_never_publicly_cacheable`).

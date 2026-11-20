@@ -491,7 +491,7 @@ pub fn list_user_repos(ctx: &mut Ctx) -> Resp {
     query_list(ctx, &Filter::default(), Sort::Id, "/user/repos", false)
 }
 
-/// `GET /orgs/{o}/repos`: 200 for any existing organization, listing only what the caller can read.
+/// `GET /orgs/{o}/repos`: lists only what the caller can read; 404 like a missing organization when the caller cannot see a private one and can read nothing in it.
 pub fn list_org_repos(ctx: &mut Ctx) -> Resp {
     let name = ctx.param("o").to_string();
     match store::find_by_login(ctx.conn, &name) {
@@ -500,16 +500,32 @@ pub fn list_org_repos(ctx: &mut Ctx) -> Resp {
             // visible: a collaborator of a repository inside a private organization still sees it
             // (recorded K#55), and the counts are the visible count.
             let path = format!("/orgs/{}/repos", org.login);
-            query_list(
-                ctx,
-                &Filter {
-                    owner_id: Some(org.id),
-                    ..Default::default()
-                },
+            let filter = Filter {
+                owner_id: Some(org.id),
+                ..Default::default()
+            };
+            // A caller who cannot see the organization and can read nothing in it gets what a
+            // missing organization gets (recorded departure from K#55); one who can read a
+            // repository there already knows it exists. Decided from the very listing that is
+            // paginated, so a repository lost in between cannot leave a `200 []`.
+            let hidden = match crate::api::org_visible(ctx, &org) {
+                Ok(visible) => !visible,
+                Err(e) => return ctx.app.internal(&e),
+            };
+            let (page, limit) = page_params(ctx);
+            match repos::list_visible(
+                ctx.conn,
+                &ctx.who.user,
+                token_public_only(ctx),
+                &filter,
                 Sort::Id,
-                &path,
-                false,
-            )
+                page,
+                limit,
+            ) {
+                Ok((_, 0)) if hidden => crate::api::org_missing(ctx.app, &name),
+                Ok((rows, total)) => list_response(ctx, &path, &rows, total, page, limit, false),
+                Err(e) => ctx.app.internal(&e),
+            }
         }
         Ok(_) => crate::api::org_missing(ctx.app, &name),
         Err(e) => ctx.app.internal(&e),

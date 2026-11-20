@@ -74,7 +74,8 @@ pub struct Backoff {
     source_cap: usize,
     max_delay: Duration,
     by_login: Mutex<HashMap<String, Vec<Instant>>>,
-    by_source: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+    by_source: Mutex<HashMap<IpAddr, Vec<(u64, Instant)>>>,
+    next_id: std::sync::atomic::AtomicU64,
 }
 
 impl Default for Backoff {
@@ -84,15 +85,40 @@ impl Default for Backoff {
     }
 }
 
-fn prune(v: &mut Vec<Instant>, window: Duration) {
+fn prune<T: Stamped>(v: &mut Vec<T>, window: Duration) {
     let now = Instant::now();
-    v.retain(|t| now.duration_since(*t) < window);
+    v.retain(|t| now.duration_since(t.at()) < window);
+}
+
+/// An entry of a failure list: when it was recorded.
+trait Stamped {
+    fn at(&self) -> Instant;
+}
+
+impl Stamped for Instant {
+    fn at(&self) -> Instant {
+        *self
+    }
+}
+
+impl Stamped for (u64, Instant) {
+    fn at(&self) -> Instant {
+        self.1
+    }
+}
+
+/// One reserved password attempt of a source, returned by [`Backoff::begin`] and given back by
+/// exactly this value, so a refund never erases another request's reservation.
+#[derive(Debug)]
+pub struct Reservation {
+    ip: IpAddr,
+    id: u64,
 }
 
 /// Keep a map bounded: drop expired entries, and if it is still over budget
 /// start over. shortcut: a distributed flood of more than MAX_ENTRIES live
 /// sources resets everyone's counters; move to an LRU if that is ever seen.
-fn bound<K>(m: &mut HashMap<K, Vec<Instant>>, window: Duration) {
+fn bound<K, T: Stamped>(m: &mut HashMap<K, Vec<T>>, window: Duration) {
     if m.len() > MAX_ENTRIES {
         m.retain(|_, v| {
             prune(v, window);
@@ -123,24 +149,39 @@ impl Backoff {
             max_delay,
             by_login: Mutex::default(),
             by_source: Mutex::default(),
+            next_id: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// Reserve one password attempt for `ip`. `false` when the source has used
+    /// Reserve one password attempt for `ip`. `None` when the source has used
     /// its per-minute budget; the check and the reservation are one step, so
     /// concurrent requests cannot all slip under the cap. A failure keeps the
-    /// reservation as its record; [`Backoff::success`] gives it back.
-    pub fn begin(&self, ip: IpAddr) -> bool {
+    /// reservation as its record; [`Backoff::success`] and [`Backoff::cancel`] give it back.
+    pub fn begin(&self, ip: IpAddr) -> Option<Reservation> {
         let ip = source_key(ip);
         let mut m = self.by_source.lock().unwrap_or_else(|e| e.into_inner());
         bound(&mut m, SOURCE_WINDOW);
         let v = m.entry(ip).or_default();
         prune(v, SOURCE_WINDOW);
         if v.len() >= self.source_cap {
-            return false;
+            return None;
         }
-        v.push(Instant::now());
-        true
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        v.push((id, Instant::now()));
+        Some(Reservation { ip, id })
+    }
+
+    fn release(&self, r: &Reservation) {
+        if let Some(v) = self
+            .by_source
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&r.ip)
+        {
+            v.retain(|(id, _)| *id != r.id);
+        }
     }
 
     /// Record a failed attempt; returns how long to delay the failure response
@@ -157,35 +198,20 @@ impl Backoff {
     }
 
     /// Give back a reservation for an attempt that failed on our side (a database
-    /// error), which says nothing about the credential and must not count against
-    /// the source.
-    pub fn cancel(&self, ip: IpAddr) {
-        if let Some(v) = self
-            .by_source
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_mut(&source_key(ip))
-        {
-            v.pop();
-        }
+    /// error, a busy gate), which says nothing about the credential and must not
+    /// count against the source.
+    pub fn cancel(&self, r: &Reservation) {
+        self.release(r);
     }
 
     /// A success clears the login's failures and returns the source's reservation.
-    pub fn success(&self, login: &str, ip: IpAddr) {
-        let ip = source_key(ip);
+    pub fn success(&self, login: &str, r: &Reservation) {
         let key: String = login.to_lowercase().chars().take(MAX_KEY).collect();
         self.by_login
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&key);
-        if let Some(v) = self
-            .by_source
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_mut(&ip)
-        {
-            v.pop();
-        }
+        self.release(r);
     }
 }
 
@@ -248,17 +274,47 @@ impl Proxies {
     /// otherwise the peer. (A header from any other peer is ignored, so a
     /// client cannot spoof its address into the limiter.)
     pub fn resolve(&self, peer: IpAddr, header_value: Option<&str>) -> IpAddr {
-        let Some(v) = header_value else { return peer };
-        if self.header.is_none() || !self.cidrs.iter().any(|c| c.contains(peer)) {
+        match header_value {
+            Some(v) => self.resolve_values(peer, &[v.as_bytes()]),
+            None => peer,
+        }
+    }
+
+    /// [`Proxies::resolve`] over every field of a repeated header, in the order received, as raw
+    /// bytes: the fields join into one chain, and an entry that is not valid text is a stopping
+    /// point like any other unparsable one, never silently dropped.
+    pub fn resolve_values(&self, peer: IpAddr, values: &[&[u8]]) -> IpAddr {
+        if values.is_empty()
+            || self.header.is_none()
+            || !self.cidrs.iter().any(|c| c.contains(peer))
+        {
             return peer;
         }
         // Walk from the right: the first address that is not one of our own
-        // trusted proxies is the client as the outermost proxy saw it.
-        v.rsplit(',')
-            .filter_map(|s| s.trim().parse::<IpAddr>().ok())
-            .find(|a| !self.cidrs.iter().any(|c| c.contains(*a)))
-            .unwrap_or(peer)
+        // trusted proxies is the client as the outermost proxy saw it. An entry that
+        // does not parse is client-controlled text: stop there and key on the last
+        // trusted hop, never on anything to its left.
+        let mut hop = peer;
+        for entry in values.iter().rev().flat_map(|v| v.rsplit(|b| *b == b',')) {
+            let addr = std::str::from_utf8(entry)
+                .ok()
+                .and_then(|s| hop_addr(s.trim()));
+            match addr {
+                None => return hop,
+                Some(a) if self.cidrs.iter().any(|c| c.contains(a)) => hop = a,
+                Some(a) => return a,
+            }
+        }
+        peer
     }
+}
+
+/// An address as a proxy may append it: `ip`, `ip:port`, `[v6]` or `[v6]:port`.
+fn hop_addr(s: &str) -> Option<IpAddr> {
+    s.parse::<IpAddr>()
+        .ok()
+        .or_else(|| s.parse::<std::net::SocketAddr>().ok().map(|a| a.ip()))
+        .or_else(|| s.strip_prefix('[')?.strip_suffix(']')?.parse().ok())
 }
 
 #[cfg(test)]
@@ -276,56 +332,74 @@ mod tests {
             .map(|_| b.failure("Alice", ip("1.1.1.1")).as_millis())
             .collect();
         assert_eq!(d, vec![50, 100, 200, 400, 800, 1600, 2000, 2000]);
-        b.success("alice", ip("1.1.1.1")); // case-insensitive key
+        let r = b.begin(ip("1.1.1.1")).unwrap();
+        b.success("alice", &r); // case-insensitive key
         assert_eq!(b.failure("alice", ip("1.1.1.1")).as_millis(), 50);
     }
 
     #[test]
     fn the_source_budget_is_reserved_atomically_and_per_source() {
         let b = Backoff::new(3, Duration::ZERO);
-        assert!([
-            b.begin(ip("9.9.9.9")),
-            b.begin(ip("9.9.9.9")),
-            b.begin(ip("9.9.9.9"))
-        ]
-        .iter()
-        .all(|x| *x));
+        let held: Vec<_> = (0..3).map(|_| b.begin(ip("9.9.9.9"))).collect();
+        assert!(held.iter().all(Option::is_some));
         assert!(
-            !b.begin(ip("9.9.9.9")),
+            b.begin(ip("9.9.9.9")).is_none(),
             "the fourth attempt is refused before any verification ran"
         );
-        assert!(b.begin(ip("8.8.8.8")), "other sources are unaffected");
-        b.success("u", ip("9.9.9.9")); // a success gives its reservation back
-        assert!(b.begin(ip("9.9.9.9")));
+        assert!(
+            b.begin(ip("8.8.8.8")).is_some(),
+            "other sources are unaffected"
+        );
+        b.success("u", held[0].as_ref().unwrap()); // a success gives its reservation back
+        assert!(b.begin(ip("9.9.9.9")).is_some());
     }
 
     #[test]
     fn a_cancelled_reservation_is_returned() {
         let b = Backoff::new(1, Duration::ZERO);
-        assert!(b.begin(ip("7.7.7.7")));
-        assert!(!b.begin(ip("7.7.7.7")));
-        b.cancel(ip("7.7.7.7"));
-        assert!(b.begin(ip("7.7.7.7")));
+        let r = b.begin(ip("7.7.7.7")).unwrap();
+        assert!(b.begin(ip("7.7.7.7")).is_none());
+        b.cancel(&r);
+        assert!(b.begin(ip("7.7.7.7")).is_some());
+    }
+
+    #[test]
+    fn a_refund_gives_back_exactly_its_own_reservation() {
+        let b = Backoff::new(3, Duration::ZERO);
+        let first = b.begin(ip("6.6.6.6")).unwrap();
+        let second = b.begin(ip("6.6.6.6")).unwrap(); // a later attempt that stays charged
+        b.cancel(&first);
+        let left: Vec<u64> = b.by_source.lock().unwrap()[&ip("6.6.6.6")]
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(
+            left,
+            vec![second.id],
+            "the newest reservation must survive an older refund"
+        );
+        b.cancel(&first); // refunding twice changes nothing
+        assert_eq!(b.by_source.lock().unwrap()[&ip("6.6.6.6")].len(), 1);
     }
 
     #[test]
     fn one_ipv6_64_shares_a_budget() {
         let b = Backoff::new(2, Duration::ZERO);
-        assert!(b.begin(ip("2001:db8::1")) && b.begin(ip("2001:db8::2")));
-        assert!(!b.begin(ip("2001:db8::ffff:1")), "same /64");
-        assert!(b.begin(ip("2001:db8:0:1::1")), "a different /64");
+        assert!(b.begin(ip("2001:db8::1")).is_some() && b.begin(ip("2001:db8::2")).is_some());
+        assert!(b.begin(ip("2001:db8::ffff:1")).is_none(), "same /64");
+        assert!(b.begin(ip("2001:db8:0:1::1")).is_some(), "a different /64");
     }
 
     #[test]
     fn ipv4_mapped_addresses_keep_their_own_budget() {
         let b = Backoff::new(1, Duration::ZERO);
-        assert!(b.begin(ip("::ffff:1.2.3.4")));
+        assert!(b.begin(ip("::ffff:1.2.3.4")).is_some());
         assert!(
-            b.begin(ip("::ffff:5.6.7.8")),
+            b.begin(ip("::ffff:5.6.7.8")).is_some(),
             "a different IPv4 client is a different source"
         );
         assert!(
-            !b.begin(ip("1.2.3.4")),
+            b.begin(ip("1.2.3.4")).is_none(),
             "mapped and plain forms of one client share a budget"
         );
     }
@@ -394,6 +468,74 @@ mod tests {
             Proxies::default().resolve(ip("127.0.0.1"), Some("6.6.6.6")),
             ip("127.0.0.1")
         );
+    }
+
+    #[test]
+    fn forwarded_for_ports_are_parsed_and_junk_stops_the_walk() {
+        let p = Proxies {
+            header: Some("x-forwarded-for".into()),
+            cidrs: vec![Cidr::parse("127.0.0.1/32").unwrap()],
+        };
+        let peer = ip("127.0.0.1");
+        // a proxy that appends ip:port, in either family
+        assert_eq!(
+            p.resolve(peer, Some("6.6.6.6, 5.5.5.5:4711")),
+            ip("5.5.5.5")
+        );
+        assert_eq!(
+            p.resolve(peer, Some("6.6.6.6, [2001:db8::5]:80")),
+            ip("2001:db8::5")
+        );
+        assert_eq!(
+            p.resolve(peer, Some("6.6.6.6, [2001:db8::5]")),
+            ip("2001:db8::5")
+        );
+        assert_eq!(
+            p.resolve(peer, Some("6.6.6.6, 127.0.0.1:9, 5.5.5.5:1")),
+            ip("5.5.5.5")
+        );
+        // an unparsable entry no longer lets the walk fall through to a client-chosen one
+        assert_eq!(p.resolve(peer, Some("6.6.6.6, unknown")), peer);
+        assert_eq!(
+            p.resolve(peer, Some("6.6.6.6, 5.5.5.5, unknown, 127.0.0.1")),
+            peer
+        );
+        assert_eq!(p.resolve(peer, Some("6.6.6.6, junk, 127.0.0.1")), peer);
+    }
+
+    #[test]
+    fn repeated_and_non_utf8_forwarded_for_fields_are_one_ordered_chain() {
+        let p = Proxies {
+            header: Some("x-forwarded-for".into()),
+            cidrs: vec![Cidr::parse("127.0.0.1/32").unwrap()],
+        };
+        let peer = ip("127.0.0.1");
+        // repeated fields join in order: the last field is the rightmost hop
+        assert_eq!(
+            p.resolve_values(peer, &[b"6.6.6.6", b"5.5.5.5"]),
+            ip("5.5.5.5")
+        );
+        assert_eq!(
+            p.resolve_values(peer, &[b"6.6.6.6, 5.5.5.5", b"127.0.0.1"]),
+            ip("5.5.5.5")
+        );
+        // a later field that is not text stops the walk; the earlier entry is not reached
+        assert_eq!(p.resolve_values(peer, &[b"5.5.5.5", b"\xff\xfe"]), peer);
+        assert_eq!(p.resolve_values(peer, &[b"5.5.5.5", b"junk"]), peer);
+        assert_eq!(
+            p.resolve_values(peer, &[b"5.5.5.5, \xff", b"127.0.0.1"]),
+            peer
+        );
+        // a non-text entry to the left of a good client address is never read
+        assert_eq!(
+            p.resolve_values(peer, &[b"\xff", b"5.5.5.5"]),
+            ip("5.5.5.5")
+        );
+        assert_eq!(
+            p.resolve_values(ip("7.7.7.7"), &[b"5.5.5.5"]),
+            ip("7.7.7.7")
+        );
+        assert_eq!(p.resolve_values(peer, &[]), peer);
     }
 
     #[test]
