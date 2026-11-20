@@ -2121,11 +2121,17 @@ pub(crate) mod tests {
             packs.push((path, enc, tomb_id));
         }
         let dst = Repo::init(&dst_root).unwrap();
-        dst.store_arc()
-            .lock()
-            .unwrap()
-            .put(src_arc.lock().unwrap().get(&snap).unwrap())
-            .unwrap();
+        {
+            // The snapshot with its whole tree: `update_ref` refuses a tip
+            // whose objects the destination does not hold.
+            let mut src = src_arc.lock().unwrap();
+            let ids = crate::reachable::reachable_objects(&mut *src, &[snap]).unwrap();
+            let dst_arc = dst.store_arc();
+            let mut dst_store = dst_arc.lock().unwrap();
+            for id in ids {
+                dst_store.put(src.get(&id).unwrap()).unwrap();
+            }
+        }
         for (path, enc, _) in &packs {
             std::fs::write(path, scl_core::pack::build_pack(enc).unwrap().0).unwrap();
         }

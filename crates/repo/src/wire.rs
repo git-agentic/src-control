@@ -2173,6 +2173,36 @@ mod tests {
         (client, handle)
     }
 
+    /// A client with write access still cannot rewind a served branch or point
+    /// it at a non-snapshot: the server checks fast-forward and target kind
+    /// itself, whatever the client did.
+    #[test]
+    fn served_update_ref_refuses_a_rewind_and_a_non_snapshot_target() {
+        use crate::transport::Transport;
+
+        let root = tmp_repo("served-ff");
+        let repo = crate::repo::Repo::open(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        let c1 = repo.commit("t", "c1").unwrap();
+        std::fs::write(root.join("a.txt"), b"two").unwrap();
+        let c2 = repo.commit("t", "c2").unwrap();
+        let blob = scl_core::Object::blob(b"not a commit".to_vec());
+        let blob_id = repo.vfs().store().lock().unwrap().put(blob).unwrap();
+        drop(repo);
+
+        let (client, server_join) = spawn_wire_pair_with_policy(&root, false);
+        assert!(matches!(
+            client.update_ref("main", &c1, Some(&c2)),
+            Err(Error::NonFastForward)
+        ));
+        assert!(client.update_ref("main", &blob_id, Some(&c2)).is_err());
+        assert_eq!(client.list_refs().unwrap(), vec![("main".to_string(), c2)]);
+        client.bye().unwrap();
+        drop(client);
+        server_join.join().unwrap().unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn read_only_policy_rejects_mutations_allows_reads() {
         use crate::transport::Transport;
@@ -3182,7 +3212,12 @@ mod tests {
         }
 
         // PutPack + UpdateRef land a second commit through the same session.
-        let (tip2, objects2) = tiny_history_for_bucket("seed2", b"second commit");
+        let second = crate::test_support::fake_commit("second commit", Some(tip));
+        let tree = crate::test_support::empty_tree();
+        let (tip2, objects2) = (
+            second.id(),
+            vec![(tree.id(), tree.encode()), (second.id(), second.encode())],
+        );
         let (pack2, _idx2) = scl_core::pack::build_pack(&objects2).unwrap();
         let ids2 = client.put_pack(&mut std::io::Cursor::new(pack2)).unwrap();
         assert_eq!(ids2.len(), objects2.len());

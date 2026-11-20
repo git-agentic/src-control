@@ -203,6 +203,12 @@ too, not just the src-control-side metadata.
   Publish re-runs the P5 secret scanner over all decrypted content **before**
   writing any public object, so a secret committed under seal cannot sail into
   plaintext history at release.
+- **A writer without a key can roll a private branch back (tracked
+  follow-on).** The server only checks that a pushed manifest chains to the
+  current one through `prev`, so a keyless writer can push a manifest that
+  reuses an older manifest's index and key wraps under a new `prev`. The index
+  AAD does not bind `prev`, so recipients decrypt it as the branch's content at
+  that older point. Binding `prev` into the AAD closes it.
 - **Does NOT defend:** a malicious *recipient* (any key-holder can read,
   commit, grant, or publish); the git bridge carries private branches **not at
   all** (export/push refuse unconditionally — `--include-encrypted` does not
@@ -501,6 +507,25 @@ too, not just the src-control-side metadata.
   unchanged; the diagnostic text is now sent raw (not as escaped `Display`
   output) and without the doubled prefix `Protocol` and `Remote` used to carry,
   and is escaped only when displayed. Paths are not escaped.
+- **The server decides a ref move itself, not just the client** (`ref_guard`).
+  Every `UpdateRef` (all transports, local-path pushes and `sc serve --store`
+  included) is judged before the repo-wide lock is taken, so a long walk does
+  not hold it; under the lock the compare-and-swap is confirmed and every
+  object the verdict relied on is checked to still be on disk (a gc prune
+  cannot slip between the two).
+  The new tip must be a snapshot or a private-branch manifest of the **same
+  kind** as the branch's current tip, and the current tip must be its ancestor
+  (a snapshot's parents, which must be snapshots; a manifest's `prev` chain,
+  which must be manifests; a manifest's `base` is not an ancestor link). It
+  must also be **connected**: every parent, root tree, nested object, secret,
+  manifest `closure` entry, `base` and `anchor` the push added is held and of
+  the right kind, checked only along what differs from an existing ref tip. Anything absent, of the
+  wrong kind or unreadable is refused. This stops a rewind, a sideways move, a
+  public/private kind flip and a tip whose history dangles, which would break
+  clone, fetch and gc for everyone. It is not a content check: write access
+  still adds any history and fast-forwards any branch it can name. Cost: a push
+  whose history joins an existing branch below its tip (not at a tip) is walked
+  back to the root, so an rw client can make a push cost a full-history walk.
 
 ## Bucket remotes (`sc+wal://` / `sc+s3://`) — ADR-0046/0057
 
@@ -513,8 +538,9 @@ too, not just the src-control-side metadata.
 - **Write access is full authority over refs and history.** Anyone who can
   write to the bucket's manifest key can move any branch to any commit —
   fast-forward-only enforcement (the manifest compare-and-swap plus the
-  `Error::NonFastForward` check) is **cooperative**, honored by the `sc`
-  client, not cryptographically enforced by the bucket. A writer with raw
+  `Error::NonFastForward` check) is **cooperative** for a writer that talks to
+  the bucket directly (a served `--store` instance enforces it, see Network
+  transport), not cryptographically enforced by the bucket. A writer with raw
   bucket access (outside the `sc` client) can bypass it entirely, the same
   way a user with raw filesystem access to a git bare repo can force-move a
   ref underneath git's own client-side checks. Scope bucket write credentials
