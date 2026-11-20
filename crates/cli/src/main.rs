@@ -2731,8 +2731,8 @@ fn render_log_line(id: &scl_core::ObjectId, snap: &scl_core::Snapshot) -> String
         "{} {} {} — {}{}",
         id.short(),
         fmt_utc(snap.timestamp),
-        scl_core::sanitize_display(&snap.author),
-        scl_core::sanitize_display(&snap.message),
+        scl_core::sanitize_display_line(&snap.author),
+        scl_core::sanitize_display_line(&snap.message),
         merge
     )
 }
@@ -3153,7 +3153,7 @@ fn run_transcript(op: TranscriptOp) -> Result<()> {
                 println!(
                     "--- {} (agent: {}) ---",
                     tid.short(),
-                    scl_core::sanitize_display(&t.agent)
+                    scl_core::sanitize_display_line(&t.agent)
                 );
                 let body = repo.open_transcript(tid, &sk)?;
                 print!(
@@ -3206,7 +3206,7 @@ fn run_transcript(op: TranscriptOp) -> Result<()> {
                     "{}  {}  agent={}  {}",
                     snap.short(),
                     tid.short(),
-                    scl_core::sanitize_display(agent),
+                    scl_core::sanitize_display_line(agent),
                     transcript_sig_label(status)
                 ));
             }
@@ -4944,8 +4944,12 @@ mod tests {
             protection: Default::default(),
         };
         let line = render_log_line(&scl_core::ObjectId::of(b"s"), &snap);
-        assert!(line.contains("evil\\x1b]0;x\\x07") && line.contains("a\\x1b[2J\\u{9b}b\nsecond"));
-        assert!(!line.chars().any(|c| c.is_control() && c != '\n'));
+        assert!(
+            line.contains("evil\\x1b]0;x\\x07") && line.contains("a\\x1b[2J\\u{9b}b\\x0asecond"),
+            "{line}"
+        );
+        // One line: a message cannot start a line that looks like a signature status.
+        assert!(!line.chars().any(|c| c.is_control()));
     }
 
     #[test]

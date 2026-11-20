@@ -172,7 +172,7 @@ pub fn read_exact_vec(r: &mut impl std::io::Read, len: usize) -> std::io::Result
     Ok(buf)
 }
 
-pub use display::sanitize_display;
+pub use display::{sanitize_display, sanitize_display_line};
 pub use error::{Error, Result};
 pub use id::ObjectId;
 pub use object::{
