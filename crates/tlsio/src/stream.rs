@@ -13,10 +13,11 @@
 //! written, and a garbage/non-TLS peer must fail at the seam, not
 //! mid-protocol.
 
+use std::cell::Cell;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustls::pki_types::ServerName;
 
@@ -111,9 +112,54 @@ pub fn server_config(id: ServerIdentity) -> Result<TlsServerConfig> {
     })
 }
 
+/// The accepted socket under a server stream. While a deadline is set, every
+/// socket read first narrows SO_RCVTIMEO to the time left, so the handshake
+/// and whatever the caller reads before lifting it share ONE overall bound.
+/// A per-read timeout alone does not bound a peer that sends a byte just
+/// under it each time: rustls reads a record in as many socket reads as the
+/// peer chooses to split it into.
+struct DeadlineTcp {
+    tcp: TcpStream,
+    deadline: Cell<Option<Instant>>,
+}
+
+impl DeadlineTcp {
+    /// Replace the deadline by a plain socket timeout (the session bound).
+    fn set_read_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
+        self.deadline.set(None);
+        self.tcp.set_read_timeout(d)
+    }
+
+    fn set_write_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
+        self.tcp.set_write_timeout(d)
+    }
+}
+
+impl Read for DeadlineTcp {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(at) = self.deadline.get() {
+            let left = at.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            self.tcp.set_read_timeout(Some(left))?;
+        }
+        self.tcp.read(buf)
+    }
+}
+
+impl Write for DeadlineTcp {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.tcp.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.tcp.flush()
+    }
+}
+
 /// A completed server-side TLS connection wrapping a `TcpStream`.
 pub struct TlsServerStream {
-    inner: rustls::StreamOwned<rustls::ServerConnection, TcpStream>,
+    inner: rustls::StreamOwned<rustls::ServerConnection, DeadlineTcp>,
 }
 
 /// A completed client-side TLS connection wrapping a `TcpStream`.
@@ -136,11 +182,24 @@ impl std::fmt::Debug for TlsClientStream {
     }
 }
 
-/// Accept-side wrap: complete the handshake (bounded by whatever socket
-/// timeout the caller set on `tcp`) and return a ready stream.
-pub fn server_stream(cfg: &TlsServerConfig, mut tcp: TcpStream) -> Result<TlsServerStream> {
+/// Accept-side wrap: complete the handshake and return a ready stream.
+///
+/// With `deadline`, the handshake AND every later read on the stream fail as
+/// timed out once it passes, however the peer paces its bytes; the first
+/// [`TlsServerReadHalf::set_socket_timeouts`] call lifts it for the session.
+/// Without one, the handshake is bounded only by a socket timeout the caller
+/// set on `tcp`, which a slow trickle can outlast.
+pub fn server_stream(
+    cfg: &TlsServerConfig,
+    tcp: TcpStream,
+    deadline: Option<Instant>,
+) -> Result<TlsServerStream> {
     let mut conn = rustls::ServerConnection::new(cfg.config.clone())
         .map_err(|e| Error::Handshake(e.to_string()))?;
+    let mut tcp = DeadlineTcp {
+        tcp,
+        deadline: Cell::new(deadline),
+    };
     while conn.is_handshaking() {
         conn.complete_io(&mut tcp)
             .map_err(|e| Error::Handshake(format!("server handshake: {e}")))?;
@@ -256,7 +315,8 @@ macro_rules! halves {
             /// Set read/write timeouts on the UNDERLYING socket (SO_RCVTIMEO
             /// / SO_SNDTIMEO apply to the socket, so they govern the TLS
             /// stream's blocking behavior below the record layer) — the P31
-            /// session-timeout hook.
+            /// session-timeout hook. On a server stream it also replaces the
+            /// accept deadline ([`server_stream`]).
             pub fn set_socket_timeouts(
                 &self,
                 read: Option<Duration>,
@@ -308,7 +368,7 @@ mod tests {
             let (tcp, _) = listener.accept().unwrap();
             // A client that aborts its handshake (mismatch/strict tests)
             // surfaces as Err here — that's fine, just return.
-            let Ok(stream) = server_stream(&cfg, tcp) else {
+            let Ok(stream) = server_stream(&cfg, tcp, None) else {
                 return;
             };
             let (mut r, mut w) = stream.split();
@@ -401,5 +461,41 @@ mod tests {
         h.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(!dir.exists());
+    }
+
+    /// A peer that keeps sending one byte of a declared 16 KiB handshake
+    /// record, each well inside any per-read timeout, still fails at the
+    /// overall deadline.
+    #[test]
+    fn a_trickled_handshake_fails_at_the_overall_deadline() {
+        let dir = tmp("trickle");
+        let id = crate::load_or_mint(&dir, &crate::identity::tests::plain_create).unwrap();
+        let cfg = server_config(id).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let deadline = Duration::from_millis(600);
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            // Per-read timeout far above the byte gap: only the deadline can fire.
+            tcp.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+            let t0 = Instant::now();
+            let r = server_stream(&cfg, tcp, Some(t0 + deadline));
+            (r.is_err(), t0.elapsed())
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.write_all(&[0x16, 0x03, 0x01, 0x40, 0x00]).unwrap();
+        while !server.is_finished() {
+            if c.write_all(&[0]).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let (failed, took) = server.join().unwrap();
+        assert!(failed, "a trickled handshake must not complete");
+        assert!(
+            took >= deadline && took < deadline + Duration::from_secs(2),
+            "failed after {took:?}, expected about {deadline:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
