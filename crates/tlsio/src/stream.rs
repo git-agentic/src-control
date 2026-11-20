@@ -113,8 +113,9 @@ pub fn server_config(id: ServerIdentity) -> Result<TlsServerConfig> {
 }
 
 /// The accepted socket under a server stream. While a deadline is set, every
-/// socket read first narrows SO_RCVTIMEO to the time left, so the handshake
-/// and whatever the caller reads before lifting it share ONE overall bound.
+/// socket read first narrows SO_RCVTIMEO, and every write SO_SNDTIMEO, to the
+/// time left, so the handshake and whatever the caller reads before lifting it
+/// share ONE overall bound.
 /// A per-read timeout alone does not bound a peer that sends a byte just
 /// under it each time: rustls reads a record in as many socket reads as the
 /// peer chooses to split it into.
@@ -131,25 +132,39 @@ impl DeadlineTcp {
     }
 
     fn set_write_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
+        self.deadline.set(None);
         self.tcp.set_write_timeout(d)
+    }
+
+    /// The time left while a deadline applies; `TimedOut` once it is spent.
+    fn left(&self) -> std::io::Result<Option<Duration>> {
+        let Some(at) = self.deadline.get() else {
+            return Ok(None);
+        };
+        let left = at.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        Ok(Some(left))
     }
 }
 
 impl Read for DeadlineTcp {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if let Some(at) = self.deadline.get() {
-            let left = at.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(std::io::ErrorKind::TimedOut.into());
-            }
+        if let Some(left) = self.left()? {
             self.tcp.set_read_timeout(Some(left))?;
         }
         self.tcp.read(buf)
     }
 }
 
+/// Writes are bounded too: rustls sends the server flight (certificate chain)
+/// inside the handshake, and a peer that stops reading would block it.
 impl Write for DeadlineTcp {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(left) = self.left()? {
+            self.tcp.set_write_timeout(Some(left))?;
+        }
         self.tcp.write(buf)
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -184,9 +199,11 @@ impl std::fmt::Debug for TlsClientStream {
 
 /// Accept-side wrap: complete the handshake and return a ready stream.
 ///
-/// With `deadline`, the handshake AND every later read on the stream fail as
-/// timed out once it passes, however the peer paces its bytes; the first
-/// [`TlsServerReadHalf::set_socket_timeouts`] call lifts it for the session.
+/// With `deadline`, the handshake AND every later read or write on the stream
+/// fail as timed out once it passes, however the peer paces its bytes or
+/// whether it reads at all; the first
+/// [`TlsServerReadHalf::set_socket_timeouts`] call lifts it for the session
+/// and sets both session timeouts.
 /// Without one, the handshake is bounded only by a socket timeout the caller
 /// set on `tcp`, which a slow trickle can outlast.
 pub fn server_stream(
@@ -496,6 +513,88 @@ mod tests {
             took >= deadline && took < deadline + Duration::from_secs(2),
             "failed after {took:?}, expected about {deadline:?}"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A peer that never reads stalls the write side of the deadline socket
+    /// (rustls writes the certificate chain during the handshake). A loopback
+    /// socket pair makes the block deterministic: the writer fills the send
+    /// and receive buffers of a peer that does not read.
+    #[test]
+    fn a_write_to_a_peer_that_never_reads_fails_at_the_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (tcp, _) = listener.accept().unwrap();
+        let deadline = Duration::from_millis(600);
+        let t0 = Instant::now();
+        let mut dt = DeadlineTcp {
+            tcp,
+            deadline: Cell::new(Some(t0 + deadline)),
+        };
+        let chunk = vec![0u8; 64 * 1024];
+        // Bounded so a regression fails the assertion rather than hanging CI
+        // forever: 1 GiB cannot fit in loopback buffers.
+        let mut sent = 0usize;
+        let err = loop {
+            match dt.write(&chunk) {
+                Ok(n) => sent += n,
+                Err(e) => break e,
+            }
+            assert!(sent < 1 << 30, "the write never blocked");
+        };
+        let took = t0.elapsed();
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ),
+            "{err:?}"
+        );
+        assert!(
+            took >= deadline && took < deadline + Duration::from_secs(2),
+            "failed after {took:?}, expected about {deadline:?}"
+        );
+        drop(client);
+    }
+
+    /// The session timeouts replace the deadline at handoff, on both sides:
+    /// the write timeout narrowed during the handshake must not survive.
+    #[test]
+    fn session_timeouts_replace_the_deadline_and_the_narrowed_write_timeout() {
+        let dir = tmp("handoff");
+        let id = crate::load_or_mint(&dir, &crate::identity::tests::plain_create).unwrap();
+        let cfg = server_config(id).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            server_stream(&cfg, tcp, Some(Instant::now() + Duration::from_secs(30))).unwrap()
+        });
+        let tcp = TcpStream::connect(addr).unwrap();
+        let _client = client_connect(tcp, "127.0.0.1", None, false).unwrap();
+        let stream = server.join().unwrap();
+        // The handshake wrote under the deadline, so a narrowed write timeout is set.
+        assert!(stream
+            .inner
+            .get_ref()
+            .tcp
+            .write_timeout()
+            .unwrap()
+            .is_some());
+        let (r, _w) = stream.split();
+        let session = Some(Duration::from_secs(300));
+        r.set_socket_timeouts(session, session).unwrap();
+        {
+            let g = r.0.lock().unwrap();
+            let dt = g.inner.get_ref();
+            assert_eq!(dt.deadline.get(), None);
+            assert_eq!(dt.tcp.read_timeout().unwrap(), session);
+            assert_eq!(dt.tcp.write_timeout().unwrap(), session);
+        }
+        r.set_socket_timeouts(None, None).unwrap(); // --timeout 0
+        let g = r.0.lock().unwrap();
+        assert_eq!(g.inner.get_ref().tcp.write_timeout().unwrap(), None);
+        drop(g);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
