@@ -1372,10 +1372,15 @@ length. Git is the system binary (`SC_GIT` overrides) with a scrubbed environmen
 transport allowlist (`https`, `http`, `ssh`, `file`; `ext`, `fd` and `git` forced off), a
 URL allowlist and no userinfo on `http(s)` URLs (credentials go through git's credential
 helper); a private bare repo in `sc-git-bucket-<pid>-<random>` caches fetched
-objects and is removed on `Drop`. Scaling: every `ls-remote` and push downloads the
-whole ref advertisement (the host does not filter it server-side), and a cold read fetches
-every `log/` and `checkpoints/` entry behind the last checkpoint; refs grow by at least three
-per push until `sc remote compact` runs.
+objects and is removed on `Drop`. A mutable key (the manifest) is read with one `git fetch`
+of exactly `refs/sc/K` under protocol v2, so a v2 host lists that ref alone, and every fetch
+runs under a watchdog that kills git past its download budget (disk bytes per fetch: a
+key's value cap, 2 GiB for a family) or after 120 s without progress (only serve mode on
+unix kills git's whole process group, through the system `kill`, and only while git is
+unreaped; elsewhere, and for any helper that outlives git's exit, the helpers that write the
+pack may keep writing). Scaling: `ls-remote` and push download the whole ref advertisement,
+and a cold read fetches every `log/` and `checkpoints/` entry behind the last checkpoint;
+refs grow by at least three per push until `sc remote compact` runs.
 
 `sc remote compact` works on a carrier (ADR-0057 addendum). A Git host reports no
 trustworthy object age (committer time is writer-controlled), so the compactor keeps its
@@ -1394,8 +1399,12 @@ A private branch goes to an `sc+git::` remote only under the per-remote opt-in
 `--allow-private-branches` (`sc remote set <name> --allow-private-branches` for an existing
 remote), since its name, recipient ids and sizes become readable by
 every reader of the repository and the ciphertext cannot be taken back.
-`sc serve --store` (a daemon cannot answer prompts, and it would bypass the opt-in)
-refuses an `sc+git::` store in v1.
+`sc serve --store sc+git::<url>` serves a carrier, and the opt-in moves to the operator
+(`--allow-private-branches`): without it `BucketTransport` refuses objects of the
+sealed-branch kinds in `PutPack` and `PutObject` before anything is uploaded or staged, and
+an `UpdateRef` to a manifest, so no private-branch ciphertext reaches the Git host through
+the server (the daemon needs non-interactive git auth, and keeps its git cache under the
+serve home's `.sc/tmp/`).
 sc-forge accepts exactly the `refs/sc/` prefix (ADR-0058 addendum). The dependency rule
 is amended: `objio` may spawn the system `git`, and only `gitio::bridge` and objio's
 git backend spawn it; `gix` stays in `gitio`. Proven by `crates/cli/tests/git_bucket.rs`,

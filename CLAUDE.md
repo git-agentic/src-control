@@ -164,7 +164,7 @@ the code, those win.
 | P37c | Merge, cherry-pick and rebase on a partial clone: a tree-recursive engine (`merge_trees`) carries a subtree by id when the sides agree and no protection rule applies, reads only where they differ or a rule intersects, and on a lazy, online clone fills what it asks for by id outside the store lock (a non-lazy clone gets the gap error with `sc backfill <path>`); a carried protected subtree keeps the complete input wrap union; a conflict inside the view is marked and resolved like on a full clone (`sc conflicts`/`sc resolve`/`merge --abort`/`sc commit`; the out-of-view part is grafted from the decided root), while a conflict outside the view, or a result that must be sealed outside it, is refused before any ref, merge-state or working-tree change (fetched objects stay). A subtree identical on all three sides is carried even under a protection rule. Cherry-pick and rebase use the same engine (`replay_commit`): the fold's accumulator may hold absent subtrees, the view is filled before the final write, and a stopped pick or rebase keeps its carried subtrees in the decided root. Mode-only edits now merge and a file/directory collision fails before any write, on full clones too. | [0049](docs/adr/0049-merge-on-partial-clones.md) |
 | P37d | Agent sessions on a partial clone: `sc ws fork`/`run`/`harvest`/`abandon` and `sc work` work; a workspace or agent sees the host's sparse view only (`sc work` no longer gets a complete tree there), the view closure is filled (lazy, online) or refused with the gap error before anything is written, a workspace commit grafts the out-of-view subtrees from the base without reading them, and harvest lands through the ADR-0049 merge (any conflict falls back to a `work-<i>` branch as on a full clone) | [0050](docs/adr/0050-sessions-on-partial-clones.md) |
 | P38 | Gitea-compatible forge over bare Git and smart HTTP: recorded API subset, scoped auth, protected merges, maintenance and container operations; 24 recorded scenarios and six first-consumer acceptance scenarios pass. Hosted repos have none of the `.sc/` features; SSH and Actions remain outside v1. | [0058](docs/adr/0058-sc-forge-gitea-compatible-git-forge.md) |
-| P39 | `sc+git::<git-url>` remotes: the bucket WAL stored as one parentless commit per key at `refs/sc/<key>` in any Git repository (system `git` via `objio::GitBucket`, lease CAS, no `+` refspec), so private branches, protected paths and secrets travel through a Git host (local bare repo, sc-forge; GitHub untested); private-branch push needs per-remote `--allow-private-branches`; `remote compact` works on it (first-sighting age record, leased deletes; ADR-0057 addendum) while `serve --store` refuses it in v1; sc-forge accepts `refs/sc/` | [0060](docs/adr/0060-git-carried-bucket-remotes.md) |
+| P39 | `sc+git::<git-url>` remotes: the bucket WAL stored as one parentless commit per key at `refs/sc/<key>` in any Git repository (system `git` via `objio::GitBucket`, lease CAS, no `+` refspec), so private branches, protected paths and secrets travel through a Git host (local bare repo, sc-forge; GitHub untested); private-branch push needs per-remote `--allow-private-branches`; `remote compact` works on it (first-sighting age record, leased deletes; ADR-0057 addendum); `sc serve --store sc+git::` serves it and refuses private-branch objects unless the operator passes `--allow-private-branches`, and every fetch runs under a download watchdog; sc-forge accepts `refs/sc/` | [0060](docs/adr/0060-git-carried-bucket-remotes.md) |
 
 ## Standing boundaries & gotchas
 
@@ -228,7 +228,7 @@ transport-adjacent. The rest, imperatively:
   error on it and it never reaches the P18 bridge. Pushing a private branch needs
   the per-remote opt-in `--allow-private-branches` (`remote add`/`clone`;
   enforced in `repo`, refuses before any upload); protected paths and secrets
-  need none. `sc serve --store` refuses it (deferred: no prompts in a daemon).
+  need none. `sc serve --store` serves it behind a server-side gate (next bullet).
   `sc remote compact` works on it with its own age source (a Git host has no
   trustworthy object age): a first-sighting record at
   `refs/sc/compact/sightings` (`<secs> <oid> <key>`, generation-aware, strict
@@ -245,7 +245,33 @@ transport-adjacent. The rest, imperatively:
   and forks may keep objects by id). Public content is plaintext, and private
   branch names, recipient ids and sizes are readable by every reader of the
   repository. A killed process can leave `sc-git-bucket-<pid>-<random>` in the
-  temp dir. Not tested against real GitHub.
+  temp dir (`sc serve` keeps it under the serve home's `.sc/tmp/`, locks
+  `<cache>/.owner.lock` for the bucket's life, and reaps at startup the caches
+  whose lock is free, unix). Not tested against real GitHub.
+- **`sc serve --store sc+git::<url>` (ADR-0060) refuses private-branch objects
+  unless the operator passes `--allow-private-branches`** (refused on any other
+  store). The gate is `BucketTransport.refuse_sealed`, set by `open_for_serve`:
+  `put_pack` stops at the first object of a sealed-branch kind (`Sealed`,
+  `Manifest`, `transport::is_sealed_branch_object`) before `upload_pack`,
+  `put_object` refuses before staging, and `update_ref` refuses a manifest tip
+  even when it already sits on the chain; the error is `InvalidArgument`
+  (`EC_OTHER`, no wire change) and a client cannot lift it. The daemon needs
+  non-interactive git auth. A mutable-key read is one `git fetch` of exactly
+  `refs/sc/<key>` under protocol v2 (the host filters the advertisement; negative
+  refspecs stop git's abbreviation rules from letting a branch or tag stand in
+  for the key). Every fetch runs under a watchdog (`fetch.unpackLimit=1`, the
+  growth of `objects/pack` polled from 2 ms backing off to 50 ms): killed over the
+  budget (the key's value cap plus 0.1% and 1 MiB, 2 GiB for a family) or after
+  120 s with no progress, what it added removed. The bound is disk per fetch, not
+  RAM inside `index-pack`, not the total cache, and not the refs a family fetch
+  writes. Only serve mode on unix bounds disk against a hostile HTTP host: it runs
+  git in its own process group and kills the group through the system `kill`,
+  but only while git is unreaped (after the reap the group id may have been
+  reused, so it is never signalled; `may_signal_group`). Without a `kill` it
+  warns once and kills git alone. The CLI and Windows kill git alone, and the
+  helpers that write the pack may keep writing; so may any helper that outlives
+  git's exit, in any mode, until it exits. Only fetches are watched; `ls-remote`
+  and push are not.
 - **`DirBucket` (`sc+wal://<dir>`) is a single-host, single-owner backend (#264).**
   Its CAS takes an OS advisory file lock (`File::lock`: `flock` on unix,
   `LockFileEx` on Windows) on `<root>/.cas-lock`, a file that is never removed and

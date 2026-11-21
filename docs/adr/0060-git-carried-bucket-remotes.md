@@ -118,6 +118,19 @@ under the temp directory (mode 0700), removed on `Drop`.
   by one. All fetches are `--depth=1`, so a hostile commit's parents are never
   downloaded. A counting `SC_GIT` shim test bounds the git network calls of a
   cold clone and an incremental push independent of the log length.
+- A mutable key (the manifest) is read with one call, `git fetch --depth=1
+  +refs/sc/K:refs/sc/K`, instead of `ls-remote` followed by `fetch`. The local ref
+  after the fetch is the tag; if it equals the caller's cached tag the read is
+  `Unchanged`. Every git call pins `protocol.version=2`, so the fetch sends
+  `ref-prefix refs/sc/K` and a v2 host lists that ref alone, not its branches
+  and other keys (packet traces: a local bare repository and sc-forge over
+  smart HTTP, both in the tests). A failed fetch does not say whether the ref is
+  absent, so an exact `ls-remote` of that one ref decides absent versus error.
+  Git resolves a refspec source that no remote ref matches exactly by its
+  abbreviation rules, so a branch, tag or remote-tracking ref spelled
+  `refs/sc/K` after its own prefix would stand in for an absent key. The fetch
+  carries negative refspecs for those five spellings, which keeps the exact-name
+  semantics `ls-remote` plus a compare had.
 - A fetched value is validated before assembly: a commit with no parent, a tree
   of regular blobs named `c0000` onward without gaps, nothing else, each chunk
   at most 32 MiB, total at most 2 GiB for a `.pack` and 256 MiB for any other
@@ -148,7 +161,9 @@ Every git call runs with `-c protocol.allow=never` plus `always` for `file`,
 and `protocol.git.allow=never` so a user config cannot re-enable them; `--end-of-options` before the URL; stdin closed;
 `GIT_TERMINAL_PROMPT=0` and `LC_ALL=C`; hooks off (`core.hooksPath=/dev/null`),
 `gc.auto=0`, `maintenance.auto=false`, signing off, `core.useReplaceRefs=false`,
-and `http.lowSpeedLimit`/`lowSpeedTime` so a stalled host cannot hang a push.
+and `http.lowSpeedLimit`/`lowSpeedTime` so a stalled host cannot hang a push;
+`protocol.version=2`, `fetch.unpackLimit=1` and `fetch.uriProtocols=` are pinned for the
+filtered manifest read and the fetch watchdog below.
 `GIT_DIR` and every other `GIT_*` variable is removed except the user's
 transport and credential setup (`GIT_SSH*`, `GIT_ASKPASS`, `GIT_CONFIG_GLOBAL`,
 `GIT_SSL_*` and a few more), then `GIT_DIR` is set to the cache. The user's
@@ -167,6 +182,91 @@ reading), 32 MiB per chunk, 10,000 chunks per value, 64 MiB of captured
 manifest, log, checkpoint and idx reads (256 MiB) and the pack record bounds
 apply on top.
 
+### Fetch watchdog: a download budget
+
+`git fetch` has no input-size limit (`fetch.maxInputSize` and
+`transfer.maxInputSize` are ignored), so the caps above used to apply only after
+a hostile host had already written its data into the cache. Every fetch now runs
+under a watchdog:
+
+- `fetch.unpackLimit=1` makes all incoming data land in one
+  `objects/pack/tmp_pack_*` file, never in loose objects, and
+  `fetch.uriProtocols=` and `transfer.bundleURI=false` stop a host from moving
+  the download to packfile or bundle URLs the watchdog could not see.
+- The fetch reads the total size of `objects/pack` before it starts and polls it
+  while it runs (2 ms at first, backing off to 50 ms), while detached threads drain
+  git's pipes. Git is killed when the growth passes the budget: the key's value cap
+  plus 0.1% and 1 MiB for a fetch of one key (256 MiB or 2 GiB plus), 2 GiB for a
+  family or batched fetch. It is also killed when nothing grows and nothing exits
+  for 120 s, so a silent host cannot park a served session on a fetch. Only
+  fetches are watched: `ls-remote` and push run unwatched. Over HTTP,
+  `http.lowSpeedLimit`/`lowSpeedTime` bound them; over ssh the operator should set
+  `ServerAliveInterval` (and `ServerAliveCountMax`) for the daemon's ssh user.
+  The 2 GiB family budget is a cliff for a legitimate store: one whose `log/`,
+  `checkpoints/` or idx entries together exceed it before compaction fails its
+  cold read with an error that says so.
+- A fetch that finished between two polls is caught by a check after it exits.
+  After git exits the watchdog keeps measuring `objects/pack` for the one deadline
+  both pipes share, because a helper that outlived git can still be writing, and
+  measures once more after both pipes have closed, before it calls the fetch good.
+  Every breach (the budget during the run, the budget after git exited, no
+  progress, a pipe a helper keeps open after git exits) takes one path: stop git
+  (the group in serve mode), reap it, keep watching until the pipes have closed
+  and `objects/pack` has stopped changing or 5 s have passed, then discard. The
+  files the fetch added to `objects/pack` and every local ref under `refs/sc/`
+  are removed (the cache only mirrors the host; the next read fetches again) and
+  the error names the cap. Discarding before the helpers are gone would let a
+  survivor write into the cleaned directory.
+- The cache path is made absolute before any git runs: git runs with the cache as
+  its working directory and `GIT_DIR` set to it, so a relative serve home (`.`)
+  would be resolved from inside the cache.
+- Serve mode, on unix, spawns git in its own process group and signals the group
+  (`kill -s KILL -- -<pgid>`, std only, no `unsafe`), so `ssh` and
+  `git-remote-https` die with it. The group is signalled only while the leader is
+  unreaped: its pid pins the group id then. Once the leader is reaped, the id of
+  the group is free to be reused by an unrelated process group of the same user,
+  and nothing observable shows that it has not been (an open pipe proves a live
+  member only at the instant it is looked at, and the external `kill` runs
+  later). Pinning the pid without reaping needs `waitid(WNOWAIT)`, which is
+  `unsafe` and not allowed here. So after the reap the group is never signalled,
+  whatever the pipes say; the decision is `may_signal_group`. That needs a `kill`
+  program on the PATH; if it cannot be run, the watchdog falls back to killing
+  git alone and prints one warning. The CLI does not use a process group: Ctrl-C
+  must still reach git and ssh must still be able to prompt on the terminal. It
+  kills git alone, and the pipe readers are detached threads, so a helper that
+  outlives git and holds the pipes cannot block the call. A git that exits while
+  a helper holds its pipes is an error once one shared 120 s deadline for both
+  pipes has passed, after which the watchdog settles for a bounded time and
+  discards what the fetch added. Windows kills the child only.
+- A helper that outlives git's exit is therefore not killed, in either mode, and
+  may keep writing after the discard until it exits. That covers a smart-HTTP
+  v0/v1 helper chain, an ssh `ControlPersist` master, and a hostile process. The
+  watchdog bounds disk only while git itself is running (or its group can still
+  be signalled); after git exits it measures, settles and discards, and cannot
+  stop a survivor. The planned fix (ROADMAP, `sc+git::` follow-on 10) is a
+  group-leading supervisor: in serve mode, run git under a std-only `sh` leader
+  (`sh -c 'git "$@"; echo $? > <status file>; read _' sh <args>`, with stdin piped
+  from sc) so the process group id stays pinned after git exits. The watchdog could
+  then group-kill a helper that outlives git, which closes this gap, before it
+  closes the leader's stdin and reaps it. Not built in v1.
+
+The exact limits:
+
+- The bound is disk bytes per fetch. It is not RAM inside git's `index-pack`, and
+  not the total size of the cache, which grows by what each fetch keeps and lives
+  as long as the process. An HTTP daemon opens one cache per connection, so its
+  worst case is the per-fetch budget times `--max-connections`, plus what the
+  caches keep.
+- Refs a family fetch writes are not measured. A hostile host can advertise a
+  great many refs; only the 120 s no-progress deadline bounds that.
+- Only serve mode on unix actually bounds disk against a hostile HTTP host. Outside
+  it (the unix CLI, Windows), and possibly against a smart-HTTP host on protocol
+  v0 or v1, the kill may not reach the helper chain that writes the pack
+  (`git-remote-https`, `index-pack`), which can keep writing after git is killed.
+  Those cases are not disk-bounded; the watchdog still frees the call.
+- A fetch in its own process group outlives a killed `sc serve`: a supervisor
+  that kills the whole cgroup covers it.
+
 ### Private-branch opt-in
 
 Pushing a private branch to an `sc+git::` remote needs a per-remote setting,
@@ -179,6 +279,54 @@ flag. The gate lives in `repo` (the push path), not only the CLI. Protected path
 and secrets need no extra opt-in: choosing the scheme is the opt-in. `remote
 add` and `clone` print one notice that public content and sealed metadata are
 readable by everyone who can read the Git repository.
+
+### Serving a Git store (`sc serve --store sc+git::<url>`)
+
+`sc serve --store sc+git::<url>` works over `--stdio` and `--http`. The server is a
+client of the Git host with the operator's credentials, so git must authenticate
+without prompting (an ssh agent, a key without a passphrase, or a credential
+helper; `GIT_TERMINAL_PROMPT=0` is already set). The private-branch opt-in moves
+to the server: `sc serve ... --store sc+git::... [--allow-private-branches]` (the
+flag is refused for any other store). The client-side gate cannot cover this path,
+because the client talks to the server with `sc+http` or `ssh` and has no idea a
+Git host sits behind it.
+
+Without the flag, the gate sits inside `BucketTransport` behind a per-instance
+flag the serve opener sets (`open_for_serve`), at the three places sealed-branch
+data can arrive, not in `upload_pack`:
+
+1. `PutPack`: the parse callback stops at the first object of a sealed-branch kind
+   (`Sealed`, `Manifest`, the predicate `is_sealed_branch_object`) before
+   `upload_pack`, whatever the order of the records.
+2. `PutObject`: the object is refused before it is staged, so a later `UpdateRef`
+   cannot flush it.
+3. `UpdateRef`: after the shared ref rule, a ref pointed at a manifest is refused,
+   including a manifest already on the chain (written by a direct writer), so an
+   existing private branch cannot be advanced or re-pointed through the server.
+
+The error is `InvalidArgument` (`EC_OTHER`, no wire change) and names the server
+flag. The check runs per request, so no order of `PutObject`, `PutPack` and
+`UpdateRef` gets a sealed object to the host: the tests drive the hostile orders
+against a real bare repository and inspect it afterwards. Reads are unchanged: a
+private branch that is already on the host is served. A writer with direct push
+access bypasses the server entirely; that is the writer-set point under
+Consequences.
+
+The cache lives under the serve home's `.sc/tmp/` (`GitBucket::open_in`), not the
+system temp directory, and the bucket holds an advisory `File::lock` on
+`<cache>/.owner.lock` for its whole life. `sc serve` removes `sc-git-bucket-*`
+directories there at startup, but only those whose lock it can take (`try_lock`
+succeeds), which means no live bucket holds it: many `sc serve --stdio` processes
+share one home, so a sweep of every directory would delete a live session's cache.
+The OS drops a lock with its holder, so this needs no pid number and no helper
+program: it is correct under pid reuse, with every server being pid 1 in a
+container, and across several pid namespaces on one host. A directory with no lock
+file, a symlink and any other name are kept. The sweep holds the lock while it
+removes the directory, and an opener whose lock file disappears starts over. The
+lock is an advisory file lock on one host, and unreliable over NFS and similar, as
+for `DirBucket` (#264). An `sc serve` run by an ssh user is run by an operator: that
+user can pass `--store` and `--allow-private-branches`, so the gate protects against
+clients of the server, not against whoever starts it.
 
 This reverses ADR-0044's reason (4) for rejecting "opaque sealed refs through
 the git bridge", and only under that opt-in. Reasons (1) to (3) do not apply:
@@ -218,9 +366,9 @@ sighting is immediately old). Consequences to know:
 
 ### Deferred in v1
 
-- `sc serve --store sc+git::...` is refused. A daemon cannot answer ssh or
-  credential prompts, and it would sit between clients and the client-side
-  private-branch gate.
+- `sc serve --store sc+git::...` was refused in v1 (a daemon cannot answer
+  prompts, and it sat between clients and the client-side gate). It is built now,
+  with a server-side gate; see "Serving a Git store".
 - SHA-256 Git repositories are not supported: values and tags are SHA-1 ids, and
   the local cache is created with `--object-format=sha1` whatever the user's
   `init.defaultObjectFormat`.
@@ -271,8 +419,9 @@ every transport path.
   `git ls-remote` lists the refs to everyone.
 - A killed process (SIGKILL, or SIGINT, which skips `Drop`) can leave
   `sc-git-bucket-<pid>-<random>` behind in the temp directory. It holds fetched
-  store objects. There is no reaper. A normal exit and an error returned to `main` remove it.
-- Scaling: every `ls-remote` and push downloads the whole ref advertisement (the pattern given to `ls-remote` filters on the client; a packet trace showed the server sends every ref, protocol v2 `ref-prefix` or not), and a cold read fetches every `log/` and `checkpoints/` entry behind the last checkpoint. Refs grow by at least three per push (a log entry, a pack and its idx); `sc remote compact` (above) is what bounds that, folding the small packs and deleting what nothing names, so a long-lived store should be compacted on a schedule. Between runs the advertisement still grows with the pushes since the last one, until a ref-filtering host exists.
+  store objects. The CLI has no reaper; `sc serve` reaps the caches in the serve
+  home whose owner lock is free at startup (unix). A normal exit and an error returned to `main` remove it.
+- Scaling: `ls-remote` and push download the whole ref advertisement (the pattern given to `ls-remote` filters on the client; a packet trace showed the server sends every ref; the manifest read no longer does, it is one fetch that a v2 host answers with that ref alone), and a cold read fetches every `log/` and `checkpoints/` entry behind the last checkpoint. Refs grow by at least three per push (a log entry, a pack and its idx); `sc remote compact` (above) is what bounds that, folding the small packs and deleting what nothing names, so a long-lived store should be compacted on a schedule. Between runs the advertisement still grows with the pushes since the last one, until a ref-filtering host exists.
 - Each cold read or push costs git round trips. The freshness window and family
   batching bound them, but a Git host is slower than S3. If push over `sc+git::`
   stays slow on large histories, the next step is a batched `has_objects`.
@@ -302,11 +451,18 @@ every transport path.
 
 `crates/objio/src/git.rs` (`GitBucket`, the contract suite and race tests);
 `crates/repo/src/bucket_transport.rs` (`BucketScheme::Git`, `is_bucket_url`,
-`check_private_push_allowed`, `refuse_git_store`);
+`check_private_push_allowed`, `open_for_serve` and the serve gate
+`refuse_sealed`);
 `crates/repo/src/bucket_transport/compact/` (the age record and the carrier
 sweep, ADR-0057 addendum);
+`crates/repo/src/wire.rs` (`WirePolicy::allow_private_branches`, the serve opener,
+`reap_stale_serve_scratch`); `crates/repo/src/http_transport.rs`
+(`ServeLimits::allow_private_branches`);
 `crates/repo/src/remote.rs` (`allow_private_branches`); `crates/cli` (flags,
-notice, URL routing); `crates/forge/src/policy.rs` (`refs/sc/`). Tests:
+notice, URL routing, `sc serve --allow-private-branches`);
+`crates/forge/src/policy.rs` (`refs/sc/`). The fetch watchdog is `run_watched` in
+`crates/objio/src/git.rs`. Tests:
 `crates/objio/src/git.rs`, `crates/repo/src/bucket_transport/git_remote_tests.rs`,
+`crates/repo/src/bucket_transport/git_serve_tests.rs`,
 `crates/cli/tests/git_bucket.rs`, `crates/forge/tests/e2e_git.rs`;
 proof: `demo/run_git_carrier_demo.sh`.

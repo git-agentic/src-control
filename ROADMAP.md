@@ -704,10 +704,11 @@ across every phase.
   `refs/sc/*`, and the same repository can also mirror public branches through a
   `--git` remote. A private-branch push needs the per-remote opt-in
   `--allow-private-branches`; `sc remote compact` works on `sc+git::` (a
-  first-sighting age record, leased deletes; ADR-0057 addendum) while
-  `sc serve --store` refuses it in v1; sc-forge accepts the `refs/sc/` prefix. No
-  format, wire or crypto change. Proven by `demo/run_git_carrier_demo.sh`.
-  (ADR-0060.)
+  first-sighting age record, leased deletes; ADR-0057 addendum); `sc serve --store
+  sc+git::` serves it behind a server-side private-branch gate (the operator's
+  `--allow-private-branches`) and every fetch runs under a download watchdog;
+  sc-forge accepts the `refs/sc/` prefix. No format, wire or crypto change. Proven
+  by `demo/run_git_carrier_demo.sh`. (ADR-0060.)
 
 ## Active
 
@@ -1028,16 +1029,22 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
   come from the idx; `list_meta` itself still downloads every listed value); (7)
   in part: compaction folds small packs and deletes what nothing names, which
   bounds the ref growth of at least three per push and the log/checkpoint
-  entries a cold read fetches, but between runs every `ls-remote` and push still
-  downloads the whole ref advertisement (the host does not filter it by prefix
-  server-side, a packet trace showed the full list). Still deferred: (2)
-  `sc serve --store sc+git::...` (a daemon cannot answer ssh or credential
-  prompts, and it would sit between clients and the private-branch opt-in); (4)
-  validation against real GitHub (per-ref and per-push limits, rulesets, hosts
-  that refuse unknown ref namespaces), untested so far; (9) a download budget for
-  fetches into the temp cache (`git fetch` has no input-size limit, so an
-  oversized value is written before the read caps refuse it). Declined, with
-  reasons: (3) rollback and rewind of `refs/sc/manifest` by anyone with push
+  entries a cold read fetches, and the manifest read is one `git fetch` that a
+  protocol v2 host answers with that ref alone, but between runs `ls-remote` and
+  push still download the whole ref advertisement; (2) `sc serve --store
+  sc+git::...`, which refuses private-branch objects unless the operator passes
+  `--allow-private-branches` (the daemon needs non-interactive git auth); (9) a
+  download budget: every fetch into the cache runs under a watchdog that kills
+  git over its budget (disk bytes per fetch; not RAM inside `index-pack`, not the
+  total cache). Still deferred: (4) validation against real GitHub (per-ref and
+  per-push limits, rulesets, hosts that refuse unknown ref namespaces), untested
+  so far; (10) a group-leading supervisor for the serve-mode watchdog: run git
+  under a std-only `sh` leader (`sh -c 'git "$@"; echo $? > <status file>; read
+  _' sh <args>`, stdin piped from sc) so the process group id stays pinned after
+  git exits, and the watchdog can group-kill a helper that outlives git (the
+  post-exit gap ADR-0060 documents: a smart-HTTP v0/v1 helper chain, an ssh
+  `ControlPersist` master) before it closes the leader's stdin and reaps it.
+  Declined, with reasons: (3) rollback and rewind of `refs/sc/manifest` by anyone with push
   access is the cross-cutting signed-ref effort already tracked under P34
   follow-on (6) and ADR-0059 follow-on (2), now reachable by more people; a
   client-side "highest manifest seq seen" floor was reviewed and judged a false
