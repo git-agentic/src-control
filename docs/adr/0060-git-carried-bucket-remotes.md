@@ -370,7 +370,7 @@ sighting is immediately old). Consequences to know:
 - A push that stalls longer than the grace window between uploading a pack and
   committing it can lose the pack, as on any backend; byte-identical reuse of an
   aged orphan pack at the moment its delete lands remains a narrowed race.
-- Deleting a ref is not erasure (see Consequences). Untested on GitHub.
+- Deleting a ref is not erasure (see Consequences).
 
 ### Deferred in v1
 
@@ -405,9 +405,17 @@ every transport path.
   push, fetch and clone private branches, protected paths and secrets through a
   Git repository. A keyless clone sees what a keyless clone of an `sc+wal://`
   remote sees. Proven by `crates/cli/tests/git_bucket.rs`, the forge end-to-end
-  tests, and `demo/run_git_carrier_demo.sh`. Not tested against real GitHub
-  (outside this work's grant); expect per-ref and per-push limits and any host
-  that refuses unknown ref namespaces to be the failure modes.
+  tests, and `demo/run_git_carrier_demo.sh`. Validated against a private GitHub repository
+  on 2026-11-21 (git 2.54, HTTPS through the gh credential helper, synthetic data only,
+  every ref deleted afterwards): GitHub accepted `refs/sc/*` creates, lease
+  CAS updates and deletes; of two racing pushers exactly one won and the other got
+  non-fast-forward; a v2 fetch of `refs/sc/manifest` was answered with that ref
+  only; keyless and keyed clones behaved as on sc-forge; two compaction runs took
+  the store from 18 refs to 5 and a clone afterwards read the private branch.
+  Each git call is its own HTTPS round trip (about 1-2 s), so a first push of a
+  tiny repository took 56 s and a clone 13 s. Not exercised on GitHub: its
+  per-push (2 GiB) and per-blob (100 MB; values are chunked at 32 MiB) limits,
+  rulesets on custom refs, and CAS atomicity across its replicas beyond one race.
 - **The writer set is wider than S3.** Everyone with push access to the Git
   repository (collaborators, deploy keys, CI tokens) holds bucket put and
   delete, and there is no object versioning to recover. They can rewind

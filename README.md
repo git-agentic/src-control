@@ -146,7 +146,8 @@ everyone who can read the repository). `sc remote compact` works on it (run it
 from one host; the first run only records when it first saw each object).
 `sc serve --store sc+git::<git-url>` serves it and refuses private branches
 unless the operator passes `--allow-private-branches`. Proven by
-`demo/run_git_carrier_demo.sh`; not tested against GitHub itself.
+`demo/run_git_carrier_demo.sh`, and checked by hand against a private GitHub
+repository (slow there: a first small push took about a minute).
 
 ## How Phase 1 works
 

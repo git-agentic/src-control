@@ -390,7 +390,7 @@ rights away from pushers; branch protection does not cover `refs/sc/*`.
 Deleting a ref is not erasure: the host may keep the objects fetchable by id,
 and forks and mirrors keep their own copies; sealed content stays ciphertext, so
 rotation (`sc rewrap --rotate`) is the cutover. Tested over a bare repository
-and sc-forge; not tested against GitHub.
+and sc-forge, and on a private GitHub repository (two runs, 18 → 5 refs; ADR-0060).
 
 As built: `compact/sightings.rs` (the record), `compact.rs` (`list_for_sweep`,
 `delete_keys`, `manifest_unmoved`), `WalView.pack_sizes`, `Bucket::list_tags`
