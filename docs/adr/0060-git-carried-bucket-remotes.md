@@ -71,11 +71,16 @@ force-updated in the experiment (git 2.54).
 A rejected push is classified by re-reading the exact ref with `ls-remote`,
 never by the host's wording:
 
-- `put_new`: the ref exists means someone else created it (`false`); absent
-  means a genuine refusal (error).
+- the ref now holds the commit this write just built: the push landed and only
+  its acknowledgement was lost, so the write succeeded (`true` / `Some(tag)`);
+- `put_new`: the ref exists with another value means someone else created it
+  (`false`); absent means a genuine refusal (error).
 - `put_if_tag`: the ref no longer equals the expected tag (changed or deleted)
   means someone else won (`None`); it still equals the expected tag means a
   genuine refusal such as `pre-receive hook declined` (error).
+
+Any write that is not a success drops the key's cached tag, so the 2 s freshness
+window can never answer `Unchanged` for a tag that just lost a CAS.
 
 So a hook or permission refusal never looks like a lost race, which
 `BucketTransport` would report as a non-fast-forward and the user would retry
@@ -92,9 +97,12 @@ under the temp directory (mode 0700), removed on `Drop`.
   `BucketTransport::has_object` refreshes per object, which would otherwise cost
   one `ls-remote` each. Staleness is bounded and only causes a failed server-side
   CAS or a redundant upload.
-- A key whose cached commit says `new` is create-only. This instance serves it
-  from the local cache with no network call at all; its bytes stay valid even
-  if compaction later deletes the key.
+- A key is create-only by its layout alone: `log/`, `checkpoints/`, or a `.pack`
+  or `.idx` under `packs/`. Never by anything the writer controls, such as a
+  commit message. This instance serves such a key from the local cache with no
+  network call at all; its bytes stay valid even if compaction later deletes
+  the key. Every other key (the manifest) is re-read once the freshness window
+  passes.
 - The first cache miss under `log/`, `checkpoints/` or a `packs/*.idx` key
   fetches that whole family in one `git fetch` (a glob refspec). This is
   GitBucket's knowledge of the WAL key layout. `.pack` values are fetched one
@@ -103,21 +111,29 @@ under the temp directory (mode 0700), removed on `Drop`.
   cold clone and an incremental push independent of the log length.
 - A fetched value is validated before assembly: a commit with no parent, a tree
   of regular blobs named `c0000` onward without gaps, nothing else, each chunk
-  at most 32 MiB, total at most 2 GiB. Anything else is a corrupt store and an
-  error.
+  at most 32 MiB, total at most 2 GiB for a `.pack` and 256 MiB for any other
+  key. The ref must point directly at the commit (a tag object is not peeled),
+  and family ref names are checked like any key before they enter the cache.
+  Anything else is a corrupt store and an error. Fetches run with
+  `fetch.fsckObjects=true`.
 
 ### URL allowlist and process hygiene
 
 The inner URL must be `https://`, `http://`, `ssh://`, `file:///abs`, scp-form
 `user@host:path` or an absolute local path. Refused: `git://`, relative paths,
-a leading `-`, control characters, `::` (git transport helpers), and a
-password in the URL (use git's credential helper; sc never stores one). `sc+git:`
-with a single colon, or any near miss, is a reserved prefix and is refused
-unless it is exactly `sc+git::<inner>`, so it never falls through to a local path
-or to the mirror bridge. `--git` is an error on an `sc+git::` URL.
+a leading `-`, control characters, `::` (git transport helpers), any userinfo at
+all on an `http(s)://` URL (credentials go through git's credential helper; a
+token used as the username would otherwise be stored in `.sc/config` and echoed),
+a password in an `ssh://` URL, an `ssh://` or scp-form user starting with `-`,
+and an `ssh://` host outside the scp-form host charset. `sc+git:` in any letter
+case with a single colon, or any near miss, is a reserved prefix and is refused
+unless it is exactly lowercase `sc+git::<inner>`, so it never falls through to a
+local path or to the mirror bridge. `--git` is an error on an `sc+git::` URL.
+sc's own messages show a remote URL only with its userinfo redacted.
 
 Every git call runs with `-c protocol.allow=never` plus `always` for `file`,
-`ssh`, `http` and `https`; `--end-of-options` before the URL; stdin closed;
+`ssh`, `http` and `https`, and `protocol.ext.allow=never`, `protocol.fd.allow=never`
+and `protocol.git.allow=never` so a user config cannot re-enable them; `--end-of-options` before the URL; stdin closed;
 `GIT_TERMINAL_PROMPT=0` and `LC_ALL=C`; hooks off (`core.hooksPath=/dev/null`),
 `gc.auto=0`, `maintenance.auto=false`, signing off, `core.useReplaceRefs=false`,
 and `http.lowSpeedLimit`/`lowSpeedTime` so a stalled host cannot hang a push.
@@ -133,7 +149,8 @@ compared by exact full ref name.
 
 ### Caps against a hostile host
 
-2 GiB per value, 32 MiB per chunk, 10,000 chunks per value, 64 MiB of captured
+2 GiB per `.pack` value and 256 MiB for every other value (checked before
+reading), 32 MiB per chunk, 10,000 chunks per value, 64 MiB of captured
 `ls-remote` output, 1 MiB for other captured output. The WAL's own caps on
 manifest, log, checkpoint and idx reads (256 MiB) and the pack record bounds
 apply on top.
@@ -141,9 +158,11 @@ apply on top.
 ### Private-branch opt-in
 
 Pushing a private branch to an `sc+git::` remote needs a per-remote setting,
-`allow_private_branches`, set by `sc remote add <name> sc+git::... --allow-private-branches`
-or `sc clone sc+git::... <dst> --allow-private-branches` (which sets it on the
-new `origin`). Without it, `sc push` refuses before any upload and names the
+`allow_private_branches`, set by `sc remote add <name> sc+git::... --allow-private-branches`,
+`sc clone sc+git::... <dst> --allow-private-branches` (which sets it on the
+new `origin`), or `sc remote set <name> --allow-private-branches` for an existing
+remote (`--no-allow-private-branches` clears it). The push reads the branch and
+its tip once, gates on that tip and pushes exactly it. Without the setting, `sc push` refuses before any upload and names the
 flag. The gate lives in `repo` (the push path), not only the CLI. Protected paths
 and secrets need no extra opt-in: choosing the scheme is the opt-in. `remote
 add` and `clone` print one notice that public content and sealed metadata are
@@ -217,6 +236,7 @@ every transport path.
 - A killed process (SIGKILL, or SIGINT, which skips `Drop`) can leave
   `sc-git-bucket-<pid>-<random>` behind in the temp directory. It holds fetched
   store objects. There is no reaper. A normal exit and an error returned to `main` remove it.
+- v1 scaling limit: every `ls-remote` and push downloads the whole ref advertisement (the pattern given to `ls-remote` filters on the client; a packet trace showed the server sends every ref, protocol v2 `ref-prefix` or not), and a cold read fetches every `log/` and `checkpoints/` entry. With compaction refused, refs grow by at least three per push (a log entry, a pack and its idx), so a long-lived store gets slower to open until compaction or a ref-filtering host exists.
 - Each cold read or push costs git round trips. The freshness window and family
   batching bound them, but a Git host is slower than S3. If push over `sc+git::`
   stays slow on large histories, the next step is a batched `has_objects`.

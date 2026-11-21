@@ -414,7 +414,8 @@ cargo run --bin sc -- remote add <name> sc+git::<git-url> [--allow-private-branc
                                               # (git@host:o/r.git) or an absolute path. `sc+git:`
                                               # is a reserved prefix (only `sc+git::<url>` parses),
                                               # `--git` is an error on it, no password in the URL
-                                              # (use git's credential helper / ssh agent), SC_GIT
+                                              # (use git's credential helper / ssh agent; any
+                                              # userinfo on an http(s) URL is refused), SC_GIT
                                               # overrides the git binary. `clone sc+git::<url> <dst>
                                               # [--allow-private-branches]` takes the same URL and
                                               # sets the opt-in on `origin`. Pushing a PRIVATE
@@ -422,6 +423,9 @@ cargo run --bin sc -- remote add <name> sc+git::<git-url> [--allow-private-branc
                                               # recipient ids and sizes become readable by everyone
                                               # who can read the repo, ciphertext stays after a
                                               # revoke); it refuses before any upload without it.
+                                              # `sc remote set <name> --allow-private-branches`
+                                              # (or --no-allow-private-branches) changes an
+                                              # existing remote.
                                               # Protected paths and secrets need no opt-in. A plain
                                               # `git clone` of the repo never fetches refs/sc/*;
                                               # `git ls-remote` lists them; the same repo can also

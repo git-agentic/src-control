@@ -1028,7 +1028,12 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
   rulesets, hosts that refuse unknown ref namespaces), untested so far; (5)
   batched deletes (one `git push` for many `:refs/sc/K`) and a batched
   `has_objects`, since a Git host costs a round trip per probe or delete; (6)
-  `list_meta` downloads every listed value to read its size.
+  `list_meta` downloads every listed value to read its size; (7) scaling: every
+  `ls-remote` and push downloads the whole ref advertisement (the host does not
+  filter it by prefix server-side, a packet trace showed the full list) and a
+  cold read fetches every `log/` and `checkpoints/` entry, and with compaction
+  refused (1) refs grow by at least three per push, so a long-lived store slows
+  down until compaction or a ref-filtering host exists.
 - **Serve-side persistent pack cache (P36c follow-on).** A bucket-backed
   serve instance re-downloads packs per connection; a content-addressed
   on-disk cache in the serve home would make warm instances cheap without

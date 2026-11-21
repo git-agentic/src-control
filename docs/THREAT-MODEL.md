@@ -744,14 +744,18 @@ The bucket model above applies unchanged, with the Git repository as the bucket 
   is rotation (`sc rewrap --rotate`), as everywhere.
 - **Transport allowlist and process hygiene.** The inner URL is `https://`, `http://`, `ssh://`,
   `file:///abs`, scp-form or an absolute path. `git://`, relative paths, `::` transport helpers,
-  a leading `-`, control characters and a password in the URL are refused, and every git call
-  carries `-c protocol.allow=never` plus `always` for `file`, `ssh`, `http` and `https`, so a
-  hostile URL or redirect cannot reach `ext::` or `fd::`. The environment is scrubbed of
+  a leading `-`, control characters, a password in the URL and any userinfo on an `http(s)://`
+  URL (credentials belong to git's credential helper, not to a URL stored in `.sc/config`) are
+  refused, as are an `ssh://` or scp-form user starting with `-` and an unusual `ssh://` host.
+  Every git call carries `-c protocol.allow=never` plus `always` for `file`, `ssh`, `http` and
+  `https`, and `protocol.ext|fd|git.allow=never`, so a hostile URL or redirect, or a user config,
+  cannot reach `ext::`, `fd::` or `git://`; fetches run with `fetch.fsckObjects=true`. The environment is scrubbed of
   `GIT_DIR`-family and config-injection variables, hooks and signing are off, stdin is closed and
   prompts are disabled. `http` stays allowed because plaintext is the user's choice, as in git.
   Errors carry git's captured stderr with URL userinfo redacted and control bytes escaped, so a
   hostile hook message cannot drive the terminal.
-- **A hostile host is bounded.** A value is capped at 2 GiB and a chunk at 32 MiB, a tree at 10,000
+- **A hostile host is bounded.** A pack value is capped at 2 GiB, any other value at 256 MiB
+  (checked before reading), and a chunk at 32 MiB, a tree at 10,000
   chunks, captured `ls-remote` output at 64 MiB; fetches are shallow so a hostile commit's parents
   are never downloaded; a fetched value must be a parentless commit over contiguous regular chunk
   blobs or it is refused as corrupt. The WAL's own 256 MiB metadata cap and pack bounds still
@@ -764,6 +768,7 @@ The bucket model above applies unchanged, with the Git repository as the bucket 
 - **Not built in v1.** `sc remote compact` is refused (committer time is writer-controlled, so it
   cannot be an age source) and so is `sc serve --store sc+git::` (a daemon cannot answer prompts
   and would bypass the client-side private-branch opt-in).
+- **Scaling.** Every `ls-remote` and push downloads the whole ref advertisement (the pattern given to `ls-remote` filters on the client; a packet trace showed the server sends every ref, protocol v2 `ref-prefix` or not), and a cold read fetches every `log/` and `checkpoints/` entry. With compaction refused, refs grow by at least three per push (a log entry, a pack and its idx), so a long-lived store gets slower to open until compaction or a ref-filtering host exists.
 - **Local cache.** A temporary bare repository `sc-git-bucket-<pid>-<random>` (mode 0700) holds
   fetched store objects and is removed on exit; a killed process (SIGKILL, or SIGINT) can leave it
   behind, and there is no reaper.

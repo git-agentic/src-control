@@ -1364,16 +1364,22 @@ a plain Git mirror of the public branches.
 create-only), never a `+` refspec, so `receive-pack` checks the sent old value under
 its ref lock and exactly one racer wins. A rejected push is classified by re-reading
 the exact ref, so a hook refusal is an error and never a lost race. Reads keep a 2 s
-freshness window for a tag the instance itself saw or wrote, serve create-only values
-from the local cache, and fetch the `log/`, `checkpoints/` and `packs/*.idx` families
+freshness window for a tag the instance itself saw or wrote (dropped when a write of
+that key does not land), serve create-only values (decided by key layout: `log/`,
+`checkpoints/`, `packs/*.pack|idx`) from the local cache, and fetch the `log/`, `checkpoints/` and `packs/*.idx` families
 in one shallow `git fetch`, which bounds a cold clone's round trips independent of log
 length. Git is the system binary (`SC_GIT` overrides) with a scrubbed environment, a
-transport allowlist (`https`, `http`, `ssh`, `file`), a URL allowlist and no password
-in the URL; a private bare repo in `sc-git-bucket-<pid>-<random>` caches fetched
-objects and is removed on `Drop`.
+transport allowlist (`https`, `http`, `ssh`, `file`; `ext`, `fd` and `git` forced off), a
+URL allowlist and no userinfo on `http(s)` URLs (credentials go through git's credential
+helper); a private bare repo in `sc-git-bucket-<pid>-<random>` caches fetched
+objects and is removed on `Drop`. v1 scaling limit: every `ls-remote` and push downloads the
+whole ref advertisement (the host does not filter it server-side), and a cold read fetches
+every `log/` and `checkpoints/` entry; with compaction refused, refs grow by at least three
+per push.
 
 A private branch goes to an `sc+git::` remote only under the per-remote opt-in
-`--allow-private-branches`, since its name, recipient ids and sizes become readable by
+`--allow-private-branches` (`sc remote set <name> --allow-private-branches` for an existing
+remote), since its name, recipient ids and sizes become readable by
 every reader of the repository and the ciphertext cannot be taken back. `sc remote
 compact` (no trustworthy age for a stored pack) and `sc serve --store` (a daemon cannot
 answer prompts, and it would bypass the opt-in) refuse an `sc+git::` store in v1.
