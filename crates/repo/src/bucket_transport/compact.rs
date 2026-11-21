@@ -134,6 +134,9 @@ impl BucketTransport {
     /// Safe to run while others push and fetch; run one at a time (concurrent
     /// runs stay correct but waste work). Needs bucket list and delete rights.
     pub fn compact(&self, opts: &CompactOptions) -> Result<CompactReport> {
+        if self.git_carrier {
+            return Err(super::git_compact_refusal());
+        }
         let mut rep = CompactReport {
             dry_run: opts.dry_run,
             ..CompactReport::default()

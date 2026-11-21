@@ -296,8 +296,8 @@ enum Cmd {
         #[command(subcommand)]
         op: WsOp,
     },
-    /// Clone a repo (local path, `ssh://`, `sc+http(s)://`, `sc+wal://`/`sc+s3://`
-    /// or Git URL) into a new directory.
+    /// Clone a repo (local path, `ssh://`, `sc+http(s)://`, `sc+wal://`/`sc+s3://`,
+    /// `sc+git::<git-url>` or Git URL) into a new directory.
     Clone {
         src: String,
         dst: PathBuf,
@@ -332,6 +332,12 @@ enum Cmd {
         /// Does nothing for git remotes, which carry no transcripts.
         #[arg(long)]
         no_transcripts: bool,
+        /// Let `origin` receive private branches (`sc+git::` only): pushing one
+        /// makes its name, recipient ids and sizes readable by everyone who
+        /// can read the Git repository, and the ciphertext stays there after
+        /// any later revoke.
+        #[arg(long)]
+        allow_private_branches: bool,
     },
     /// Serve a repo to a remote `sc` client, either over stdin/stdout
     /// (invoked by `ssh` for ssh:// remotes) or over TCP (`sc+http://`
@@ -407,8 +413,8 @@ enum Cmd {
         /// --tls-cert (enforced in run_serve, not by clap).
         #[arg(long)]
         tls_key: Option<PathBuf>,
-        /// Serve a bucket WAL remote (`sc+wal://…` or `sc+s3://…`) instead of
-        /// this repo's own object store (P36c). `<path>` remains the serve
+        /// Serve a bucket WAL remote (`sc+wal://…` or `sc+s3://…`; `sc+git::`
+        /// is not supported yet) instead of this repo's own object store (P36c). `<path>` remains the serve
         /// home: its `.sc/` still provides access tokens, the TLS identity,
         /// and scratch space — but all served content lives in the bucket,
         /// making this instance disposable.
@@ -886,12 +892,30 @@ enum RemoteOp {
         name: String,
         url: String,
         /// Treat the remote URL as a Git repository (translated via gitio).
+        /// Not for `sc+git::` URLs, which carry a native sc store.
         #[arg(long)]
         git: bool,
+        /// Let this remote receive private branches (`sc+git::` only): pushing
+        /// one makes its name, recipient ids and sizes readable by everyone
+        /// who can read the Git repository, and the ciphertext stays there
+        /// after any later revoke.
+        #[arg(long)]
+        allow_private_branches: bool,
+    },
+    /// Change a setting of an existing remote.
+    Set {
+        name: String,
+        /// Let this remote receive private branches (`sc+git::` only); see
+        /// `sc remote add --allow-private-branches` for what that exposes.
+        #[arg(long, conflicts_with = "no_allow_private_branches")]
+        allow_private_branches: bool,
+        /// Stop this remote receiving private branches again.
+        #[arg(long)]
+        no_allow_private_branches: bool,
     },
     /// List configured remotes.
     List,
-    /// Compact a bucket remote (`sc+wal://`, `sc+s3://`): merge small packs,
+    /// Compact a bucket remote (`sc+wal://`, `sc+s3://`; not `sc+git::` yet): merge small packs,
     /// then delete log entries, checkpoints and packs no reader or writer can
     /// still need (ADR-0057). Needs bucket list and delete rights.
     Compact {
@@ -1224,7 +1248,16 @@ fn real_main() -> Result<()> {
             filter,
             lazy,
             no_transcripts,
-        } => run_clone(src, dst, git, filter, lazy, no_transcripts),
+            allow_private_branches,
+        } => run_clone(
+            src,
+            dst,
+            git,
+            filter,
+            lazy,
+            no_transcripts,
+            allow_private_branches,
+        ),
         Cmd::Cat { target } => run_cat(&target),
         Cmd::Serve {
             sub,
@@ -4012,13 +4045,19 @@ fn resolve_ids_to_pubkeys(
 /// so persist the absolute path. URLs (`ssh://`, `sc+http://`, ...) and paths
 /// that do not resolve are returned unchanged.
 fn absolute_local_source(src: String) -> String {
-    if src.contains("://") {
+    // Bucket URLs, including `sc+git::` (scp-form carriers have no `://`) and
+    // its near misses, are never paths.
+    if src.contains("://") || scl_repo::is_bucket_url(&src) {
         return src;
     }
     std::fs::canonicalize(&src)
         .map(|p| p.display().to_string())
         .unwrap_or(src)
 }
+
+/// Printed once by `remote add` and `clone` for an `sc+git::` remote.
+const GIT_BUCKET_NOTICE: &str = "note: sc+git:: stores public content and sealed metadata \
+(branch names, recipient ids, sizes) where everyone who can read the Git repository can read them";
 
 fn run_clone(
     src: String,
@@ -4027,12 +4066,27 @@ fn run_clone(
     filter: Vec<String>,
     lazy: bool,
     no_transcripts: bool,
+    allow_private_branches: bool,
 ) -> Result<()> {
+    // `sc+git::` carries a native sc store inside a Git repository: it is a
+    // bucket remote, never the P18 mirror bridge, whatever its inner URL looks
+    // like.
+    let git_bucket = scl_repo::is_git_bucket_url(&src);
+    if git_bucket && git {
+        anyhow::bail!(
+            "--git cannot be used with {}: sc+git:: carries a native sc store, not a Git history",
+            scl_repo::redact(&src)
+        );
+    }
+    if allow_private_branches && !git_bucket {
+        anyhow::bail!("--allow-private-branches applies only to sc+git:: URLs");
+    }
     // Auto-detect unambiguous git URL forms (https/http, scp-style, file://):
     // those can never be sc-native, so no flag is needed. Bare `ssh://` is
     // ambiguous — it means an sc-native remote (ADR-0022) unless `--git`
     // forces the mirror-bridge path (ADR-0028; user-adjudicated).
-    let git_shaped = scl_gitio::bridge::is_network_git_url(&src) && !src.starts_with("ssh://");
+    let git_shaped =
+        !git_bucket && scl_gitio::bridge::is_network_git_url(&src) && !src.starts_with("ssh://");
     if git || git_shaped {
         if !filter.is_empty() {
             anyhow::bail!("partial clone is not supported over git remotes");
@@ -4045,6 +4099,12 @@ fn run_clone(
         scl_repo::Repo::clone_url_limited(&src, &dst, &prefixes, blob_limit, no_transcripts)?;
     if lazy {
         scl_repo::promisor::set_lazy(repo.layout(), true)?;
+    }
+    if allow_private_branches {
+        repo.remote_allow_private_branches("origin")?;
+    }
+    if git_bucket {
+        eprintln!("{GIT_BUCKET_NOTICE}");
     }
     let n = repo.branches()?.len();
     if let Some(promisor) = repo.promisor()? {
@@ -4207,6 +4267,7 @@ fn run_serve(
     };
     scl_repo::wire::validate_max_conn_bytes(conn_bytes, max_pack, scl_core::max_object_size())?;
     if let Some(url) = &store {
+        scl_repo::refuse_git_store(url)?;
         scl_repo::BucketUrl::parse(url)?; // fail fast on malformed URLs, before any bind
     }
     match (stdio, http) {
@@ -4419,7 +4480,22 @@ fn git_remote_effective_path(
 fn run_remote(op: RemoteOp) -> Result<()> {
     let repo = open_repo()?;
     match op {
-        RemoteOp::Add { name, url, git } => {
+        RemoteOp::Add {
+            name,
+            url,
+            git,
+            allow_private_branches,
+        } => {
+            let git_bucket = scl_repo::is_git_bucket_url(&url);
+            if git_bucket && git {
+                anyhow::bail!(
+                    "--git cannot be used with {}: sc+git:: carries a native sc store, not a Git history",
+                    scl_repo::redact(&url)
+                );
+            }
+            if allow_private_branches && !git_bucket {
+                anyhow::bail!("--allow-private-branches applies only to sc+git:: URLs");
+            }
             if git {
                 if !scl_gitio::bridge::is_network_git_url(&url)
                     && !std::path::Path::new(&url).join("HEAD").exists()
@@ -4442,12 +4518,52 @@ fn run_remote(op: RemoteOp) -> Result<()> {
                 if url.starts_with("sc+http:") || url.starts_with("sc+https:") {
                     scl_repo::ScHttpUrl::parse(&url)?; // fail fast on malformed URLs
                 }
-                if url.starts_with("sc+wal://") || url.starts_with("sc+s3://") {
+                if scl_repo::is_bucket_url(&url) {
                     scl_repo::BucketUrl::parse(&url)?; // fail fast on malformed URLs
                 }
-                repo.remote_add(&name, &url)?;
-                println!("added remote {name} -> {url}");
+                repo.remote_add_opts(&name, &url, allow_private_branches)?;
+                // A bucket URL can carry userinfo; never echo it back.
+                let shown = if git_bucket {
+                    scl_repo::redact(&url)
+                } else {
+                    url.clone()
+                };
+                println!("added remote {name} -> {shown}");
+                if git_bucket {
+                    eprintln!("{GIT_BUCKET_NOTICE}");
+                }
             }
+        }
+        RemoteOp::Set {
+            name,
+            allow_private_branches,
+            no_allow_private_branches,
+        } => {
+            if !allow_private_branches && !no_allow_private_branches {
+                anyhow::bail!(
+                    "nothing to set: pass --allow-private-branches or --no-allow-private-branches"
+                );
+            }
+            if allow_private_branches {
+                let url = repo
+                    .remotes()?
+                    .into_iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, u)| u)
+                    .ok_or_else(|| anyhow::anyhow!("no such remote: {name}"))?;
+                if !scl_repo::is_git_bucket_url(&url) {
+                    anyhow::bail!("--allow-private-branches applies only to sc+git:: URLs");
+                }
+            }
+            repo.remote_set_allow_private_branches(&name, allow_private_branches)?;
+            println!(
+                "remote {name}: private branches {}",
+                if allow_private_branches {
+                    "allowed"
+                } else {
+                    "not allowed"
+                }
+            );
         }
         RemoteOp::Compact {
             name,
@@ -4468,7 +4584,8 @@ fn run_remote(op: RemoteOp) -> Result<()> {
                 .find(|(n, _)| *n == name)
                 .map(|(_, u)| u)
                 .ok_or_else(|| anyhow::anyhow!("no such remote: {name}"))?;
-            if !(url.starts_with("sc+wal://") || url.starts_with("sc+s3://")) {
+            scl_repo::refuse_git_compact(&url)?;
+            if !scl_repo::is_bucket_url(&url) {
                 anyhow::bail!("remote '{name}' is not a bucket remote ({url}); nothing to compact");
             }
             let transport = scl_repo::BucketTransport::open(&url)?;
@@ -5480,6 +5597,7 @@ mod tests {
             Vec::new(),
             false,
             false,
+            false,
         )
         .unwrap();
         let repo = scl_repo::Repo::open(&dst).unwrap();
@@ -5502,7 +5620,14 @@ mod tests {
         // once the user cd's into it, so the recorded origin must be absolute.
         let abs = absolute_local_source(".".to_string());
         assert!(std::path::Path::new(&abs).is_absolute(), "got {abs}");
-        for url in ["ssh://host/srv/repo", "sc+http://127.0.0.1:1/x"] {
+        // `sc+git::` carriers (scp-form has no `://`) and near misses are never paths.
+        for url in [
+            "ssh://host/srv/repo",
+            "sc+http://127.0.0.1:1/x",
+            "sc+git::git@h:o/r.git",
+            "sc+git::/abs/hub.git",
+            "sc+git:/x",
+        ] {
             assert_eq!(absolute_local_source(url.to_string()), url);
         }
         assert_eq!(
@@ -5529,6 +5654,7 @@ mod tests {
             root.join("cloned-ssh"),
             false,
             Vec::new(),
+            false,
             false,
             false,
         )

@@ -343,17 +343,22 @@ mod tests {
                 l(A, "refs/replace/x"),
                 l(Z, "refs/heads/MAIN"),
                 l(A, "refs/pull/1/head"),
+                l(A, "refs/sc/manifest"),
+                l(Z, "refs/sc/log/00000000000000000001"),
+                l(A, "refs/scx/x"),
             ],
             "main",
             true,
             &Rules::default(),
             &ff(true),
         );
-        assert_eq!(out.len(), 3, "{out:?}");
+        assert_eq!(out.len(), 4, "{out:?}");
         assert!(
             out[0].contains("refs/replace/x")
                 && out[1].contains("default branch")
                 && out[2].contains("refs/pull/1/head")
+                && out[3].contains("refs/scx/x"),
+            "refs/sc/* is accepted, refs/scx/x is not: {out:?}"
         );
     }
 

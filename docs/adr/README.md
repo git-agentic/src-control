@@ -30,7 +30,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0016](0016-git-export.md) | Git export for round-trip interop | Accepted | 9 |
 | [0018](0018-git-as-a-remote.md) | Git as a remote (bidirectional sync) | Accepted | 10 |
 | [0019](0019-secret-lifecycle.md) | Secret/permission lifecycle (rotation + escrow) | Accepted; per-path rotation added by 0051 | 11 |
-| [0020](0020-six-crate-workspace.md) | Six-crate workspace with a strict dependency direction | Accepted; crate set extended by 0042, 0045, 0046 | foundation |
+| [0020](0020-six-crate-workspace.md) | Six-crate workspace with a strict dependency direction | Accepted; crate set extended by 0042, 0045, 0046; `objio` may spawn the system `git` (0060) | foundation |
 | [0021](0021-durability-and-concurrency-hardening.md) | Durability and concurrency hardening for `.sc/` | Accepted | hardening |
 | [0022](0022-ssh-native-transport.md) | sc-native network transport over SSH (trait-mirror wire protocol) | Accepted | 12 |
 | [0023](0023-agent-workspaces.md) | Agent workspaces — vfs-backed sessions over the persistent store | Accepted | 13 |
@@ -54,9 +54,9 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0041](0041-listener-resource-limits.md) | Listener resource limits (connection cap, session timeout, spool cap, accept backoff) | Accepted | 31 |
 | [0042](0042-in-binary-tls-sc-https.md) | In-binary TLS — `sc+https://` via rustls | Accepted; CA validation 0054, pin management 0053 | 32 |
 | [0043](0043-randomized-protected-encryption.md) | Randomized protected-path encryption (dual-read, randomized-write) | Accepted; rotate-for-paths built as 0051 | 33 |
-| [0044](0044-per-branch-access-control.md) | Per-branch access control with opaque private branches | Accepted; sparse merge-in section (#240) | 34 |
+| [0044](0044-per-branch-access-control.md) | Per-branch access control with opaque private branches | Accepted; sparse merge-in section (#240); reason 4 against opaque refs through Git reversed under an opt-in by 0060 | 34 |
 | [0045](0045-native-desktop-read-model.md) | Native desktop adapter and keyless read model | Accepted | 35 |
-| [0046](0046-wal-bucket-remotes.md) | Bucket remotes via an immutable-pack WAL + one CAS'd manifest | Accepted; compaction built as 0057 | 36 |
+| [0046](0046-wal-bucket-remotes.md) | Bucket remotes via an immutable-pack WAL + one CAS'd manifest | Accepted; compaction built as 0057; Git-carried store as 0060 | 36 |
 | [0047](0047-want-by-id-fetch-and-gap-fill.md) | Want-by-id fetch and explicit gap fill for partial clones | Accepted (built) | 37 |
 | [0048](0048-presence-based-partial-clones.md) | Presence-based walks for partial clones | Accepted (built); 0055 adds a second kind of gap | 37b |
 | [0049](0049-merge-on-partial-clones.md) | Merge on partial clones | Accepted (built) | 37c |
@@ -70,6 +70,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0057](0057-bucket-compaction.md) | Bucket remote compaction and gc (`sc remote compact`) | Accepted | 36 |
 | [0058](0058-sc-forge-gitea-compatible-git-forge.md) | sc-forge: a Gitea-compatible Git forge (bare Git, recorded API subset) | Proposed | 38 |
 | [0059](0059-locally-accepted-recipients.md) | Locally accepted recipients: a seal wraps only to keys this clone accepted (`sc policy`) | Accepted | hardening |
+| [0060](0060-git-carried-bucket-remotes.md) | Git-carried bucket remotes (`sc+git::<git-url>`): the bucket WAL stored as `refs/sc/*` in any Git repository | Accepted | 39 |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are
 assigned in creation order, so 0017 — the secret scanner — sequences as phase P5,

@@ -501,8 +501,10 @@ pub(crate) fn ssh_command(url: &SshUrl) -> Command {
 
 /// Open the right [`Transport`] for a remote URL: `ssh://` spawns the wire
 /// client over a child process's stdio, `sc+http://`/`sc+https://` dial it
-/// directly over TCP (TLS-wrapped for the latter, P32); anything else is a
-/// local `.sc/` path.
+/// directly over TCP (TLS-wrapped for the latter, P32), `sc+wal://`,
+/// `sc+s3://` and `sc+git::` open a bucket remote (a malformed `sc+git:` near
+/// miss is refused there, never read as a path); anything else is a local
+/// `.sc/` path.
 pub fn open_transport(url: &str) -> Result<Box<dyn Transport>> {
     if url.starts_with("ssh://") {
         let parsed = SshUrl::parse(url)?;
@@ -512,7 +514,7 @@ pub fn open_transport(url: &str) -> Result<Box<dyn Transport>> {
         Ok(Box::new(crate::http_transport::HttpTransport::connect(
             &parsed,
         )?))
-    } else if url.starts_with("sc+wal://") || url.starts_with("sc+s3://") {
+    } else if crate::bucket_transport::is_bucket_url(url) {
         Ok(Box::new(crate::bucket_transport::BucketTransport::open(
             url,
         )?))

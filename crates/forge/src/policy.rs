@@ -19,8 +19,12 @@ pub fn same_branch_name(a: &str, b: &str) -> bool {
 }
 
 /// May a client push `name` (`old` -> `new`) to a repository whose default branch is
-/// `default_branch`? Only `refs/heads/*` and `refs/tags/*` are writable; `refs/replace/*`,
-/// `refs/forge/*`, `refs/pull/*`, `refs/notes/*` and anything else is refused. The default branch
+/// `default_branch`? Only `refs/heads/*`, `refs/tags/*` and `refs/sc/*` are writable;
+/// `refs/replace/*`, `refs/forge/*`, `refs/pull/*`, `refs/notes/*` and anything else is refused.
+/// `refs/sc/*` (the trailing slash matters: `refs/sc` and `refs/scx/x` are refused) holds a native
+/// sc bucket store (`sc+git::` remotes): every repository writer may create, update (including
+/// non-fast-forward, the client uses `--force-with-lease`) and delete it, branch protection does
+/// not apply, and it never touches the default branch. The default branch
 /// cannot be deleted, compared case-insensitively (on a case-insensitive filesystem `MAIN` aliases
 /// the loose ref `main`).
 pub fn check_update(name: &str, new: &str, default_branch: &str) -> Result<(), Refusal> {
@@ -30,11 +34,11 @@ pub fn check_update(name: &str, new: &str, default_branch: &str) -> Result<(), R
         }
         return Ok(());
     }
-    if name.starts_with("refs/tags/") {
+    if name.starts_with("refs/tags/") || name.starts_with("refs/sc/") {
         return Ok(());
     }
     Err(format!(
-        "refusing to update {name}: only refs/heads/* and refs/tags/* are writable"
+        "refusing to update {name}: only refs/heads/*, refs/tags/* and refs/sc/* are writable"
     ))
 }
 
@@ -143,6 +147,19 @@ mod tests {
     }
 
     #[test]
+    fn refs_sc_is_writable_for_create_update_and_delete() {
+        for r in [
+            "refs/sc/manifest",
+            "refs/sc/log/00000000000000000001",
+            "refs/sc/packs/ab12.pack",
+        ] {
+            for new in [A, Z] {
+                assert!(check_update(r, new, "main").is_ok(), "{r} -> {new}");
+            }
+        }
+    }
+
+    #[test]
     fn every_other_namespace_is_refused_with_the_recorded_text() {
         for r in [
             "refs/replace/1111111111111111111111111111111111111111",
@@ -156,13 +173,18 @@ mod tests {
             "refs/heads",
             "refs/headsx/main",
             "refs/tag/v1",
+            "refs/sc",
+            "refs/scx/x",
+            "refs/sc2/manifest",
             "FETCH_HEAD",
             "",
         ] {
             let e = check_update(r, A, "main").unwrap_err();
             assert_eq!(
                 e,
-                format!("refusing to update {r}: only refs/heads/* and refs/tags/* are writable"),
+                format!(
+                    "refusing to update {r}: only refs/heads/*, refs/tags/* and refs/sc/* are writable"
+                ),
                 "{r:?}"
             );
         }

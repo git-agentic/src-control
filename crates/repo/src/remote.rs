@@ -27,6 +27,13 @@ pub struct RemoteEntry {
     pub url: String,
     #[serde(default)]
     pub kind: RemoteKind,
+    /// Opt-in to pushing private branches to an `sc+git::` remote (the branch
+    /// name, recipient ids and sizes become readable by every reader of the
+    /// Git repository). Absent in configs written before it existed, which
+    /// parse as `false`; omitted on write while `false`, so those configs
+    /// stay byte-identical.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_private_branches: bool,
 }
 
 impl RemoteConfig {
@@ -58,6 +65,7 @@ impl RemoteConfig {
             RemoteEntry {
                 url: url.to_string(),
                 kind: RemoteKind::default(),
+                allow_private_branches: false,
             },
         );
         Ok(())
@@ -73,6 +81,7 @@ impl RemoteConfig {
             RemoteEntry {
                 url: url.to_string(),
                 kind,
+                allow_private_branches: false,
             },
         );
         Ok(())
@@ -86,6 +95,23 @@ impl RemoteConfig {
     /// The kind configured for `name`, or None if there is no such remote.
     pub fn kind(&self, name: &str) -> Option<RemoteKind> {
         self.remote.get(name).map(|r| r.kind)
+    }
+
+    /// Whether `name` may receive private branches (`false` when unset or
+    /// when there is no such remote).
+    pub fn allow_private_branches(&self, name: &str) -> bool {
+        self.remote
+            .get(name)
+            .is_some_and(|r| r.allow_private_branches)
+    }
+
+    /// Record the private-branch opt-in for an existing remote.
+    pub fn set_allow_private_branches(&mut self, name: &str, allow: bool) -> Result<()> {
+        self.remote
+            .get_mut(name)
+            .ok_or_else(|| Error::NoSuchRemote(name.to_string()))?
+            .allow_private_branches = allow;
+        Ok(())
     }
 
     /// The configured remote names, sorted (the backing map is ordered).
@@ -119,6 +145,26 @@ mod tests {
         assert_eq!(loaded.kind("origin"), Some(RemoteKind::Sc));
         assert_eq!(loaded.kind("hub"), Some(RemoteKind::Git));
         assert_eq!(loaded.kind("missing"), None);
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn allow_private_branches_roundtrips_and_old_configs_parse_false() {
+        let layout = tmp_layout("allowpriv");
+        // A config from before the field existed.
+        std::fs::write(layout.config_path(), "[remote.origin]\nurl = \"/path/a\"\n").unwrap();
+        let mut cfg = RemoteConfig::load(&layout).unwrap();
+        assert!(!cfg.allow_private_branches("origin"));
+        assert!(!cfg.allow_private_branches("missing"));
+        // Not written while false: an old binary and a diff see no change.
+        cfg.save(&layout).unwrap();
+        let text = std::fs::read_to_string(layout.config_path()).unwrap();
+        assert!(!text.contains("allow_private_branches"), "{text}");
+        cfg.set_allow_private_branches("origin", true).unwrap();
+        assert!(cfg.set_allow_private_branches("missing", true).is_err());
+        cfg.save(&layout).unwrap();
+        let loaded = RemoteConfig::load(&layout).unwrap();
+        assert!(loaded.allow_private_branches("origin"));
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
 

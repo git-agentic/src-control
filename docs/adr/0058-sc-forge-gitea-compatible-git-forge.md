@@ -168,3 +168,24 @@ Acceptance does not approve a production migration. The local fixture used
 the consumer's Redis-free middleware mode, so production rate limiting was
 not qualified. SSH, Actions and the other v1 exclusions above remain excluded;
 implementation follow-ons remain tracked in #316.
+
+## Addendum: `refs/sc/*` carries a native sc bucket store
+
+The `pre-receive` policy accepts exactly the `refs/sc/` prefix (trailing slash; `refs/sc`
+and `refs/scx/x` stay refused) for create, update and delete, in addition to `refs/heads/*`
+and `refs/tags/*`. A `sc+git::` remote stores each bucket key as a parentless commit at
+`refs/sc/<key>`, so a repository hosted here can hold an sc store. Updates may be
+non-fast-forward: the client compare-and-swaps with `--force-with-lease`, and git checks the
+old value under the ref lock.
+
+- Every repository writer may write `refs/sc/*`. There is no per-repository opt-in; a writer
+  can already push arbitrary content to any branch, so this adds no new kind of access.
+- Branch protection does not cover it.
+- `refs/sc/*` is advertised to every reader. A plain `git clone` or `git fetch` does not fetch it
+  by default; a reader who asks for the exact refspec gets it.
+- A deleted or replaced value stays fetchable by object id until the gc prune stage removes it
+  (`--gc-prune-expire`).
+- `receive.maxInputSize` (`--max-pack-size`, default 2 GiB) bounds one pushed value.
+
+Tests: `policy::tests`, `hook::tests`, and in `crates/forge/tests/e2e_git.rs` the
+`refs_sc_*`, `racing_refs_sc_*` and `maintenance_keeps_the_live_refs_sc_values` cases.

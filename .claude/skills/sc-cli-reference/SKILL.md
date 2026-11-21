@@ -407,6 +407,34 @@ cargo run --bin sc -- remote add <name> sc+s3://<bucket>/<prefix>   # same, on a
                                               # content stays ciphertext); `clone --filter` is
                                               # refused; signatures, transcripts and drop
                                               # tombstones travel like on any native remote (#229)
+cargo run --bin sc -- remote add <name> sc+git::<git-url> [--allow-private-branches]
+                                              # bucket remote stored INSIDE a Git repository as
+                                              # refs/sc/* (P39, ADR-0060); <git-url> is https://,
+                                              # http://, ssh://, file:///abs, scp-form
+                                              # (git@host:o/r.git) or an absolute path. `sc+git:`
+                                              # is a reserved prefix (only `sc+git::<url>` parses),
+                                              # `--git` is an error on it, no password in the URL
+                                              # (use git's credential helper / ssh agent; any
+                                              # userinfo on an http(s) URL is refused), SC_GIT
+                                              # overrides the git binary. `clone sc+git::<url> <dst>
+                                              # [--allow-private-branches]` takes the same URL and
+                                              # sets the opt-in on `origin`. Pushing a PRIVATE
+                                              # branch needs --allow-private-branches (its name,
+                                              # recipient ids and sizes become readable by everyone
+                                              # who can read the repo, ciphertext stays after a
+                                              # revoke); it refuses before any upload without it.
+                                              # `sc remote set <name> --allow-private-branches`
+                                              # (or --no-allow-private-branches) changes an
+                                              # existing remote.
+                                              # Protected paths and secrets need no opt-in. A plain
+                                              # `git clone` of the repo never fetches refs/sc/*;
+                                              # `git ls-remote` lists them; the same repo can also
+                                              # hold a `--git` mirror of public branches. Anyone
+                                              # with push to the repo holds bucket put + delete;
+                                              # deleting a ref is not erasure. `remote compact`
+                                              # and `serve --store` refuse it in v1; clone
+                                              # --filter refused as for any bucket. Untested
+                                              # against real GitHub
 cargo run --bin sc -- remote compact <name> [--dry-run] [--prune-expire 24h] [--allow-short-grace]
                                               # bucket remotes only (#216, ADR-0057): merge small
                                               # packs behind one manifest CAS, then delete log
@@ -429,6 +457,14 @@ cargo run --bin sc -- serve --http <addr> <home> --store sc+wal://<dir>|sc+s3://
                                               # all content lives in the bucket (instance is
                                               # disposable); <home> still needs `.sc/` for tokens,
                                               # the TLS identity and scratch space
+bash demo/run_git_carrier_demo.sh             # sc+git:: proof (P39): a bare Git repo as the host;
+                                              # protected path + secret + private branch pushed
+                                              # (private branch refused without the opt-in), plain
+                                              # `git clone` sees no refs/sc, keyless clone sees
+                                              # `(private, no access)` and no plaintext, keyed
+                                              # clone reads all, public main also mirrored as a
+                                              # normal Git branch; second leg against sc-forge;
+                                              # no sc-git-bucket-* temp leftovers
 bash demo/run_http_remote_demo.sh             # sc-native HTTP transport proof (P26): real
                                               # loopback TCP (no shim, unlike ssh://), clone +
                                               # push + fetch over sc+http://, a signed ~1 MiB

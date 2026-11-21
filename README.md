@@ -64,8 +64,9 @@ crates/
           Ed25519 signing (the ONLY crate that links RustCrypto)
   tlsio/  TLS for the sc+https:// transport (the ONLY crate that links
           rustls/rcgen; a leaf — no workspace deps)
-  objio/  object-store buckets for sc+wal:// and sc+s3:// remotes (the ONLY crate
-          that links the S3 SDK; a leaf — no workspace deps)
+  objio/  object-store buckets for sc+wal://, sc+s3:// and sc+git:: remotes (the
+          ONLY crate that links the S3 SDK; its Git backend spawns the system
+          `git`; a leaf — no workspace deps)
   repo/   durable .sc repo — refs, branches, working tree, merge, history
           editing, remotes, protection, GC, sparse/partial clone, transcripts,
           transport (ssh, sc+http(s), bucket WAL)
@@ -136,6 +137,14 @@ Bucket remotes take `sc remote add <name> sc+wal://<dir>` or
 (ADR-0057), and `sc serve --http 127.0.0.1:8730 --store <url> <serve-home>`
 serves a bucket from a disposable instance (`--stdio` also works;
 `sc serve --help`).
+`sc remote add <name> sc+git::<git-url>` (or `sc clone sc+git::<git-url> <dst>`)
+stores the same bucket inside any (SHA-1) Git repository as `refs/sc/*`, so private
+branches, protected paths and secrets travel through a Git host that a plain
+`git clone` never sees into (ADR-0060). Pushing a private branch there needs
+`--allow-private-branches` (its name and recipient ids become readable by
+everyone who can read the repository); compaction and `serve --store` are not
+supported on it yet. Proven by `demo/run_git_carrier_demo.sh`; not tested
+against GitHub itself.
 
 ## How Phase 1 works
 
@@ -168,11 +177,12 @@ provenance (droppable through signed tombstones), sparse and partial checkouts (
 cherry-pick, rebase and agent sessions on a partial clone), and local,
 ssh-native, sc-native HTTP/TLS (bearer tokens with expiry and rotation,
 listener resource limits, TOFU pinning managed by `sc tls`, or CA validation
-via `SC_HTTPS_CA_FILE`/`SC_HTTPS_CA=system`), bucket (`sc+wal://`, `sc+s3://`),
-and Git (including hosted GitHub) network transports, plus private branches
+via `SC_HTTPS_CA_FILE`/`SC_HTTPS_CA=system`), bucket (`sc+wal://`, `sc+s3://`,
+`sc+git::` inside a Git repository), and Git (including hosted GitHub) network
+transports, plus private branches
 sealed to a recipient set until publish and a read-only Tauri desktop
-browser. All 36 phases and P37a-37d are implemented and tested; `demo/` holds
-28 independent end-to-end proofs covering most major capabilities. Remaining
+browser. All 36 phases, P37a-37d and P39 are implemented and tested; `demo/` holds
+29 independent end-to-end proofs covering most major capabilities. Remaining
 follow-ons (richer signer trust models, per-path token ACLs, transcript
 rewrap/grant/revoke and similar items) are tracked in [ROADMAP.md](ROADMAP.md)'s Deferred section and as open
 GitHub issues rather than being open MVP scope.

@@ -15,6 +15,8 @@ use std::collections::BTreeMap;
 use std::io::Write;
 
 mod compact;
+#[cfg(test)]
+mod git_remote_tests;
 pub use compact::{CompactOptions, CompactReport};
 
 /// How many times a read restarts from a fresh manifest after an object the
@@ -91,6 +93,9 @@ pub struct BucketTransport {
     /// Tag of the manifest the in-progress `refresh_once` is building from, so
     /// a failed attempt can say which manifest it failed on.
     attempt_tag: RefCell<Option<String>>,
+    /// Opened from an `sc+git::` URL: compaction is refused here, not only in
+    /// the CLI (a Git host gives it no trustworthy pack age, ADR-0060).
+    git_carrier: bool,
 }
 
 /// A leaf object a pack holds that no tree or snapshot references, so the
@@ -158,13 +163,88 @@ pub enum BucketScheme {
     Wal,
     /// `sc+s3://` — an S3-compatible object store.
     S3,
+    /// `sc+git::<git-url>` — `refs/sc/*` inside any Git repository.
+    Git,
 }
 
-/// A parsed `sc+wal://<dir>` or `sc+s3://<bucket>/<prefix…>` remote URL.
+/// Whether `url` belongs to the bucket transport: `sc+wal://`, `sc+s3://`, or
+/// anything under the reserved `sc+git:` prefix. The prefix is reserved on
+/// purpose: a near miss such as `sc+git:/x` is routed here, where
+/// [`BucketUrl::parse`] refuses it, instead of falling through to a local path
+/// or the Git mirror bridge.
+pub fn is_bucket_url(url: &str) -> bool {
+    url.starts_with("sc+wal://") || url.starts_with("sc+s3://") || is_git_bucket_url(url)
+}
+
+/// Whether `url` is under the reserved `sc+git:` prefix (valid or not),
+/// whatever its letter case: `SC+GIT::x` is a near miss that [`BucketUrl::parse`]
+/// refuses, never a local path.
+pub fn is_git_bucket_url(url: &str) -> bool {
+    url.as_bytes()
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"sc+git:"))
+}
+
+/// The private-branch gate for `sc+git::` remotes (ADR-0044 reason 4, reversed
+/// only under this opt-in): a private branch published to a Git host exposes
+/// its name, recipient ids and sizes to every reader of the repository, and the
+/// ciphertext stays there for good. Pure, so it runs before any bucket I/O.
+/// Remotes of any other kind are unaffected. The URL is shown redacted.
+pub fn check_private_push_allowed(url: &str, allowed: bool, branch: &str) -> Result<()> {
+    if allowed || !is_git_bucket_url(url) {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "branch {branch} is private and this remote is a Git repository ({}): pushing it \
+         makes the branch name, recipient ids and sizes readable by everyone who can read the \
+         Git repository, and the ciphertext stays there after any later revoke. Nothing was \
+         uploaded. To accept that for an existing remote, run \
+         `sc remote set <name> --allow-private-branches` (new remotes: `sc remote add <name> \
+         <url> --allow-private-branches` or `sc clone <url> <dst> --allow-private-branches`)",
+        scl_objio::redact(url)
+    )))
+}
+
+/// `sc serve --store sc+git::…` is refused (deferred): a daemon cannot answer
+/// ssh or credential prompts, and it would sit between clients and the
+/// client-side private-branch gate. Checked on the prefix, before any parse.
+pub fn refuse_git_store(url: &str) -> Result<()> {
+    if is_git_bucket_url(url) {
+        return Err(Error::InvalidArgument(
+            "sc serve --store does not support sc+git:: remotes yet (deferred); \
+             serve an sc+wal:// or sc+s3:// store, or push to the Git repository with `sc push`"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// `sc remote compact` on an `sc+git::` remote is refused (deferred): the
+/// compactor has no trustworthy age source for refs in a Git repository, so
+/// it could not tell a stale pack from one an in-flight push just uploaded.
+pub fn refuse_git_compact(url: &str) -> Result<()> {
+    if is_git_bucket_url(url) {
+        return Err(git_compact_refusal());
+    }
+    Ok(())
+}
+
+fn git_compact_refusal() -> Error {
+    Error::InvalidArgument(
+        "sc remote compact does not support sc+git:: remotes yet (deferred): a Git \
+         repository gives the compactor no trustworthy age for stored packs"
+            .into(),
+    )
+}
+
+/// A parsed `sc+wal://<dir>`, `sc+s3://<bucket>/<prefix…>` or
+/// `sc+git::<git-url>` remote URL.
 /// `sc+wal` treats everything after the scheme as a directory path (so
 /// `sc+wal:///abs/path` and `sc+wal://rel/path` both work); `sc+s3` splits
 /// the first path component off as the bucket name and keeps the remainder
-/// (possibly empty) as the key prefix.
+/// (possibly empty) as the key prefix; `sc+git` keeps everything after `::`
+/// verbatim as the Git URL in `bucket` (the objio backend validates it).
+#[derive(Debug)]
 pub struct BucketUrl {
     pub scheme: BucketScheme,
     pub bucket: String,
@@ -177,17 +257,36 @@ impl BucketUrl {
     /// embedded CR/LF, which would otherwise smuggle extra "lines" into
     /// anything that later logs or shells out with the raw URL.
     pub fn parse(url: &str) -> Result<BucketUrl> {
+        // Every message shows the URL redacted: it can carry credentials.
+        let shown = scl_objio::redact(url);
+        if url.chars().any(|c| c == '\r' || c == '\n') {
+            return Err(Error::InvalidArgument(format!("bad bucket url: {shown}")));
+        }
+        if is_git_bucket_url(url) {
+            let inner = url.strip_prefix("sc+git::").ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "bad bucket url: {shown} (the form is lowercase sc+git::<git-url>, with two colons)"
+                ))
+            })?;
+            scl_objio::GitBucket::validate_url(inner)
+                .map_err(|e| Error::InvalidArgument(format!("bad bucket url: {shown}: {e}")))?;
+            return Ok(BucketUrl {
+                scheme: BucketScheme::Git,
+                bucket: inner.to_string(),
+                prefix: String::new(),
+            });
+        }
         let (scheme, rest) = if let Some(r) = url.strip_prefix("sc+wal://") {
             (BucketScheme::Wal, r)
         } else if let Some(r) = url.strip_prefix("sc+s3://") {
             (BucketScheme::S3, r)
         } else {
             return Err(Error::InvalidArgument(format!(
-                "not an sc+wal:// or sc+s3:// url: {url}"
+                "not an sc+wal://, sc+s3:// or sc+git:: url: {shown}"
             )));
         };
-        if rest.is_empty() || rest.chars().any(|c| c == '\r' || c == '\n') {
-            return Err(Error::InvalidArgument(format!("bad bucket url: {url}")));
+        if rest.is_empty() {
+            return Err(Error::InvalidArgument(format!("bad bucket url: {shown}")));
         }
         Ok(match scheme {
             BucketScheme::Wal => BucketUrl {
@@ -198,7 +297,7 @@ impl BucketUrl {
             BucketScheme::S3 => {
                 let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
                 if bucket.is_empty() {
-                    return Err(Error::InvalidArgument(format!("bad bucket url: {url}")));
+                    return Err(Error::InvalidArgument(format!("bad bucket url: {shown}")));
                 }
                 BucketUrl {
                     scheme,
@@ -206,6 +305,7 @@ impl BucketUrl {
                     prefix: prefix.trim_matches('/').to_string(),
                 }
             }
+            BucketScheme::Git => unreachable!("handled above"),
         })
     }
 }
@@ -213,7 +313,8 @@ impl BucketUrl {
 impl BucketTransport {
     /// Open the right bucket backend for a bucket URL (`sc+wal://` opens a
     /// local-directory test/demo backend, `sc+s3://` opens the real
-    /// S3-compatible backend), then wrap it as a `Transport` the same way
+    /// S3-compatible backend, `sc+git::` stores `refs/sc/*` in a Git
+    /// repository), then wrap it as a `Transport` the same way
     /// [`BucketTransport::from_bucket`] does.
     pub fn open(url: &str) -> Result<BucketTransport> {
         let parsed = BucketUrl::parse(url)?;
@@ -222,8 +323,9 @@ impl BucketTransport {
             BucketScheme::S3 => {
                 Box::new(scl_objio::S3Bucket::open(&parsed.bucket, &parsed.prefix)?)
             }
+            BucketScheme::Git => Box::new(scl_objio::GitBucket::open(&parsed.bucket)?),
         };
-        BucketTransport::from_bucket(bucket)
+        BucketTransport::build(bucket, parsed.scheme == BucketScheme::Git)
     }
 
     /// Open a transport directly over an already-constructed bucket backend.
@@ -231,6 +333,10 @@ impl BucketTransport {
     /// manifest plus a walk of its parent chain) errors — an entirely empty
     /// bucket is a valid, successfully-opened remote with no refs yet.
     pub fn from_bucket(bucket: Box<dyn Bucket>) -> Result<BucketTransport> {
+        Self::build(bucket, false)
+    }
+
+    fn build(bucket: Box<dyn Bucket>, git_carrier: bool) -> Result<BucketTransport> {
         let t = BucketTransport {
             bucket,
             view: RefCell::new(None),
@@ -241,6 +347,7 @@ impl BucketTransport {
             leaf_cache: RefCell::new(BTreeMap::new()),
             saw_absent: Cell::new(false),
             attempt_tag: RefCell::new(None),
+            git_carrier,
         };
         t.refresh()?;
         Ok(t)

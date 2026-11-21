@@ -694,6 +694,19 @@ across every phase.
     file and the auto-minted TLS serve key get the same owner-only DACL through
     one shared primitive, `scl_core::owner_only` (#281).
 
+- **Phase 39 — Git-carried bucket remotes (`sc+git::<git-url>`).** The bucket WAL
+  stored as one parentless commit per key at `refs/sc/<key>` in any Git
+  repository, through the system `git` binary (`objio::GitBucket`, lease CAS with
+  no `+` refspec, rejections classified by re-reading the ref, 2 s freshness
+  window, create-only caching and family-batched fetches). Private branches,
+  protected paths and secrets travel through a Git host (a local bare repo and
+  sc-forge verified; real GitHub untested); a plain `git clone` never fetches
+  `refs/sc/*`, and the same repository can also mirror public branches through a
+  `--git` remote. A private-branch push needs the per-remote opt-in
+  `--allow-private-branches`; `sc remote compact` and `sc serve --store` refuse
+  `sc+git::` in v1; sc-forge accepts the `refs/sc/` prefix. No format, wire or
+  crypto change. Proven by `demo/run_git_carrier_demo.sh`. (ADR-0060.)
+
 ## Active
 
 No phase is currently active. Follow-up work is tracked under Deferred below.
@@ -702,6 +715,7 @@ No phase is currently active. Follow-up work is tracked under Deferred below.
 
 | Phase | Goal | Demoable outcome | ADR |
 |-------|------|------------------|-----|
+| **P39 — Git-carried bucket remotes** | Carry private branches, protected paths and secrets through a Git host | `sc remote add origin sc+git::<git-url>` (or `sc clone sc+git::<git-url> <dst>`): the bucket WAL as `refs/sc/*` in any Git repository; a private-branch push needs `--allow-private-branches`; a plain `git clone` of the same repo sees none of it; sc-forge accepts `refs/sc/`; proven by `demo/run_git_carrier_demo.sh` | [0060](docs/adr/0060-git-carried-bucket-remotes.md) |
 | **P38 — sc-forge** | Configurable project Git host | Bare Git over smart HTTP, recorded Gitea API subset, protected merges and operations tooling; all 24 recorded scenarios and all six first-consumer acceptance scenarios pass. Local acceptance only; production migration is separate. | [0058](docs/adr/0058-sc-forge-gitea-compatible-git-forge.md) |
 | **P4 — Merge & conflict resolution** | Combine work from two branches | `sc merge <branch>` creates a merge snapshot; clean merges auto-resolve, conflicts are detected and reported | [0012](docs/adr/0012-three-way-merge.md) |
 | **P5 — Secret scanner (accidental-plaintext guard)** | Stop plaintext secrets being committed | pattern + entropy scan hard-rejects plaintext secrets, with `sc scan` and a hash-scoped allowlist | [0017](docs/adr/0017-secret-scanner.md) |
@@ -1002,6 +1016,27 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
   issues a `has_object` round trip per object over S3; batching those probes
   into one `refresh()` plus local index lookups (instead of one S3 round
   trip per object) is deferred.
+- **`sc+git::` follow-ons (P39, ADR-0060).** Deferred rather than built: (1)
+  `sc remote compact` on an `sc+git::` remote, which needs an age source the
+  compactor controls (a Git repository gives only writer-controlled committer
+  time, so `list_meta` reports observation time and v1 refuses the command);
+  (2) `sc serve --store sc+git::...` (a daemon cannot answer ssh or credential
+  prompts, and it would sit between clients and the private-branch opt-in); (3)
+  rollback and rewind of `refs/sc/manifest` by anyone with push access, tracked
+  under P34 follow-on (6) and ADR-0059 follow-on (2), now reachable by more
+  people; (4) validation against real GitHub (per-ref and per-push limits,
+  rulesets, hosts that refuse unknown ref namespaces), untested so far; (5)
+  batched deletes (one `git push` for many `:refs/sc/K`) and a batched
+  `has_objects`, since a Git host costs a round trip per probe or delete; (6)
+  `list_meta` downloads every listed value to read its size; (7) scaling: every
+  `ls-remote` and push downloads the whole ref advertisement (the host does not
+  filter it by prefix server-side, a packet trace showed the full list) and a
+  cold read fetches every `log/` and `checkpoints/` entry, and with compaction
+  refused (1) refs grow by at least three per push, so a long-lived store slows
+  down until compaction or a ref-filtering host exists; (8) SHA-256 Git
+  repositories (v1 pins its cache to SHA-1 and handles SHA-1 ids only); (9) a
+  download budget for fetches into the temp cache (`git fetch` has no input-size
+  limit, so an oversized value is written before the read caps refuse it).
 - **Serve-side persistent pack cache (P36c follow-on).** A bucket-backed
   serve instance re-downloads packs per connection; a content-addressed
   on-disk cache in the serve home would make warm instances cheap without
