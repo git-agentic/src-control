@@ -21,10 +21,11 @@
 
 use crate::{validate_key, Bucket, Error, Fetched, ObjectMeta, Result};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::{Read, Write};
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::{Mutex, MutexGuard};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::{mpsc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Largest chunk blob a value is split into (GitHub's hard per-blob limit is
@@ -55,10 +56,24 @@ const FETCH_BATCH: usize = 256;
 /// 32 KiB, so the budget stays well under it).
 const DELETE_BATCH: usize = 128;
 const DELETE_ARG_BUDGET: usize = 24 << 10;
+/// How long a fetch may neither grow `objects/pack` nor exit before the
+/// watchdog kills it (a served store depends on its git child, so a silent
+/// host must not park a session forever).
+const IDLE: Duration = Duration::from_secs(120);
+/// Download budget of a fetch of a whole key family or a batch of keys.
+const FAMILY_BUDGET: u64 = MAX_VALUE;
 
 /// `-c` overrides on every git call: transport allowlist, no hooks, no signing,
-/// no background maintenance, bounded stalls.
+/// no background maintenance, bounded stalls. `protocol.version=2` makes a
+/// fetch send `ref-prefix`, so the host filters its ref advertisement down to
+/// what is asked for; `fetch.unpackLimit=1` keeps every incoming object in one
+/// `objects/pack/tmp_pack_*` file (never loose objects), which is what the
+/// fetch watchdog measures; `fetch.uriProtocols=` stops a host from redirecting
+/// the download to packfile URIs the watchdog could not see.
 const GIT_CONFIG: &[&str] = &[
+    "protocol.version=2",
+    "fetch.unpackLimit=1",
+    "fetch.uriProtocols=",
     "protocol.allow=never",
     "protocol.file.allow=always",
     "protocol.ssh.allow=always",
@@ -192,6 +207,34 @@ enum Pushed {
     Refused(String),
 }
 
+/// Fetch watchdog limits: what one fetch may cost before it is killed.
+#[derive(Clone, Copy)]
+struct Tuning {
+    /// Replaces the computed download budget of every fetch (tests only).
+    budget: Option<u64>,
+    /// A fetch that neither grows `objects/pack` nor exits for this long is killed.
+    idle: Duration,
+    /// Fixed polling interval; `None` polls after 2 ms and backs off to 50 ms
+    /// (tests fix it to make a fetch finish between two polls).
+    poll: Option<Duration>,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Tuning {
+            budget: None,
+            idle: IDLE,
+            poll: None,
+        }
+    }
+}
+
+/// One watched fetch: its download budget and the name of the cap behind it.
+struct Watch {
+    budget: u64,
+    what: String,
+}
+
 /// A bucket stored as `refs/sc/*` in a Git repository reachable at `url`.
 /// Intent: let a plain Git host carry a native sc store (P39) without a new
 /// server. See the module docs for the value encoding and write protocol.
@@ -202,6 +245,13 @@ pub struct GitBucket {
     /// Chunk size used for writes (tests shrink it).
     chunk: usize,
     state: Mutex<HashMap<String, Known>>,
+    tune: Tuning,
+    /// Serve mode: every fetch leads its own process group, so the watchdog
+    /// can kill `ssh` and `git-remote-*` along with git. Off for the CLI, where
+    /// the terminal's Ctrl-C must still reach git and ssh must still be able to
+    /// prompt on the controlling terminal.
+    #[cfg(unix)]
+    group: bool,
 }
 
 fn is_oid(s: &str) -> bool {
@@ -288,6 +338,94 @@ fn check_len(key: &str, len: u64) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Download budget of a fetch of exactly one key: its value cap plus the pack
+/// overhead (0.1% and 1 MiB; deflate can grow incompressible data a little).
+fn single_budget(key: &str) -> u64 {
+    let cap = value_cap(key);
+    cap + cap / 1024 + (1 << 20)
+}
+
+/// Negative refspecs that make `+refs/sc/<key>:refs/sc/<key>` exact. For a
+/// refspec without a glob git also accepts a remote ref that merely abbreviates
+/// to the name (its rev-parse rules: `refs/heads/refs/sc/<key>`, a tag, a
+/// remote-tracking ref, ...), which would let a branch or tag stand in for an
+/// absent key. `ls-remote` plus an exact-name compare never had that gap, so
+/// the single-key fetch excludes every such spelling.
+fn exact_only(full: &str) -> Vec<String> {
+    ["refs/", "refs/tags/", "refs/heads/", "refs/remotes/"]
+        .iter()
+        .map(|p| format!("^{p}{full}"))
+        .chain([format!("^refs/remotes/{full}/HEAD")])
+        .collect()
+}
+
+/// Name and size of every regular file directly in `dir` (empty when it cannot
+/// be read).
+fn dir_files(dir: &Path) -> HashMap<OsString, u64> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let m = e.metadata().ok()?;
+            m.is_file().then(|| (e.file_name(), m.len()))
+        })
+        .collect()
+}
+
+/// Total size of the regular files directly in `dir`.
+fn dir_bytes(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.metadata().ok().filter(|m| m.is_file()).map(|m| m.len()))
+        .sum()
+}
+
+/// Remove the `*.lock` files under `dir` (the cache root and its `refs/`, not
+/// `objects/`): only a killed git can have left one, because nothing else uses
+/// the cache while its fetch is being undone.
+fn remove_stale_locks(dir: &Path, depth: u32) {
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let (path, kind) = (e.path(), e.file_type());
+        match kind {
+            Ok(t) if t.is_dir() && depth < 8 && e.file_name() != "objects" => {
+                remove_stale_locks(&path, depth + 1);
+            }
+            Ok(t) if t.is_file() && path.extension().is_some_and(|x| x == "lock") => {
+                let _ = std::fs::remove_file(&path);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Read up to `cap` bytes from `r` and discard the rest, so the writer never
+/// blocks on a full pipe. The flag says more than `cap` bytes came.
+fn drain(r: &mut impl Read, cap: usize) -> (Vec<u8>, bool) {
+    let mut buf = Vec::new();
+    let _ = r.by_ref().take(cap as u64 + 1).read_to_end(&mut buf);
+    let over = buf.len() > cap;
+    buf.truncate(cap);
+    let _ = std::io::copy(r, &mut std::io::sink());
+    (buf, over)
+}
+
+fn over_budget(watch: &Watch) -> Error {
+    Error::Backend(format!(
+        "git fetch downloaded more than {} bytes ({}); it was stopped and its download \
+         discarded (hostile or corrupt remote)",
+        watch.budget, watch.what
+    ))
+}
+
+fn stalled(idle: Duration) -> Error {
+    Error::Backend(format!(
+        "git fetch made no progress for {idle:?}; it was stopped (unreachable or hostile remote)"
+    ))
 }
 
 /// How a refused write turned out, judged by re-reading the exact ref.
@@ -426,14 +564,47 @@ impl GitBucket {
         Self::open_with(url, git, CHUNK)
     }
 
+    /// [`GitBucket::open`] for a long-running server (`sc serve --store`): the
+    /// cache directory is made under `parent` (the serve home's `.sc/tmp/`, created
+    /// if missing) instead of the system temp directory, and every fetch
+    /// leads its own process group so the watchdog, when it kills one, takes `ssh` or
+    /// `git-remote-https` with it. A killed server can leave the cache behind;
+    /// [`GitBucket::reap_stale`] removes such leftovers at the next start.
+    pub fn open_in(url: &str, parent: &Path) -> Result<GitBucket> {
+        let git = std::env::var("SC_GIT").unwrap_or_else(|_| "git".to_string());
+        Self::open_full(url, git, CHUNK, Some(parent), true)
+    }
+
     fn open_with(url: &str, git: String, chunk: usize) -> Result<GitBucket> {
+        Self::open_full(url, git, chunk, None, false)
+    }
+
+    fn open_full(
+        url: &str,
+        git: String,
+        chunk: usize,
+        parent: Option<&Path>,
+        group: bool,
+    ) -> Result<GitBucket> {
         Self::validate_url(url)?;
+        #[cfg(not(unix))]
+        let _ = group; // process groups are unix-only; the watchdog kills the child alone
+        let cache = match parent {
+            Some(p) => {
+                std::fs::create_dir_all(p)?;
+                new_cache_dir_in(p)?
+            }
+            None => new_cache_dir_in(&std::env::temp_dir())?,
+        };
         let b = GitBucket {
             url: url.to_string(),
             git,
-            cache: new_cache_dir()?,
+            cache,
             chunk: chunk.max(1),
             state: Mutex::new(HashMap::new()),
+            tune: Tuning::default(),
+            #[cfg(unix)]
+            group,
         };
         // An early `?` drops `b`, which removes the cache dir. The cache is
         // pinned to sha1 whatever the user's `init.defaultObjectFormat`: values
@@ -458,14 +629,9 @@ impl GitBucket {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Run git in the cache repository with the hardened environment.
-    fn run(
-        &self,
-        args: &[&str],
-        stdin: Option<&[u8]>,
-        env: &[(&str, &str)],
-        max_out: usize,
-    ) -> Result<Out> {
+    /// The git command line in the cache repository with the hardened
+    /// environment, stdout and stderr piped.
+    fn command(&self, args: &[&str], env: &[(&str, &str)], piped_stdin: bool) -> Command {
         let mut cmd = Command::new(&self.git);
         for c in GIT_CONFIG {
             cmd.arg("-c").arg(c);
@@ -482,19 +648,35 @@ impl GitBucket {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        cmd.stdin(if stdin.is_some() {
+        cmd.stdin(if piped_stdin {
             Stdio::piped()
         } else {
             Stdio::null()
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|e| {
+        cmd
+    }
+
+    fn spawn(&self, cmd: &mut Command) -> Result<Child> {
+        cmd.spawn().map_err(|e| {
             Error::Backend(format!(
                 "cannot run git ({}): {e} (install git or set SC_GIT)",
                 self.git
             ))
-        })?;
+        })
+    }
+
+    /// Run git in the cache repository with the hardened environment.
+    fn run(
+        &self,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+        env: &[(&str, &str)],
+        max_out: usize,
+    ) -> Result<Out> {
+        let mut cmd = self.command(args, env, stdin.is_some());
+        let mut child = self.spawn(&mut cmd)?;
         let sin = child.stdin.take();
         let mut sout = child.stdout.take().expect("piped");
         let mut serr = child.stderr.take().expect("piped");
@@ -545,6 +727,153 @@ impl GitBucket {
             Ok(out)
         } else {
             Err(self.fail(args.first().copied().unwrap_or("git"), &out))
+        }
+    }
+
+    /// Run `git fetch` under the download watchdog. Instead of blocking on the
+    /// pipes like [`Self::run`], this polls the growth of `objects/pack` (every
+    /// download lands in one `tmp_pack_*` file, see [`GIT_CONFIG`]) while
+    /// detached threads drain the pipes, and kills git when the growth passes
+    /// `watch.budget` or when nothing grows and nothing exits for `idle`. A
+    /// check after a normal exit catches a fetch that finished between two
+    /// polls. A breach removes what the fetch added and returns an error
+    /// naming the cap.
+    ///
+    /// The bound is disk per fetch. It is not RAM inside `index-pack` and not
+    /// the total size of the cache, which grows by what each fetch keeps.
+    fn run_watched(&self, args: &[&str], max_out: usize, watch: &Watch) -> Result<Out> {
+        let pack_dir = self.cache.join("objects").join("pack");
+        let before = dir_files(&pack_dir);
+        let base: u64 = before.values().sum();
+        let mut cmd = self.command(args, &[], false);
+        #[cfg(unix)]
+        if self.group {
+            std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        }
+        let mut child = self.spawn(&mut cmd)?;
+        let mut sout = child.stdout.take().expect("piped");
+        let mut serr = child.stderr.take().expect("piped");
+        // Detached readers: a descendant that outlives a killed git and keeps a
+        // pipe open must never be able to block this call.
+        let (otx, orx) = mpsc::channel();
+        let (etx, erx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = otx.send(drain(&mut sout, max_out));
+        });
+        std::thread::spawn(move || {
+            let _ = etx.send(drain(&mut serr, SMALL_CAP).0);
+        });
+
+        let (mut last, mut moved) = (0u64, Instant::now());
+        let mut pause = self.tune.poll.unwrap_or(Duration::from_millis(2));
+        let mut breach = None;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break Some(st),
+                Ok(None) => {}
+                Err(e) => {
+                    self.stop(&mut child);
+                    let _ = child.wait();
+                    return Err(e.into());
+                }
+            }
+            let grown = dir_bytes(&pack_dir).saturating_sub(base);
+            if grown > watch.budget {
+                breach = Some(over_budget(watch));
+                break None;
+            }
+            if grown != last {
+                (last, moved) = (grown, Instant::now());
+            } else if moved.elapsed() >= self.tune.idle {
+                breach = Some(stalled(self.tune.idle));
+                break None;
+            }
+            std::thread::sleep(pause);
+            if self.tune.poll.is_none() {
+                pause = (pause * 2).min(Duration::from_millis(50));
+            }
+        };
+        let Some(status) = status else {
+            // Signal before reaping, while the group id is still ours.
+            self.stop(&mut child);
+            let _ = child.wait();
+            self.discard_download(&pack_dir, &before);
+            return Err(breach.expect("only a breach leaves the loop without a status"));
+        };
+        if dir_bytes(&pack_dir).saturating_sub(base) > watch.budget {
+            self.discard_download(&pack_dir, &before);
+            return Err(over_budget(watch));
+        }
+        let held = |what: &str| {
+            Error::Backend(format!(
+                "git exited but left its {what} open for {:?} (a helper outlived it)",
+                self.tune.idle
+            ))
+        };
+        let (stdout, over) = orx
+            .recv_timeout(self.tune.idle)
+            .map_err(|_| held("stdout"))?;
+        let stderr = erx
+            .recv_timeout(self.tune.idle)
+            .map_err(|_| held("stderr"))?;
+        if over {
+            return Err(Error::Backend(format!(
+                "git output exceeded {max_out} bytes (hostile or corrupt remote)"
+            )));
+        }
+        Ok(Out {
+            success: status.success(),
+            code: status.code(),
+            stdout,
+            stderr: self.scrub(&String::from_utf8_lossy(&stderr)),
+        })
+    }
+
+    /// Kill a watched git. Called before the child is reaped, so its group id
+    /// cannot have been reused. In serve mode the child leads its own process
+    /// group and the whole group is signalled, so `ssh` and `git-remote-*`
+    /// die with it; the system `kill` keeps this std-only, with no `unsafe`.
+    fn stop(&self, child: &mut Child) {
+        #[cfg(unix)]
+        if self.group {
+            let _ = Command::new("kill")
+                .args(["-s", "KILL", "--"])
+                .arg(format!("-{}", child.id()))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        let _ = child.kill();
+    }
+
+    /// Undo a fetch that went over budget: remove every file it added to
+    /// `objects/pack` and every ref under `refs/sc/`. A fetch that finished
+    /// before the check had already pointed refs at what is deleted here; the
+    /// cache is only a copy of the host, so the next read fetches again.
+    fn discard_download(&self, pack_dir: &Path, before: &HashMap<OsString, u64>) {
+        // A killed git cannot release its locks (`shallow.lock`, ref locks), and
+        // a lock that stays would fail every later fetch into this cache.
+        remove_stale_locks(&self.cache, 0);
+        // Names first, while the objects still exist: a ref to a missing
+        // object is skipped by `for-each-ref`.
+        let refs: Vec<String> = self
+            .local_refs(NS)
+            .map(|v| v.into_iter().map(|(k, _, _)| format!("{NS}{k}")).collect())
+            .unwrap_or_default();
+        for e in std::fs::read_dir(pack_dir).into_iter().flatten().flatten() {
+            if !before.contains_key(&e.file_name()) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+        if !refs.is_empty() {
+            let cmds: String = refs.iter().map(|r| format!("delete {r}\n")).collect();
+            let _ = self.run(
+                &["update-ref", "--stdin"],
+                Some(cmds.as_bytes()),
+                &[],
+                SMALL_CAP,
+            );
         }
     }
 
@@ -635,7 +964,32 @@ impl GitBucket {
     /// downloaded. `family` = a glob fetch of a whole key family, which also
     /// prunes stale local refs. A shallow glob fetch that matches no ref exits 1
     /// with no error text; [`Self::get_family`] tells that apart by listing.
+    /// The download budget is [`FAMILY_BUDGET`]; a fetch of exactly one key
+    /// goes through [`Self::fetch_one`] and gets that key's own, tighter one.
     fn fetch(&self, refspecs: &[String], family: bool) -> Result<Out> {
+        let what = "the 2 GiB budget of a family or batched fetch".to_string();
+        self.fetch_watched(refspecs, family, FAMILY_BUDGET, what)
+    }
+
+    /// Fetch exactly `refs/sc/<key>` in one call, which both reads the ref and
+    /// updates the cache (a v2 host answers with just that ref, see
+    /// [`GIT_CONFIG`]). Exact by name: see [`exact_only`]. A failure does not
+    /// say whether the ref is absent; the caller asks `ls-remote` for that.
+    fn fetch_one(&self, key: &str) -> Result<Out> {
+        let full = format!("{NS}{key}");
+        let mut specs = vec![format!("+{full}:{full}")];
+        specs.extend(exact_only(&full));
+        let what = format!("the value cap of {key:?}");
+        self.fetch_watched(&specs, false, single_budget(key), what)
+    }
+
+    fn fetch_watched(
+        &self,
+        refspecs: &[String],
+        family: bool,
+        budget: u64,
+        what: String,
+    ) -> Result<Out> {
         let mut a = vec![
             "fetch",
             "--no-tags",
@@ -648,7 +1002,11 @@ impl GitBucket {
         }
         a.extend(["--end-of-options", &self.url]);
         a.extend(refspecs.iter().map(String::as_str));
-        self.run(&a, None, &[], SMALL_CAP)
+        let watch = Watch {
+            budget: self.tune.budget.unwrap_or(budget),
+            what,
+        };
+        self.run_watched(&a, SMALL_CAP, &watch)
     }
 
     /// Push `oid` to `refs/sc/<key>` (or delete it when `oid` is `None`) under
@@ -971,15 +1329,74 @@ impl Drop for GitBucket {
     }
 }
 
-/// Fresh private temp directory `sc-git-bucket-<pid>-<random>` (mode 0700).
-fn new_cache_dir() -> Result<PathBuf> {
+/// Prefix of every cache directory name: `sc-git-bucket-<pid>-<random>`.
+const CACHE_PREFIX: &str = "sc-git-bucket-";
+
+impl GitBucket {
+    /// Remove cache directories a killed process left under `parent`, and return
+    /// how many were removed. Only a `sc-git-bucket-<pid>-*` directory whose
+    /// owner process is provably gone is touched: several `sc serve --stdio`
+    /// processes can share one `parent`, and a live one's cache must survive.
+    /// A name that does not parse, this process's own directories, and a pid
+    /// that cannot be shown dead are all kept. Unix only; on other platforms it
+    /// removes nothing.
+    pub fn reap_stale(parent: &Path) -> usize {
+        #[cfg(unix)]
+        {
+            let mut removed = 0;
+            for e in std::fs::read_dir(parent).into_iter().flatten().flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let Some(rest) = name.strip_prefix(CACHE_PREFIX) else {
+                    continue;
+                };
+                let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+                    continue;
+                };
+                // `file_type` does not follow a symlink, so only a real directory goes.
+                let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+                if is_dir
+                    && pid != std::process::id()
+                    && pid_is_gone(pid)
+                    && std::fs::remove_dir_all(e.path()).is_ok()
+                {
+                    removed += 1;
+                }
+            }
+            removed
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = parent;
+            0
+        }
+    }
+}
+
+/// Is `pid` provably not running? `kill -0` says "No such process" for a pid
+/// that is gone; any other answer (alive, not permitted, unknown wording) is
+/// not proof, so the caller keeps what it owns.
+#[cfg(unix)]
+fn pid_is_gone(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output()
+        .is_ok_and(|o| {
+            !o.status.success() && String::from_utf8_lossy(&o.stderr).contains("No such process")
+        })
+}
+
+/// Fresh private directory `sc-git-bucket-<pid>-<random>` (mode 0700) under `parent`.
+fn new_cache_dir_in(parent: &Path) -> Result<PathBuf> {
     for attempt in 0u64..16 {
         let name = format!(
-            "sc-git-bucket-{}-{}",
+            "{CACHE_PREFIX}{}-{}",
             std::process::id(),
             &nonce_seed(attempt)[..16]
         );
-        let p = std::env::temp_dir().join(name);
+        let p = parent.join(name);
         #[cfg_attr(not(unix), allow(unused_mut))] // `mut` only for the unix mode
         let mut b = std::fs::DirBuilder::new();
         #[cfg(unix)]
@@ -1035,26 +1452,14 @@ impl Bucket for GitBucket {
         if let Some(fam) = family_of(key) {
             return self.get_family(&mut st, key, cached_tag, fam);
         }
-        let Some(remote) = self.remote_ref(key)? else {
-            st.remove(key);
-            return Ok(Fetched::Absent);
-        };
-        if cached_tag == Some(remote.as_str()) {
-            // Refresh only a cache entry for this very value; an entry for an
-            // older value would otherwise look fresh. A cold hit stays uncached.
-            match st.get_mut(key) {
-                Some(k) if k.oid == remote => k.at = Instant::now(),
-                _ => {
-                    st.remove(key);
-                }
-            }
-            return Ok(Fetched::Unchanged);
-        }
+        // One fetch both reads the ref and tells whether it changed: a v2 host
+        // filters its advertisement to this ref, where `ls-remote` followed by
+        // `fetch` cost two calls (and the whole advertisement on a v0 host).
         let full = format!("{NS}{key}");
-        let out = self.fetch(&[format!("+{full}:{full}")], false)?;
+        let out = self.fetch_one(key)?;
         if !out.success {
-            // The ref may have vanished between ls-remote and fetch; only the
-            // exact full refname decides (patterns tail-match).
+            // The fetch fails for an absent ref and for a real error alike;
+            // only the exact full refname decides (patterns tail-match).
             return match self.remote_ref(key)? {
                 None => {
                     st.remove(key);
@@ -1073,6 +1478,17 @@ impl Bucket for GitBucket {
         };
         if ty != "commit" {
             return Err(corrupt("ref does not point at a commit"));
+        }
+        if cached_tag == Some(oid.as_str()) {
+            // Refresh only a cache entry for this very value; an entry for an
+            // older value would otherwise look fresh. A cold hit stays uncached.
+            match st.get_mut(key) {
+                Some(k) if k.oid == oid => k.at = Instant::now(),
+                _ => {
+                    st.remove(key);
+                }
+            }
+            return Ok(Fetched::Unchanged);
         }
         self.finish_read(&mut st, key, &oid, cached_tag)
     }
@@ -2373,5 +2789,402 @@ mod tests {
             }
         }
         assert_eq!(leases, N, "one lease per ref");
+    }
+
+    /// Shell snippet for a shim that logs the git subcommand of every call.
+    #[cfg(unix)]
+    fn count_snippet(log: &Path) -> String {
+        format!(
+            "s=; k=0; for x in \"$@\"; do if [ $k = 1 ]; then k=0; continue; fi; if [ \"$x\" = -c ]; then k=1; continue; fi; s=$x; break; done; echo \"$s\" >> {}",
+            log.display()
+        )
+    }
+
+    /// Network subcommands logged by [`count_snippet`], in order.
+    #[cfg(unix)]
+    fn network_calls(log: &Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| matches!(*l, "fetch" | "ls-remote" | "push"))
+            .map(String::from)
+            .collect()
+    }
+
+    /// Wait for `pid` to be gone (a zombie awaiting its reaper counts as gone).
+    #[cfg(unix)]
+    fn wait_gone(pid: u32) {
+        for _ in 0..80 {
+            let out = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if stat.is_empty() || stat.starts_with('Z') {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("process {pid} survived");
+    }
+
+    #[cfg(unix)]
+    fn kill_pid(pid: u32) {
+        let _ = Command::new("kill")
+            .args(["-s", "KILL", &pid.to_string()])
+            .status();
+    }
+
+    /// The error text of a read that must fail.
+    fn get_err(b: &GitBucket, key: &str) -> String {
+        match b.get(key, None) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("reading {key:?} must fail"),
+        }
+    }
+
+    /// Plant a value commit holding one incompressible chunk of `n` bytes.
+    fn plant_big(hubdir: &Path, key: &str, n: usize) {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let data: Vec<u8> = (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect();
+        let f = hubdir.join("big.bin");
+        std::fs::write(&f, &data).unwrap();
+        let blob = git(hubdir, &["hash-object", "-w", f.to_str().unwrap()], "");
+        std::fs::remove_file(&f).unwrap();
+        let tree = git(hubdir, &["mktree"], &format!("100644 blob {blob}\tc0000\n"));
+        let c = git(hubdir, &["commit-tree", &tree, "-m", "planted"], "");
+        git(hubdir, &["update-ref", &format!("refs/sc/{key}"), &c], "");
+    }
+
+    /// A mutable-key read is one `git fetch`, and the host's reply lists that
+    /// ref alone: protocol v2 sends `ref-prefix`, so the branch and the other
+    /// keys on the host never cross the wire (they used to, in a separate
+    /// `ls-remote`).
+    #[cfg(unix)]
+    #[test]
+    fn a_manifest_read_is_one_fetch_with_a_filtered_advertisement() {
+        need_git!();
+        let t = Tmp::new("filtered");
+        let (hubdir, url) = hub(&t);
+        let w = open(&url);
+        let m = w.put_if_tag("manifest", b"v1", None).unwrap().unwrap();
+        w.put_new("log/1", b"entry").unwrap();
+        w.put_new("other", b"o").unwrap();
+        let oid = git(&hubdir, &["rev-parse", "refs/sc/other"], "");
+        git(&hubdir, &["update-ref", "refs/heads/main", &oid], "");
+
+        let (calls, trace) = (t.0.join("calls.log"), t.0.join("trace.log"));
+        // GIT_TRACE_PACKET is stripped from the environment `run` passes, so
+        // the shim sets it itself.
+        let sh = shim(
+            &t,
+            "trace.sh",
+            &format!(
+                "{}\nexport GIT_TRACE_PACKET={}",
+                count_snippet(&calls),
+                trace.display()
+            ),
+        );
+        let r = open_git(&url, &sh);
+        let Fetched::New { bytes, tag } = r.get("manifest", None).unwrap() else {
+            panic!("cold read")
+        };
+        assert_eq!((bytes.as_slice(), tag.as_str()), (&b"v1"[..], m.as_str()));
+        assert_eq!(network_calls(&calls), ["fetch"], "one call, no ls-remote");
+
+        let text = std::fs::read_to_string(&trace).unwrap();
+        assert!(
+            text.contains("ref-prefix refs/sc/manifest"),
+            "the fetch must ask for the ref by prefix"
+        );
+        let advertised: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("upload-pack>") && l.contains(" refs/"))
+            .filter_map(|l| l.split_whitespace().last())
+            .collect();
+        assert_eq!(
+            advertised,
+            ["refs/sc/manifest"],
+            "reply must be filtered: {text}"
+        );
+
+        // A poll after the freshness window is again one call, and unchanged.
+        std::thread::sleep(FRESH + Duration::from_millis(200));
+        assert!(matches!(
+            r.get("manifest", Some(&m)).unwrap(),
+            Fetched::Unchanged
+        ));
+        assert_eq!(network_calls(&calls), ["fetch", "fetch"]);
+    }
+
+    /// Git resolves a refspec source that is absent by its abbreviation rules,
+    /// so a branch, tag or remote-tracking ref spelled `refs/sc/<key>` after its
+    /// own prefix would stand in for the key. The exact-name reads of v1 never
+    /// allowed that; the single-key fetch still must not.
+    #[test]
+    fn abbreviated_ref_names_never_stand_in_for_an_absent_key() {
+        need_git!();
+        let t = Tmp::new("abbrev");
+        let (hubdir, url) = hub(&t);
+        plant(&hubdir, "decoy-src", false, &[("100644", "blob", "c0000")]);
+        let c = git(&hubdir, &["rev-parse", "refs/sc/decoy-src"], "");
+        let decoys = [
+            "refs/refs/sc/manifest",
+            "refs/tags/refs/sc/manifest",
+            "refs/heads/refs/sc/manifest",
+            "refs/remotes/refs/sc/manifest",
+            "refs/remotes/refs/sc/manifest/HEAD",
+        ];
+        for decoy in decoys {
+            git(&hubdir, &["update-ref", decoy, &c], "");
+            let r = open(&url);
+            assert!(
+                matches!(r.get("manifest", None).unwrap(), Fetched::Absent),
+                "{decoy} stood in for the manifest"
+            );
+            assert!(!r.exists("manifest").unwrap());
+            git(&hubdir, &["update-ref", "-d", decoy], "");
+        }
+        // With every decoy present, the real key is the one read. (A push to a
+        // name some other ref abbreviates to is ambiguous, so the key goes in first.)
+        assert!(open(&url)
+            .put_if_tag("manifest", b"real", None)
+            .unwrap()
+            .is_some());
+        for decoy in &decoys[..4] {
+            git(&hubdir, &["update-ref", decoy, &c], "");
+        }
+        let Fetched::New { bytes, .. } = open(&url).get("manifest", None).unwrap() else {
+            panic!()
+        };
+        assert_eq!(bytes, b"real");
+    }
+
+    /// A value over its budget is discarded whether the watchdog catches it in
+    /// flight or only after git exited between two polls (`poll` fixed longer
+    /// than the whole fetch), in serve mode (the group is killed) and in CLI
+    /// mode (git alone), and the same instance keeps reading good keys. A git
+    /// killed in flight cannot release its `shallow.lock`; the next read must
+    /// not trip on it. After a CLI-mode kill a surviving `index-pack` may still
+    /// finish its own file, so only the other cases assert an empty pack dir.
+    #[test]
+    fn an_oversized_value_is_discarded_and_the_instance_keeps_working() {
+        need_git!();
+        let t = Tmp::new("oversize");
+        let (hubdir, url) = hub(&t);
+        assert!(open(&url).put_new("good", b"fine").unwrap());
+        plant_big(&hubdir, "manifest", 3 << 20);
+        let late = Some(Duration::from_millis(400));
+        for (group, poll) in [(true, None), (true, late), (false, None), (false, late)] {
+            let mut b = GitBucket::open_full(&url, "git".into(), CHUNK, None, group).unwrap();
+            b.tune.budget = Some(256 << 10);
+            b.tune.poll = poll;
+            let started = Instant::now();
+            let e = get_err(&b, "manifest");
+            assert!(
+                e.contains("262144 bytes") && e.contains("manifest"),
+                "the error must name the cap: {e}"
+            );
+            if poll.is_some() {
+                assert!(
+                    started.elapsed() >= Duration::from_millis(400),
+                    "final check path"
+                );
+            }
+            if group || poll.is_some() {
+                assert!(
+                    dir_files(&b.cache.join("objects").join("pack")).is_empty(),
+                    "the download must be removed"
+                );
+            }
+            assert!(b.local_refs(NS).unwrap().is_empty(), "no ref may survive");
+            let Fetched::New { bytes, .. } = b.get("good", None).unwrap() else {
+                panic!("the instance must still read other keys")
+            };
+            assert_eq!(bytes, b"fine");
+            // the hostile key is refused again, not cached as absent or known
+            assert!(b.get("manifest", None).is_err());
+        }
+    }
+
+    /// The fetch is killed in flight, with every descendant, and leaves nothing:
+    /// the shim stands in for a git that keeps growing `tmp_pack_*` and has a
+    /// helper process (as `ssh` or `git-remote-https` would).
+    #[cfg(unix)]
+    #[test]
+    fn a_runaway_fetch_is_killed_with_its_descendants() {
+        need_git!();
+        let t = Tmp::new("runaway");
+        let (_, url) = hub(&t);
+        let pids = t.0.join("pids");
+        // Like a git killed mid-fetch, it holds locks it can never release.
+        let body = format!(
+            "case \" $* \" in *\" fetch \"*) sleep 600 & echo $! > {}; touch \"$GIT_DIR/shallow.lock\"; mkdir -p \"$GIT_DIR/refs/sc\"; touch \"$GIT_DIR/refs/sc/manifest.lock\"; while :; do head -c 65536 /dev/zero >> \"$GIT_DIR/objects/pack/tmp_pack_x\"; sleep 0.01; done;; esac",
+            pids.display()
+        );
+        let sh = shim(&t, "runaway.sh", &body);
+        let parent = t.0.join("scratch");
+        let mut b = GitBucket::open_full(&url, sh, CHUNK, Some(&parent), true).unwrap();
+        assert!(b.cache.starts_with(&parent));
+        b.tune.budget = Some(1 << 20);
+        let started = Instant::now();
+        let e = get_err(&b, "manifest");
+        assert!(e.contains("1048576 bytes"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(20));
+        let helper: u32 = std::fs::read_to_string(&pids)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        wait_gone(helper);
+        let tmp_pack = b.cache.join("objects").join("pack").join("tmp_pack_x");
+        assert!(!tmp_pack.exists(), "partial download must be removed");
+        for lock in ["shallow.lock", "refs/sc/manifest.lock"] {
+            assert!(!b.cache.join(lock).exists(), "{lock} must be removed");
+        }
+        // The loop that wrote it died too: nothing comes back.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!tmp_pack.exists(), "the fetch kept running");
+    }
+
+    /// No growth and no exit for `idle` is a stuck host. Both modes return
+    /// promptly; in serve mode the group dies with it.
+    #[cfg(unix)]
+    #[test]
+    fn a_silent_fetch_hits_the_no_progress_deadline() {
+        need_git!();
+        for group in [false, true] {
+            let t = Tmp::new("silent");
+            let (_, url) = hub(&t);
+            let pids = t.0.join("pids");
+            let body = format!(
+                "case \" $* \" in *\" fetch \"*) sleep 600 & echo $! > {}; wait;; esac",
+                pids.display()
+            );
+            let sh = shim(&t, "silent.sh", &body);
+            let mut b = GitBucket::open_full(&url, sh, CHUNK, None, group).unwrap();
+            b.tune.idle = Duration::from_millis(800);
+            let started = Instant::now();
+            let e = get_err(&b, "manifest");
+            let took = started.elapsed();
+            let helper: u32 = std::fs::read_to_string(&pids)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert!(e.contains("no progress"), "{e}");
+            assert!(took >= Duration::from_millis(800), "{took:?}");
+            assert!(
+                took < Duration::from_secs(10),
+                "a descendant holding the pipes must not park the call: {took:?}"
+            );
+            if group {
+                wait_gone(helper);
+            } else {
+                // Only the child was killed: the orphan still holds the pipes,
+                // which is exactly what must not block the caller.
+                kill_pid(helper);
+                wait_gone(helper);
+            }
+        }
+    }
+
+    /// A git that exits cleanly while a helper keeps its pipes open is an error
+    /// within `idle`, not a hang.
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_holding_the_pipes_after_exit_is_an_error() {
+        need_git!();
+        let t = Tmp::new("held");
+        let (_, url) = hub(&t);
+        let pids = t.0.join("pids");
+        let body = format!(
+            "case \" $* \" in *\" fetch \"*) sleep 600 & echo $! > {}; exit 0;; esac",
+            pids.display()
+        );
+        let sh = shim(&t, "held.sh", &body);
+        let mut b = open_git(&url, &sh);
+        b.tune.idle = Duration::from_millis(800);
+        let started = Instant::now();
+        let e = get_err(&b, "manifest");
+        assert!(e.contains("left its"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let helper: u32 = std::fs::read_to_string(&pids)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        kill_pid(helper);
+        wait_gone(helper);
+    }
+
+    /// Serve mode (own cache parent, own process group) is the same store.
+    #[cfg(unix)]
+    #[test]
+    fn a_served_bucket_passes_the_contract_and_cleans_up() {
+        need_git!();
+        let t = Tmp::new("served");
+        let (_, url) = hub(&t);
+        let parent = t.0.join("home").join(".sc").join("tmp");
+        let b = GitBucket::open_in(&url, &parent).unwrap();
+        let cache = b.cache.clone();
+        assert_eq!(cache.parent(), Some(parent.as_path()));
+        contract_suite(&b);
+        drop(b);
+        assert!(!cache.exists());
+        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 0);
+    }
+
+    /// The startup sweep removes only what a dead process left. A live foreign
+    /// process (another `sc serve --stdio` on the same home), this process, an
+    /// unparsable name and unrelated entries stay.
+    #[cfg(unix)]
+    #[test]
+    fn reap_stale_removes_only_caches_of_dead_processes() {
+        need_git!();
+        let t = Tmp::new("reap");
+        let (_, url) = hub(&t);
+        let parent = t.0.join("tmp");
+        std::fs::create_dir_all(&parent).unwrap();
+        let mk = |name: &str| {
+            let p = parent.join(name);
+            std::fs::create_dir_all(p.join("objects")).unwrap();
+            p
+        };
+        let mut gone = Command::new("true").spawn().unwrap();
+        let dead = gone.id();
+        gone.wait().unwrap();
+        let mut live = Command::new("sleep").arg("30").spawn().unwrap();
+        let stale = mk(&format!("{CACHE_PREFIX}{dead}-aaaa"));
+        let foreign = mk(&format!("{CACHE_PREFIX}{}-bbbb", live.id()));
+        let junk = mk(&format!("{CACHE_PREFIX}notapid-cccc"));
+        let other = mk("serve-bucket-1-0");
+        // two live buckets of this process, and a symlink named like a stale cache
+        let (a, b) = (
+            GitBucket::open_in(&url, &parent).unwrap(),
+            GitBucket::open_in(&url, &parent).unwrap(),
+        );
+        let link = parent.join(format!("{CACHE_PREFIX}{dead}-link"));
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+
+        assert_eq!(GitBucket::reap_stale(&parent), 1);
+        assert!(!stale.exists());
+        for kept in [&foreign, &junk, &other, &link, &a.cache, &b.cache] {
+            assert!(kept.exists(), "{kept:?} must survive");
+        }
+        assert!(a.put_new("k", b"v").unwrap() && b.exists("k").unwrap());
+        live.kill().unwrap();
+        live.wait().unwrap();
+        // once its owner is dead the foreign cache goes too
+        assert_eq!(GitBucket::reap_stale(&parent), 1);
+        assert!(!foreign.exists());
+        assert_eq!(GitBucket::reap_stale(&parent.join("missing")), 0);
     }
 }
