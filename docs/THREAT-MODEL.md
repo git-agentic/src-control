@@ -718,6 +718,58 @@ too, not just the src-control-side metadata.
   the `MAX_OBJECT_SIZE` guards, so this costs bandwidth and CPU, not memory
   beyond one pack body.
 
+## Git-carried bucket remotes (`sc+git::`) — ADR-0060
+
+The bucket model above applies unchanged, with the Git repository as the bucket and
+`refs/sc/*` as its keys. What differs:
+
+- **The writer set is wider than S3.** Everyone with push access to the Git repository
+  (collaborators, deploy keys, CI tokens) holds bucket put **and** delete, with no object
+  versioning to recover from. A writer can rewind `refs/sc/manifest` to a pre-revoke
+  manifest, delete keys or add packs. Branch protection and rulesets do not cover
+  `refs/sc/*` (sc-forge applies none to it either). Rewind is the same tracked follow-on as
+  for any bucket (a fetch-time freshness attestation, ROADMAP P34 follow-on 6, and
+  ADR-0059 follow-on 2); `sc+git::` makes it reachable by more people.
+- **Metadata exposure.** Anyone who can read the repository can list `refs/sc/*` (`git
+  ls-remote`) and fetch it by exact refspec; a default `git clone`/`git fetch` does not. They
+  see public content as plaintext in the packs, and for private branches the branch name,
+  recipient ids, sealed-object counts and sizes and the public fork point (ADR-0044's accepted
+  leak, now to every reader of a Git host). Protected-path and secret ciphertext stays
+  ciphertext. Because that exposure is wider, pushing a private branch needs the per-remote
+  opt-in `--allow-private-branches`, enforced in `repo` before any upload; protected paths and
+  secrets need none.
+- **Deleting a ref is not erasure.** A host can keep the objects fetchable by id (sc-forge does,
+  until its gc prune stage), and forks, mirrors and clones keep their own copies. A deleted
+  private-branch ciphertext or a pre-rewrap value should be treated as published; the cutover
+  is rotation (`sc rewrap --rotate`), as everywhere.
+- **Transport allowlist and process hygiene.** The inner URL is `https://`, `http://`, `ssh://`,
+  `file:///abs`, scp-form or an absolute path. `git://`, relative paths, `::` transport helpers,
+  a leading `-`, control characters and a password in the URL are refused, and every git call
+  carries `-c protocol.allow=never` plus `always` for `file`, `ssh`, `http` and `https`, so a
+  hostile URL or redirect cannot reach `ext::` or `fd::`. The environment is scrubbed of
+  `GIT_DIR`-family and config-injection variables, hooks and signing are off, stdin is closed and
+  prompts are disabled. `http` stays allowed because plaintext is the user's choice, as in git.
+  Errors carry git's captured stderr with URL userinfo redacted and control bytes escaped, so a
+  hostile hook message cannot drive the terminal.
+- **A hostile host is bounded.** A value is capped at 2 GiB and a chunk at 32 MiB, a tree at 10,000
+  chunks, captured `ls-remote` output at 64 MiB; fetches are shallow so a hostile commit's parents
+  are never downloaded; a fetched value must be a parentless commit over contiguous regular chunk
+  blobs or it is refused as corrupt. The WAL's own 256 MiB metadata cap and pack bounds still
+  apply. A host can still serve large values (disk in the temp cache, RAM in `get`), the same
+  class as S3.
+- **Rejections are classified by re-reading the ref**, not by the host's wording, so a hook or
+  permission refusal is never reported as a lost race. The atomic CAS relies on the host checking
+  the sent old value under its ref lock: stock `git receive-pack` and sc-forge do (verified);
+  another host that does not cannot carry the store safely.
+- **Not built in v1.** `sc remote compact` is refused (committer time is writer-controlled, so it
+  cannot be an age source) and so is `sc serve --store sc+git::` (a daemon cannot answer prompts
+  and would bypass the client-side private-branch opt-in).
+- **Local cache.** A temporary bare repository `sc-git-bucket-<pid>-<random>` (mode 0700) holds
+  fetched store objects and is removed on exit; a killed process (SIGKILL, or SIGINT) can leave it
+  behind, and there is no reaper.
+- Not tested against real GitHub. The "not independently audited, do not commit production
+  secrets" warning at the top of this document applies unchanged.
+
 ## By-id object reads (`GetObjects`, `sc cat`) — ADR-0047
 
 - **A hash is not a capability.** Anyone who can reach a served repo and

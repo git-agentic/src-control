@@ -47,7 +47,11 @@ yourself reaching for it elsewhere, add a function to `crypto` instead.
 **rustls/rcgen must stay quarantined in `tlsio`** — if you find yourself
 reaching for TLS elsewhere, add a function to `tlsio` instead. **Object-store
 SDKs must stay quarantined in `objio`** — if you find yourself reaching for
-S3 elsewhere, add a function to `objio` instead. **`repo` must not depend on
+S3 elsewhere, add a function to `objio` instead. **`objio` also holds the
+`sc+git::` backend (P39), which may spawn the system `git` binary (never `gix`);
+the system `git` binary is spawned only by `gitio::bridge` and objio's git
+backend** (`repo` must not depend on `gitio`, and `repo` picks the bucket
+backend). **`repo` must not depend on
 `gitio`** — `cli` links both and passes imported snapshots down; `repo` stays
 Git-agnostic. **`forge` (the `sc-forge` Git forge, P38, unix-only) is a third top-level adapter
 and may link only `{crypto, core}`** — never `repo`, `vfs` or `gitio` (hosted
@@ -110,7 +114,7 @@ the project tree if desired.
 
 ## Capability map (what's built, by phase)
 
-All 36 phases, P37a, P37b-i, P37b-ii, P37c, P37d and P38 are built and tested. One line of current fact per phase; the
+All 36 phases, P37a, P37b-i, P37b-ii, P37c, P37d, P38 and P39 are built and tested. One line of current fact per phase; the
 authoritative rationale and full semantics live in the linked ADR, the design
 in `ARCHITECTURE.md`. The old per-phase narrative log this table replaced is
 archived verbatim at `docs/archive/claude-md-phase-log-2026-07.md` — do not
@@ -160,6 +164,7 @@ the code, those win.
 | P37c | Merge, cherry-pick and rebase on a partial clone: a tree-recursive engine (`merge_trees`) carries a subtree by id when the sides agree and no protection rule applies, reads only where they differ or a rule intersects, and on a lazy, online clone fills what it asks for by id outside the store lock (a non-lazy clone gets the gap error with `sc backfill <path>`); a carried protected subtree keeps the complete input wrap union; a conflict inside the view is marked and resolved like on a full clone (`sc conflicts`/`sc resolve`/`merge --abort`/`sc commit`; the out-of-view part is grafted from the decided root), while a conflict outside the view, or a result that must be sealed outside it, is refused before any ref, merge-state or working-tree change (fetched objects stay). A subtree identical on all three sides is carried even under a protection rule. Cherry-pick and rebase use the same engine (`replay_commit`): the fold's accumulator may hold absent subtrees, the view is filled before the final write, and a stopped pick or rebase keeps its carried subtrees in the decided root. Mode-only edits now merge and a file/directory collision fails before any write, on full clones too. | [0049](docs/adr/0049-merge-on-partial-clones.md) |
 | P37d | Agent sessions on a partial clone: `sc ws fork`/`run`/`harvest`/`abandon` and `sc work` work; a workspace or agent sees the host's sparse view only (`sc work` no longer gets a complete tree there), the view closure is filled (lazy, online) or refused with the gap error before anything is written, a workspace commit grafts the out-of-view subtrees from the base without reading them, and harvest lands through the ADR-0049 merge (any conflict falls back to a `work-<i>` branch as on a full clone) | [0050](docs/adr/0050-sessions-on-partial-clones.md) |
 | P38 | Gitea-compatible forge over bare Git and smart HTTP: recorded API subset, scoped auth, protected merges, maintenance and container operations; 24 recorded scenarios and six first-consumer acceptance scenarios pass. Hosted repos have none of the `.sc/` features; SSH and Actions remain outside v1. | [0058](docs/adr/0058-sc-forge-gitea-compatible-git-forge.md) |
+| P39 | `sc+git::<git-url>` remotes: the bucket WAL stored as one parentless commit per key at `refs/sc/<key>` in any Git repository (system `git` via `objio::GitBucket`, lease CAS, no `+` refspec), so private branches, protected paths and secrets travel through a Git host (local bare repo, sc-forge; GitHub untested); private-branch push needs per-remote `--allow-private-branches`; `remote compact` and `serve --store` refuse it in v1; sc-forge accepts `refs/sc/` | [0060](docs/adr/0060-git-carried-bucket-remotes.md) |
 
 ## Standing boundaries & gotchas
 
@@ -216,6 +221,24 @@ transport-adjacent. The rest, imperatively:
 - **Bucket remotes hold public content plaintext at rest** — bucket ACL is
   the perimeter (sealed content stays ciphertext, unchanged); partial-clone
   `filter` against bucket remotes is refused.
+- **`sc+git::<git-url>` (P39, ADR-0060) stores the bucket WAL as `refs/sc/*` in a
+  Git repository.** The prefix `sc+git:` is reserved: only `sc+git::<inner>`
+  parses (inner: `https://`, `http://`, `ssh://`, `file:///abs`, scp-form or an
+  absolute path; no password in the URL, no `git://`, no `::`), `--git` is an
+  error on it and it never reaches the P18 bridge. Pushing a private branch needs
+  the per-remote opt-in `--allow-private-branches` (`remote add`/`clone`;
+  enforced in `repo`, refuses before any upload); protected paths and secrets
+  need none. `sc remote compact` and `sc serve --store` refuse it (deferred: no
+  trustworthy pack age, no prompts in a daemon). Every git call goes through
+  `objio::GitBucket` with a scrubbed environment; CAS is `--force-with-lease`,
+  never a `+` refspec, and a rejected push is classified by re-reading the ref.
+  **Everyone with push to the Git repository holds bucket put and delete** (no
+  versioning; wider than S3), branch protection does not cover `refs/sc/*`, and
+  rewind stays the tracked follow-on. **Deleting a ref is not erasure** (hosts
+  and forks may keep objects by id). Public content is plaintext, and private
+  branch names, recipient ids and sizes are readable by every reader of the
+  repository. A killed process can leave `sc-git-bucket-<pid>-<random>` in the
+  temp dir. Not tested against real GitHub.
 - **`DirBucket` (`sc+wal://<dir>`) is a single-host, single-owner backend (#264).**
   Its CAS takes an OS advisory file lock (`File::lock`: `flock` on unix,
   `LockFileEx` on Windows) on `<root>/.cas-lock`, a file that is never removed and

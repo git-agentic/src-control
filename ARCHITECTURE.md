@@ -35,7 +35,7 @@ composability held across every phase since. **All three long-term-thesis pillar
 now ship** — in-RAM worktrees (P1), committed secrets (P2), and per-file
 permissions (P7, encrypted paths; per-branch in P34) — atop a full collaborative
 VCS: three-way merge and history editing, packfiles + GC, ssh:// / sc+http(s):// /
-bucket (sc+wal://, sc+s3://) / Git network transports, sparse and partial clone
+bucket (sc+wal://, sc+s3://, sc+git::) / Git network transports, sparse and partial clone
 (with lazy fetch, merge and agent sessions on a partial clone), signed commits,
 intent-deep provenance via sealed agent-session transcripts, and a read-only
 native desktop browser. The phase-by-phase build log is in
@@ -82,8 +82,9 @@ src-control/
 │   │             v2 dual-key identities (scl-crypto; the only crate linking RustCrypto)
 │   ├── tlsio/    rustls/rcgen wrappers for sc+https:// (P32); a leaf, the only crate
 │   │             linking rustls
-│   ├── objio/    `Bucket` trait + directory and S3 backends for sc+wal:// / sc+s3:// (P36);
-│   │             a leaf, the only crate linking the S3 SDK
+│   ├── objio/    `Bucket` trait + directory, S3 and Git backends for sc+wal:// / sc+s3:// /
+│   │             sc+git:: (P36, P39); a leaf, the only crate linking the S3 SDK; its Git
+│   │             backend spawns the system `git` (never gix)
 │   ├── repo/     durable .sc/ repo: refs/branches/working tree, three-way merge, history
 │   │             editing (cherry-pick/rebase/amend/undo), remotes + wire transport (ssh://,
 │   │             sc+http(s)://, bucket WAL), protection + secret lifecycle, GC, sparse &
@@ -220,7 +221,8 @@ lazily-built bare `mirror.git` beside the marks map is the transport). All of it
 keeps `gix` quarantined in `gitio`. This is distinct from sc's **own** network
 transport: `repo` speaks a framed wire protocol over ssh:// (P12), sc+http://
 (P26) and sc+https:// (P32) that mirrors its `Transport` trait, and treats a
-bucket as a remote (P36) — no `gix` involved (see the appendix).
+bucket as a remote (P36), which P39 can store inside a Git repository (`sc+git::`,
+through the system `git` binary, not `gix`) — no `gix` involved (see the appendix).
 
 ## Cryptography and key management
 
@@ -1344,3 +1346,39 @@ out-of-view subtrees from the base without reading them; and harvest lands
 through the ADR-0049 merge, with any conflict falling back to a `work-<i>`
 branch as on a full clone. `sc backfill --all` remains the way to a genuine full
 clone. See ADR-0050.
+
+## Phase 39 — Git-carried bucket remotes: sc+git:: (built)
+
+The bucket WAL (P36) stored inside any Git repository, so a Git host can carry
+private branches, protected paths and secrets that the Git bridge cannot.
+`sc+git::<git-url>` opens `objio::GitBucket` behind the same `Bucket` trait, so
+`BucketTransport`, the log, the manifest and every format stay unchanged: no wire
+change, no `PROTOCOL_VERSION` bump, no new crypto. Key `K` is the ref `refs/sc/K`;
+its value is a parentless commit whose tree holds the bytes as chunk blobs
+`c0000`, `c0001`, ... (at most 32 MiB each, 2 GiB per value), and the commit id is
+the CAS tag. A default `git clone` or `git fetch` never takes `refs/sc/*`, and the
+P18 bridge touches only `refs/heads/*`, so one repository can hold the sc store and
+a plain Git mirror of the public branches.
+
+`put_new` and `put_if_tag` push with `--force-with-lease` (an empty lease for
+create-only), never a `+` refspec, so `receive-pack` checks the sent old value under
+its ref lock and exactly one racer wins. A rejected push is classified by re-reading
+the exact ref, so a hook refusal is an error and never a lost race. Reads keep a 2 s
+freshness window for a tag the instance itself saw or wrote, serve create-only values
+from the local cache, and fetch the `log/`, `checkpoints/` and `packs/*.idx` families
+in one shallow `git fetch`, which bounds a cold clone's round trips independent of log
+length. Git is the system binary (`SC_GIT` overrides) with a scrubbed environment, a
+transport allowlist (`https`, `http`, `ssh`, `file`), a URL allowlist and no password
+in the URL; a private bare repo in `sc-git-bucket-<pid>-<random>` caches fetched
+objects and is removed on `Drop`.
+
+A private branch goes to an `sc+git::` remote only under the per-remote opt-in
+`--allow-private-branches`, since its name, recipient ids and sizes become readable by
+every reader of the repository and the ciphertext cannot be taken back. `sc remote
+compact` (no trustworthy age for a stored pack) and `sc serve --store` (a daemon cannot
+answer prompts, and it would bypass the opt-in) refuse an `sc+git::` store in v1.
+sc-forge accepts exactly the `refs/sc/` prefix (ADR-0058 addendum). The dependency rule
+is amended: `objio` may spawn the system `git`, and only `gitio::bridge` and objio's
+git backend spawn it; `gix` stays in `gitio`. Proven by `crates/cli/tests/git_bucket.rs`,
+the forge end-to-end tests and `demo/run_git_carrier_demo.sh`. Not tested against real
+GitHub. See ADR-0060.
