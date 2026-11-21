@@ -1,11 +1,15 @@
-//! Object-storage access for sc bucket remotes (P36).
+//! Object-storage access for sc bucket remotes (P36, P39).
 //!
 //! Quarantine rule: object-store SDKs live here and only here — the rest of
 //! the workspace sees the [`Bucket`] trait. Leaf crate: depends on no other
-//! workspace crate (like `tlsio`).
+//! workspace crate (like `tlsio`). The git backend ([`GitBucket`], the
+//! `sc+git::` carrier) spawns the system `git` binary (`SC_GIT` overrides it);
+//! it does not use `gix`, which stays quarantined in `gitio`.
 
 mod dir;
 pub use dir::DirBucket;
+mod git;
+pub use git::GitBucket;
 mod s3;
 pub use s3::S3Bucket;
 
