@@ -164,7 +164,7 @@ the code, those win.
 | P37c | Merge, cherry-pick and rebase on a partial clone: a tree-recursive engine (`merge_trees`) carries a subtree by id when the sides agree and no protection rule applies, reads only where they differ or a rule intersects, and on a lazy, online clone fills what it asks for by id outside the store lock (a non-lazy clone gets the gap error with `sc backfill <path>`); a carried protected subtree keeps the complete input wrap union; a conflict inside the view is marked and resolved like on a full clone (`sc conflicts`/`sc resolve`/`merge --abort`/`sc commit`; the out-of-view part is grafted from the decided root), while a conflict outside the view, or a result that must be sealed outside it, is refused before any ref, merge-state or working-tree change (fetched objects stay). A subtree identical on all three sides is carried even under a protection rule. Cherry-pick and rebase use the same engine (`replay_commit`): the fold's accumulator may hold absent subtrees, the view is filled before the final write, and a stopped pick or rebase keeps its carried subtrees in the decided root. Mode-only edits now merge and a file/directory collision fails before any write, on full clones too. | [0049](docs/adr/0049-merge-on-partial-clones.md) |
 | P37d | Agent sessions on a partial clone: `sc ws fork`/`run`/`harvest`/`abandon` and `sc work` work; a workspace or agent sees the host's sparse view only (`sc work` no longer gets a complete tree there), the view closure is filled (lazy, online) or refused with the gap error before anything is written, a workspace commit grafts the out-of-view subtrees from the base without reading them, and harvest lands through the ADR-0049 merge (any conflict falls back to a `work-<i>` branch as on a full clone) | [0050](docs/adr/0050-sessions-on-partial-clones.md) |
 | P38 | Gitea-compatible forge over bare Git and smart HTTP: recorded API subset, scoped auth, protected merges, maintenance and container operations; 24 recorded scenarios and six first-consumer acceptance scenarios pass. Hosted repos have none of the `.sc/` features; SSH and Actions remain outside v1. | [0058](docs/adr/0058-sc-forge-gitea-compatible-git-forge.md) |
-| P39 | `sc+git::<git-url>` remotes: the bucket WAL stored as one parentless commit per key at `refs/sc/<key>` in any Git repository (system `git` via `objio::GitBucket`, lease CAS, no `+` refspec), so private branches, protected paths and secrets travel through a Git host (local bare repo, sc-forge; GitHub untested); private-branch push needs per-remote `--allow-private-branches`; `remote compact` and `serve --store` refuse it in v1; sc-forge accepts `refs/sc/` | [0060](docs/adr/0060-git-carried-bucket-remotes.md) |
+| P39 | `sc+git::<git-url>` remotes: the bucket WAL stored as one parentless commit per key at `refs/sc/<key>` in any Git repository (system `git` via `objio::GitBucket`, lease CAS, no `+` refspec), so private branches, protected paths and secrets travel through a Git host (local bare repo, sc-forge; GitHub untested); private-branch push needs per-remote `--allow-private-branches`; `remote compact` works on it (first-sighting age record, leased deletes; ADR-0057 addendum) while `serve --store` refuses it in v1; sc-forge accepts `refs/sc/` | [0060](docs/adr/0060-git-carried-bucket-remotes.md) |
 
 ## Standing boundaries & gotchas
 
@@ -228,8 +228,15 @@ transport-adjacent. The rest, imperatively:
   error on it and it never reaches the P18 bridge. Pushing a private branch needs
   the per-remote opt-in `--allow-private-branches` (`remote add`/`clone`;
   enforced in `repo`, refuses before any upload); protected paths and secrets
-  need none. `sc remote compact` and `sc serve --store` refuse it (deferred: no
-  trustworthy pack age, no prompts in a daemon). Every git call goes through
+  need none. `sc serve --store` refuses it (deferred: no prompts in a daemon).
+  `sc remote compact` works on it with its own age source (a Git host has no
+  trustworthy object age): a first-sighting record at
+  `refs/sc/compact/sightings` (`<secs> <oid> <key>`, generation-aware, strict
+  decode: a bad record blocks the run, a time over five minutes ahead of the
+  compactor's clock is refused), leased deletes (`Bucket::delete_leased`), and
+  an uncached manifest read before every destructive batch. The first run
+  deletes nothing it did not already see (zero grace: a first sighting is
+  immediately old); run it from one host (clocks). Every git call goes through
   `objio::GitBucket` with a scrubbed environment; CAS is `--force-with-lease`,
   never a `+` refspec, and a rejected push is classified by re-reading the ref.
   **Everyone with push to the Git repository holds bucket put and delete** (no
@@ -255,7 +262,9 @@ transport-adjacent. The rest, imperatively:
   not hold. It advances the manifest only through the normal CAS (one no-op
   entry plus a checkpoint) and never deletes what the current chain names. Keep `--prune-expire` well above any push's duration (default
   24h): a writer stalled longer than that between uploading a pack and its
-  commit can still lose the pack (the leases follow-on closes it).
+  commit can still lose the pack (the leases follow-on closes it). On an
+  `sc+git::` remote the manifest is read uncached before every delete batch
+  (every backend) and every pusher holds delete.
   `--dry-run` writes and deletes nothing but still downloads and decodes every
   candidate pack, so on S3 its download egress and read requests match a real run (the uploads,
   CAS and deletes it skips are the rest).

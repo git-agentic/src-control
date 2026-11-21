@@ -4,7 +4,8 @@
 - **Date:** 2026-11-21
 - **Phase:** 39
 - **Builds on:** ADR-0046 (bucket WAL remotes), ADR-0044 (private branches),
-  ADR-0058 (sc-forge, addendum for `refs/sc/*`)
+  ADR-0058 (sc-forge, addendum for `refs/sc/*`), ADR-0057 (compaction; its
+  addendum lifts the v1 compaction refusal)
 - **Amends:** ADR-0020 (dependency rule: `objio` may spawn the system `git`
   binary), ADR-0044 (reason 4 for rejecting opaque sealed refs through the Git
   bridge, reversed only under a per-remote opt-in)
@@ -86,6 +87,10 @@ So a hook or permission refusal never looks like a lost race, which
 `BucketTransport` would report as a non-fast-forward and the user would retry
 forever. A tag that is not a full nonzero hex object id returns `None`. Delete
 pushes `:refs/sc/K` and treats an already absent ref as success.
+`delete_leased` (used by compaction) pushes `:refs/sc/K` with
+`--force-with-lease=refs/sc/K:<oid>` for every key of a chunk, never `+` and
+never `--atomic`: a key re-created since the caller's listing holds another oid
+and survives; a key still at its lease after a refused push is an error.
 
 ### Reads: freshness, create-only caching, family batching
 
@@ -95,8 +100,12 @@ under the temp directory (mode 0700), removed on `Drop`.
 - A `get` whose cached tag equals the tag this instance observed or wrote for
   that key less than 2 s ago returns `Unchanged` with no network call.
   `BucketTransport::has_object` refreshes per object, which would otherwise cost
-  one `ls-remote` each. Staleness is bounded and only causes a failed server-side
-  CAS or a redundant upload.
+  one `ls-remote` each. For a pusher, staleness is bounded by the window and
+  normally costs a failed server-side CAS or a redundant upload. It is not
+  harmless for a delete: a view up to 2 s old can miss a push that has just
+  named a pack, so compaction never trusts it. It reads the manifest with no
+  cache (`get("manifest", None)`) and compares tags before every destructive
+  batch (ADR-0057 addendum).
 - A key is create-only by its layout alone: `log/`, `checkpoints/`, or a `.pack`
   or `.idx` under `packs/`. Never by anything the writer controls, such as a
   commit message. This instance serves such a key from the local cache with no
@@ -181,13 +190,34 @@ path to durably publishing embargo ciphertext on a public host, does apply, and
 is why it is gated and why the notice and the refusal message say what stays
 behind.
 
+### Compaction
+
+`sc remote compact` works on an `sc+git::` remote (ADR-0057 addendum has the
+algorithm; v1 refused it). A Git repository gives the compactor no trustworthy
+age for a stored pack: committer time is writer-controlled and predates
+publication. So on a carrier the compactor keeps its own record of when it first
+saw each pack and checkpoint (`refs/sc/compact/sightings`: `<first_seen> <oid>
+<key>` per line, generation-aware by oid), sizes packs from their idx instead of
+downloading them (`list_meta` still downloads every value and compaction never
+calls it here), deletes with leases (`delete_leased`), and reads the manifest
+with no cache before every destructive batch. The first run after an object
+appears never deletes it (with a zero grace, `--allow-short-grace`, a first
+sighting is immediately old). Consequences to know:
+
+- Run compaction from one host. Runs that share the record need clocks within
+  far less than the grace window; a first-seen time more than five minutes ahead
+  of the compactor's clock is refused.
+- Every pusher holds delete, unlike the ADR-0057 advice to withhold it: on a Git
+  host a push to `refs/sc/*` is a push. The record adds no authority (anyone who
+  can write it can already delete the store); it can only make something
+  unreferenced look older, never a live object deletable.
+- A push that stalls longer than the grace window between uploading a pack and
+  committing it can lose the pack, as on any backend; byte-identical reuse of an
+  aged orphan pack at the moment its delete lands remains a narrowed race.
+- Deleting a ref is not erasure (see Consequences). Untested on GitHub.
+
 ### Deferred in v1
 
-- `sc remote compact` on an `sc+git::` remote is refused. A Git repository gives
-  the compactor no trustworthy age for a stored pack: committer time is
-  writer-controlled and predates publication, so it cannot drive pruning.
-  `list_meta` exists for the trait contract and reports the observation time as
-  `modified`.
 - `sc serve --store sc+git::...` is refused. A daemon cannot answer ssh or
   credential prompts, and it would sit between clients and the client-side
   private-branch gate.
@@ -231,9 +261,9 @@ every transport path.
   follow-ons (ROADMAP: P34 follow-on 6, a fetch-time freshness attestation;
   ADR-0059 follow-on 2).
 - **Deleting a ref is not erasure.** A host may keep the objects fetchable by
-  id, forks and mirrors keep their own copies, and compaction (when it exists
-  for Git) only unreferences values. Sealed content stays ciphertext, so
-  rotation is the cutover (`sc rewrap --rotate`), as for any transport.
+  id, forks and mirrors keep their own copies, and compaction only unreferences
+  values. Sealed content stays ciphertext, so rotation is the cutover
+  (`sc rewrap --rotate`), as for any transport.
 - **Public content is plaintext in packs** on the host, as on any bucket remote.
 - **Sealed metadata is readable by every reader of the repository:** private
   branch names, recipient ids, sealed-object counts and sizes, and the public
@@ -242,7 +272,7 @@ every transport path.
 - A killed process (SIGKILL, or SIGINT, which skips `Drop`) can leave
   `sc-git-bucket-<pid>-<random>` behind in the temp directory. It holds fetched
   store objects. There is no reaper. A normal exit and an error returned to `main` remove it.
-- v1 scaling limit: every `ls-remote` and push downloads the whole ref advertisement (the pattern given to `ls-remote` filters on the client; a packet trace showed the server sends every ref, protocol v2 `ref-prefix` or not), and a cold read fetches every `log/` and `checkpoints/` entry. With compaction refused, refs grow by at least three per push (a log entry, a pack and its idx), so a long-lived store gets slower to open until compaction or a ref-filtering host exists.
+- Scaling: every `ls-remote` and push downloads the whole ref advertisement (the pattern given to `ls-remote` filters on the client; a packet trace showed the server sends every ref, protocol v2 `ref-prefix` or not), and a cold read fetches every `log/` and `checkpoints/` entry behind the last checkpoint. Refs grow by at least three per push (a log entry, a pack and its idx); `sc remote compact` (above) is what bounds that, folding the small packs and deleting what nothing names, so a long-lived store should be compacted on a schedule. Between runs the advertisement still grows with the pushes since the last one, until a ref-filtering host exists.
 - Each cold read or push costs git round trips. The freshness window and family
   batching bound them, but a Git host is slower than S3. If push over `sc+git::`
   stays slow on large histories, the next step is a batched `has_objects`.
@@ -272,7 +302,9 @@ every transport path.
 
 `crates/objio/src/git.rs` (`GitBucket`, the contract suite and race tests);
 `crates/repo/src/bucket_transport.rs` (`BucketScheme::Git`, `is_bucket_url`,
-`check_private_push_allowed`, `refuse_git_store`, `refuse_git_compact`);
+`check_private_push_allowed`, `refuse_git_store`);
+`crates/repo/src/bucket_transport/compact/` (the age record and the carrier
+sweep, ADR-0057 addendum);
 `crates/repo/src/remote.rs` (`allow_private_branches`); `crates/cli` (flags,
 notice, URL routing); `crates/forge/src/policy.rs` (`refs/sc/`). Tests:
 `crates/objio/src/git.rs`, `crates/repo/src/bucket_transport/git_remote_tests.rs`,
