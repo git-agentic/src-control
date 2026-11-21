@@ -456,17 +456,21 @@ fn remove_stale_locks(dir: &Path, depth: u32) {
     }
 }
 
-/// Whether a watched git's process group may be signalled. While the leader is
-/// unreaped its pid pins the group id, so the signal can only reach our own
-/// group. Once the leader is reaped, an empty group's id is free to be reused by
-/// an unrelated process group of the same user, so signal it only while a pipe
-/// reader is still waiting: an open pipe has a live process holding its write
-/// end, which is the evidence that the group still has a member. With both
-/// pipes closed there is no such evidence, and the caller only settles and
-/// discards. (A helper that left the group and still holds a pipe would fool
-/// this; it has to have changed its own process group to do so.)
-fn may_signal_group(leader_reaped: bool, a_pipe_is_open: bool) -> bool {
-    !leader_reaped || a_pipe_is_open
+/// Whether a watched git's process group may be signalled: only while the leader
+/// is unreaped. Its pid pins the group id then, so the signal can only reach our
+/// own group. Once the leader is reaped, the group's id is free to be reused by
+/// an unrelated process group of the same user, and nothing observable can show
+/// it has not been: an open pipe proves a live member only at the instant it is
+/// looked at, and the external `kill` runs later. Holding the pid without
+/// reaping it needs `waitid(WNOWAIT)`, which is `unsafe`, so after the reap the
+/// group is never signalled, whatever the pipes say.
+///
+/// The cost: a helper that outlives git's exit (a smart-HTTP v0/v1 helper chain,
+/// an ssh `ControlPersist` master, a hostile process) is not killed and can keep
+/// writing after the download was discarded, until it exits. The watchdog then
+/// only settles for a bounded time and discards what the fetch added.
+fn may_signal_group(leader_reaped: bool) -> bool {
+    !leader_reaped
 }
 
 /// Signal every process of group `pgid` with SIGKILL through the system `kill`.
@@ -953,14 +957,14 @@ impl GitBucket {
         })
     }
 
-    /// The one end of every breach. Stop git (its whole group in serve mode),
-    /// reap it, then keep watching until the pipes have closed and the pack
-    /// directory has stopped changing, or a short settle deadline passes (a
-    /// helper outside the group, in CLI mode, may still be writing), and only
-    /// then discard what the fetch added. Discarding first would let a surviving
-    /// helper write into the directory after it was cleaned. `reaped` says whether
-    /// the leader was already reaped; it decides whether the group may be
-    /// signalled ([`may_signal_group`]).
+    /// The one end of every breach. Stop git (its whole group in serve mode, but
+    /// only while the leader is unreaped: [`may_signal_group`]), reap it, then
+    /// keep watching until the pipes have closed and the pack directory has
+    /// stopped changing, or a short settle deadline passes, and only then discard
+    /// what the fetch added. Discarding first would let a surviving helper write
+    /// into the directory after it was cleaned. `reaped` says whether the leader
+    /// was already reaped when the breach was found. A helper that outlives that
+    /// reap is not killed and may write again after the discard.
     fn terminate_and_discard(
         &self,
         child: &mut Child,
@@ -969,8 +973,7 @@ impl GitBucket {
         before: &HashMap<OsString, u64>,
         reaped: bool,
     ) {
-        let a_pipe_is_open = readers.wait(Instant::now()).is_err();
-        self.stop(child, may_signal_group(reaped, a_pipe_is_open));
+        self.stop(child, may_signal_group(reaped));
         let _ = child.wait();
         let settle = Instant::now() + self.tune.idle.min(SETTLE);
         let mut last = dir_bytes(pack_dir);
@@ -3335,9 +3338,9 @@ mod tests {
     }
 
     /// A git that exits cleanly while a helper keeps its pipes open is an error
-    /// within `idle`, not a hang. In serve mode the helper is still in git's
-    /// process group, and the group is stopped before the error returns, so it
-    /// does not outlive the call; in CLI mode only git was ever its to kill.
+    /// within `idle`, not a hang, and what the fetch added is discarded. git is
+    /// already reaped, so the group is not signalled in either mode: the helper
+    /// outlives the call (the test kills it), which is the documented cost.
     #[cfg(unix)]
     #[test]
     fn a_helper_holding_the_pipes_after_exit_is_an_error() {
@@ -3367,21 +3370,20 @@ mod tests {
                 .trim()
                 .parse()
                 .unwrap();
-            if !group {
-                kill_pid(helper);
-            }
+            kill_pid(helper);
             wait_gone(helper);
         }
     }
 
     /// git exits cleanly with its download over budget while a helper is still
-    /// alive (here holding the pipes): the final check must stop the helper
-    /// (serve mode) and discard the download, like every other breach. `poll`
-    /// is fixed longer than the shim runs, so git has already exited at the
-    /// second look.
+    /// alive (here holding the pipes): the download is discarded like for every
+    /// other breach, but the group is not signalled, because git is already
+    /// reaped and its id could have been reused. The helper survives (and is
+    /// killed here by the test). `poll` is fixed longer than the shim runs, so
+    /// git has already exited at the second look.
     #[cfg(unix)]
     #[test]
-    fn a_clean_exit_over_budget_still_stops_a_helper_and_discards() {
+    fn a_clean_exit_over_budget_discards_but_leaves_the_helper_alone() {
         need_git!();
         for group in [true, false] {
             let t = Tmp::new("finalover");
@@ -3404,18 +3406,19 @@ mod tests {
                 dir_files(&b.cache.join("objects").join("pack")).is_empty(),
                 "the over-budget download must be discarded"
             );
-            // The leader was reaped but a helper held the pipes: that is the
-            // evidence the group is alive, so serve mode signals it, once.
-            let signals = std::fs::read_to_string(&killed).unwrap_or_default();
-            assert_eq!(signals.lines().count(), usize::from(group), "{signals:?}");
+            assert!(!killed.exists(), "no group signal after the leader's reap");
             let helper: u32 = std::fs::read_to_string(&pids)
                 .unwrap()
                 .trim()
                 .parse()
                 .unwrap();
-            if !group {
-                kill_pid(helper);
-            }
+            let alive = Command::new("ps")
+                .args(["-o", "stat=", "-p", &helper.to_string()])
+                .output()
+                .unwrap();
+            let stat = String::from_utf8_lossy(&alive.stdout).trim().to_string();
+            assert!(!stat.is_empty() && !stat.starts_with('Z'), "stat {stat:?}");
+            kill_pid(helper);
             wait_gone(helper);
         }
     }
@@ -3433,44 +3436,60 @@ mod tests {
         (Box::leak(sh.into_boxed_str()), log)
     }
 
-    /// Once git is reaped and both pipes are closed there is no evidence the
-    /// process group still has a member, so it must not be signalled: its id may
-    /// have been reused. The fetch is over budget here and is still discarded.
+    /// Once git is reaped the group is never signalled, whether a pipe is still
+    /// open (a helper holds it) or both are closed: its id may have been reused,
+    /// and an open pipe proves nothing by the time the external `kill` runs. The
+    /// fetch is over budget in both cases and is still discarded.
     #[cfg(unix)]
     #[test]
-    fn a_reaped_leader_with_both_pipes_closed_gets_no_group_signal() {
+    fn a_reaped_leader_gets_no_group_signal_even_with_a_pipe_open() {
         need_git!();
-        let t = Tmp::new("nosignal");
-        let (_, url) = hub(&t);
-        // No helper: the shim writes too much late, then exits, closing the pipes.
-        let body = "case \" $* \" in *\" fetch \"*) sleep 1; head -c 2000000 /dev/zero > \"$GIT_DIR/objects/pack/pack-fake.pack\"; exit 0;; esac";
-        let sh = shim(&t, "nosignal.sh", body);
-        let mut b = GitBucket::open_full(&url, sh, CHUNK, None, true).unwrap();
-        let (kill, killed) = recording_kill(&t);
-        b.tune.kill = kill;
-        b.tune.budget = Some(64 << 10);
-        // git has exited at the second look, so the breach comes after the reap.
-        b.tune.poll = Some(Duration::from_secs(3));
-        let e = get_err(&b, "manifest");
-        assert!(e.contains("65536 bytes"), "{e}");
-        assert!(
-            dir_files(&b.cache.join("objects").join("pack")).is_empty(),
-            "the over-budget download must be discarded"
-        );
-        assert!(!killed.exists(), "no group signal without a live member");
+        for helper_holds_pipes in [true, false] {
+            let t = Tmp::new("nosignal");
+            let (_, url) = hub(&t);
+            let pids = t.0.join("pids");
+            let helper = if helper_holds_pipes {
+                format!("sleep 600 & echo $! > {};", pids.display())
+            } else {
+                String::new()
+            };
+            // The shim writes too much late, then exits; with a helper the pipes stay open.
+            let body = format!(
+                "case \" $* \" in *\" fetch \"*) sleep 1; head -c 2000000 /dev/zero > \"$GIT_DIR/objects/pack/pack-fake.pack\"; {helper} exit 0;; esac"
+            );
+            let sh = shim(&t, "nosignal.sh", &body);
+            let mut b = GitBucket::open_full(&url, sh, CHUNK, None, true).unwrap();
+            let (kill, killed) = recording_kill(&t);
+            b.tune.kill = kill;
+            b.tune.budget = Some(64 << 10);
+            b.tune.idle = Duration::from_secs(3);
+            // git has exited at the second look, so the breach comes after the reap.
+            b.tune.poll = Some(Duration::from_secs(3));
+            let e = get_err(&b, "manifest");
+            assert!(e.contains("65536 bytes"), "{e}");
+            assert!(
+                dir_files(&b.cache.join("objects").join("pack")).is_empty(),
+                "the over-budget download must be discarded"
+            );
+            assert!(!killed.exists(), "no group signal after the reap");
+            if helper_holds_pipes {
+                let pid: u32 = std::fs::read_to_string(&pids)
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                kill_pid(pid);
+                wait_gone(pid);
+            }
+        }
     }
 
-    /// The signalling decision: free while the leader's pid pins the group id,
-    /// afterwards only with an open pipe as evidence of a live member.
+    /// The signalling decision: only while the leader is unreaped, when its pid
+    /// pins the group id. After the reap, never.
     #[test]
-    fn the_group_is_signalled_only_when_its_id_is_pinned_or_a_member_is_proven() {
-        assert!(
-            may_signal_group(false, false),
-            "unreaped leader pins the id"
-        );
-        assert!(may_signal_group(false, true));
-        assert!(may_signal_group(true, true), "an open pipe proves a member");
-        assert!(!may_signal_group(true, false), "reaped and nothing proven");
+    fn the_group_is_signalled_only_while_the_leader_is_unreaped() {
+        assert!(may_signal_group(false), "an unreaped leader pins the id");
+        assert!(!may_signal_group(true), "a reaped leader pins nothing");
     }
 
     /// A helper that outlives git can cross the budget after git has exited and
