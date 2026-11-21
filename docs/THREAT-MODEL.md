@@ -754,13 +754,14 @@ The bucket model above applies unchanged, with the Git repository as the bucket 
   prompts are disabled. `http` stays allowed because plaintext is the user's choice, as in git.
   Errors carry git's captured stderr with URL userinfo redacted and control bytes escaped, so a
   hostile hook message cannot drive the terminal.
-- **A hostile host is bounded.** A pack value is capped at 2 GiB, any other value at 256 MiB
-  (checked before reading), and a chunk at 32 MiB, a tree at 10,000
+- **A hostile host is bounded on read, not on download.** A pack value is capped at 2 GiB, any other value at 256 MiB
+  (checked before reading into memory), and a chunk at 32 MiB, a tree at 10,000
   chunks, captured `ls-remote` output at 64 MiB; fetches are shallow so a hostile commit's parents
   are never downloaded; a fetched value must be a parentless commit over contiguous regular chunk
   blobs or it is refused as corrupt. The WAL's own 256 MiB metadata cap and pack bounds still
-  apply. A host can still serve large values (disk in the temp cache, RAM in `get`), the same
-  class as S3.
+  apply. `git fetch` has no input-size limit, so a hostile host or repository writer can still
+  make a fetch write an oversized value into the temp cache before the caps refuse it (disk, not
+  RAM; the cache is removed afterwards), the same class as an unbounded S3 `get`.
 - **Rejections are classified by re-reading the ref**, not by the host's wording, so a hook or
   permission refusal is never reported as a lost race. The atomic CAS relies on the host checking
   the sent old value under its ref lock: stock `git receive-pack` and sc-forge do (verified);
