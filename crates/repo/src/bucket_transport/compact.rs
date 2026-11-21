@@ -123,15 +123,17 @@ fn total(sizes: impl IntoIterator<Item = u64>) -> u64 {
 
 /// Bytes of these packs' objects whose key ends with `suffix` (`.idx` or
 /// `.pack`); a pack in `declared` (a Git carrier, which lists no sizes) counts
-/// its declared body length under `.pack` and nothing under `.idx`.
+/// its declared body length under `.pack`, only when its `.pack` key is listed
+/// (a lone `.idx` deletes no body), and nothing under `.idx`.
 fn pack_bytes(
     packs: &[(&String, &Vec<ObjectMeta>)],
     declared: &BTreeMap<String, u64>,
     suffix: &str,
 ) -> u64 {
     total(packs.iter().map(|(h, ms)| {
+        let has_body = || ms.iter().any(|m| m.key.ends_with(".pack"));
         match declared.get(*h) {
-            Some(d) if suffix == ".pack" => *d,
+            Some(d) if suffix == ".pack" && has_body() => *d,
             Some(_) => 0,
             None => total(
                 ms.iter()

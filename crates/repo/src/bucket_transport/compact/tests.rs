@@ -1051,3 +1051,23 @@ fn candidates_that_are_each_large_once_decoded_are_not_merged_one_by_one() {
 }
 
 mod git;
+
+/// A Git carrier lists no sizes, so a pack's body is charged at its idx's
+/// declared length, but only when the `.pack` key itself is listed: a lone
+/// aged `.idx` (its body already gone) deletes no body bytes.
+#[test]
+fn declared_body_bytes_count_only_when_the_pack_key_is_listed() {
+    let meta = |key: &str| ObjectMeta {
+        key: key.into(),
+        size: 0,
+        modified: SystemTime::UNIX_EPOCH,
+    };
+    let (lone, whole) = ("aa".to_string(), "bb".to_string());
+    let lone_ms = vec![meta("packs/aa.idx")];
+    let whole_ms = vec![meta("packs/bb.idx"), meta("packs/bb.pack")];
+    let declared: BTreeMap<String, u64> = [(lone.clone(), 700), (whole.clone(), 50)].into();
+    let packs = [(&lone, &lone_ms), (&whole, &whole_ms)];
+    assert_eq!(pack_bytes(&packs, &declared, ".pack"), 50);
+    assert_eq!(pack_bytes(&packs, &declared, ".idx"), 0);
+    assert_eq!(pack_bytes(&packs[..1], &declared, ".pack"), 0);
+}
