@@ -250,7 +250,7 @@ fn serve_store_sc_git_gates_private_branches_until_the_operator_opts_in() {
     ok(sc(&a, &["commit", "-m", "embargoed", "--identity", idp]));
     let e = err_text(&sc(&a, &["push", "origin"]));
     assert!(e.contains("--allow-private-branches"), "{e}");
-    assert!(e.contains("Nothing was uploaded"), "{e}");
+    assert!(e.contains("No private-branch object was uploaded"), "{e}");
     assert_eq!(
         refs_on_carrier(&hub),
         public_refs,
@@ -279,11 +279,13 @@ fn serve_store_sc_git_gates_private_branches_until_the_operator_opts_in() {
 }
 
 /// A starting `sc serve --store sc+git::` removes the Git caches a killed
-/// earlier server left in the serve home, and only those whose owner is gone:
-/// another server on the same home may be live. Unix only, like the sweep.
+/// earlier server left in the serve home, and only those nobody holds: another
+/// server on the same home may be live, and liveness is the owner lock, not a
+/// pid (the test process holds one lock, in a directory named for a dead pid).
+/// Unix only, like the sweep.
 #[cfg(unix)]
 #[test]
-fn serve_start_reaps_caches_of_dead_servers_only() {
+fn serve_start_reaps_caches_nobody_holds() {
     let root = tmp("serve-reap");
     let home = root.join("home");
     init_repo(&home);
@@ -292,12 +294,25 @@ fn serve_start_reaps_caches_of_dead_servers_only() {
     let mut gone = Command::new("true").spawn().unwrap();
     let dead = gone.id();
     gone.wait().unwrap();
-    let mut live = Command::new("sleep").arg("60").spawn().unwrap();
-    let stale = scratch.join(format!("sc-git-bucket-{dead}-aaaa"));
-    let foreign = scratch.join(format!("sc-git-bucket-{}-bbbb", live.id()));
-    for d in [&stale, &foreign] {
+    // A killed server's cache: the lock file is there, nobody holds it. Its pid
+    // is that of the running test, which no pid check could tell from a live one.
+    let stale = scratch.join(format!("sc-git-bucket-{}-aaaa", std::process::id()));
+    // A live server's cache: the lock is held (by this process, from the point
+    // of view of the `sc serve` that sweeps), whatever its pid looks like.
+    let live = scratch.join(format!("sc-git-bucket-{dead}-bbbb"));
+    // Not a cache this sweep can judge: no lock file.
+    let unlocked = scratch.join(format!("sc-git-bucket-{dead}-cccc"));
+    for d in [&stale, &live, &unlocked] {
         std::fs::create_dir_all(d.join("objects")).unwrap();
     }
+    for d in [&stale, &live] {
+        std::fs::write(d.join(".owner.lock"), b"").unwrap();
+    }
+    let held = std::fs::OpenOptions::new()
+        .write(true)
+        .open(live.join(".owner.lock"))
+        .unwrap();
+    held.lock().unwrap();
     // No stdin: the session ends at once, after the startup sweep.
     let out = Command::new(env!("CARGO_BIN_EXE_sc"))
         .args([
@@ -311,10 +326,10 @@ fn serve_start_reaps_caches_of_dead_servers_only() {
         .output()
         .unwrap();
     let _ = out;
-    live.kill().unwrap();
-    live.wait().unwrap();
     assert!(!stale.exists(), "the dead server's cache must be reaped");
-    assert!(foreign.exists(), "a live server's cache must stay");
+    assert!(live.exists(), "a cache whose lock is held must stay");
+    assert!(unlocked.exists(), "a directory with no lock file must stay");
+    drop(held);
     std::fs::remove_dir_all(&root).unwrap();
 }
 

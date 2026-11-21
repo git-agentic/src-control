@@ -1519,8 +1519,6 @@ fn refs_sc_create_cas_update_fetch_and_delete_round_trip_through_the_real_receiv
     }
 }
 
-/// One receive-pack request by hand (`old` and `new` are what the client believes), so the
-/// server's own compare-and-swap is exercised: the real client checks the advertisement first.
 /// How `sc+git::` reads one mutable key (`GitBucket::get`, ADR-0060): a single
 /// `git fetch` of exactly `refs/sc/<key>` under protocol v2. The host must answer
 /// the ref listing with that ref alone: the branch and the other keys never cross
@@ -1555,9 +1553,13 @@ fn a_v2_fetch_of_one_sc_ref_gets_a_filtered_advertisement() {
             "--end-of-options",
             &url,
             &format!("+{m}:{m}"),
-            // what `GitBucket` adds so abbreviations cannot stand in for the key
+            // The five spellings `GitBucket` excludes so that a branch, tag or
+            // remote-tracking ref cannot stand in for the key (`exact_only` in objio).
             &format!("^refs/{m}"),
+            &format!("^refs/tags/{m}"),
             &format!("^refs/heads/{m}"),
+            &format!("^refs/remotes/{m}"),
+            &format!("^refs/remotes/{m}/HEAD"),
         ],
     );
     assert!(ok, "fetch: {text}");
@@ -1577,6 +1579,8 @@ fn a_v2_fetch_of_one_sc_ref_gets_a_filtered_advertisement() {
     assert_eq!(listed, [m], "the host must not list other refs: {text}");
 }
 
+/// One receive-pack request by hand (`old` and `new` are what the client believes), so the
+/// server's own compare-and-swap is exercised: the real client checks the advertisement first.
 fn raw_update(s: &Srv, auth: &str, old: &str, new: &str, refname: &str) -> String {
     let pkt = |t: &str| format!("{:04x}{t}", t.len() + 4);
     let mut body = pkt(&format!(

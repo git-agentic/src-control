@@ -1143,9 +1143,11 @@ fn open_bucket_serve_transport(
 
 /// Remove Git cache directories a killed `sc serve --store sc+git::…` process
 /// left under the serve home's `.sc/tmp/`, and return how many were removed. Call
-/// once at startup. Only a directory whose owner process is provably gone is
-/// removed: many `sc serve --stdio` processes can share one home, and a live
-/// session's cache must survive. Unix only; elsewhere it removes nothing.
+/// once at startup. Only a directory whose owner lock is free is removed: many
+/// `sc serve --stdio` processes can share one home, and a live session's cache,
+/// whose bucket holds the lock, must survive. Liveness is that advisory file
+/// lock on one host (unreliable over NFS and similar, as for `DirBucket`), not a
+/// pid. Unix only; elsewhere it removes nothing.
 pub fn reap_stale_serve_scratch(home: &std::path::Path) -> usize {
     scl_objio::GitBucket::reap_stale(&crate::layout::Layout::at(home).tmp_dir())
 }

@@ -237,7 +237,7 @@ fn finish(client: Client, srv: Server) {
 fn assert_refused(e: &Error) {
     let m = e.to_string();
     assert!(m.contains("--allow-private-branches"), "{m}");
-    assert!(m.contains("Nothing was uploaded"), "{m}");
+    assert!(m.contains("No private-branch object was uploaded"), "{m}");
 }
 
 fn allowing() -> WirePolicy {

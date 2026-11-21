@@ -352,14 +352,16 @@ impl BucketTransport {
     }
 
     /// The refusal for private-branch objects on a gated `sc+git::` store. The
-    /// text names the server-side flag; it never shows the store URL.
+    /// text names the server-side flag; it never shows the store URL. It does
+    /// not claim that the whole push uploaded nothing: public objects of the same
+    /// push may already sit on the host as an orphan pack.
     fn sealed_refusal() -> Error {
         Error::InvalidArgument(
             "this server stores into a Git repository (sc+git::) and was not started with \
              --allow-private-branches, so it refuses private-branch objects: a Git host shows \
              the branch name, recipient ids and sizes to everyone who can read the repository \
-             and keeps the ciphertext after any later revoke. Nothing was uploaded. The \
-             operator can restart `sc serve` with --allow-private-branches"
+             and keeps the ciphertext after any later revoke. No private-branch object was \
+             uploaded. The operator can restart `sc serve` with --allow-private-branches"
                 .into(),
         )
     }

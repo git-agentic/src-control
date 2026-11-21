@@ -68,12 +68,14 @@ const FAMILY_BUDGET: u64 = MAX_VALUE;
 /// fetch send `ref-prefix`, so the host filters its ref advertisement down to
 /// what is asked for; `fetch.unpackLimit=1` keeps every incoming object in one
 /// `objects/pack/tmp_pack_*` file (never loose objects), which is what the
-/// fetch watchdog measures; `fetch.uriProtocols=` stops a host from redirecting
-/// the download to packfile URIs the watchdog could not see.
+/// fetch watchdog measures; `fetch.uriProtocols=` and `transfer.bundleURI=false`
+/// stop a host from redirecting the download to packfile or bundle URLs the
+/// watchdog could not see.
 const GIT_CONFIG: &[&str] = &[
     "protocol.version=2",
     "fetch.unpackLimit=1",
     "fetch.uriProtocols=",
+    "transfer.bundleURI=false",
     "protocol.allow=never",
     "protocol.file.allow=always",
     "protocol.ssh.allow=always",
@@ -217,6 +219,10 @@ struct Tuning {
     /// Fixed polling interval; `None` polls after 2 ms and backs off to 50 ms
     /// (tests fix it to make a fetch finish between two polls).
     poll: Option<Duration>,
+    /// The program that signals a process group in serve mode (tests point it
+    /// at a missing one).
+    #[cfg(unix)]
+    kill: &'static str,
 }
 
 impl Default for Tuning {
@@ -225,6 +231,8 @@ impl Default for Tuning {
             budget: None,
             idle: IDLE,
             poll: None,
+            #[cfg(unix)]
+            kill: "kill",
         }
     }
 }
@@ -246,6 +254,10 @@ pub struct GitBucket {
     chunk: usize,
     state: Mutex<HashMap<String, Known>>,
     tune: Tuning,
+    /// Serve mode: the lock on `<cache>/.owner.lock`, held for the bucket's whole
+    /// life. It is how [`GitBucket::reap_stale`] tells a live cache from one a
+    /// killed process left behind (the OS drops the lock with its holder).
+    owner: Option<std::fs::File>,
     /// Serve mode: every fetch leads its own process group, so the watchdog
     /// can kill `ssh` and `git-remote-*` along with git. Off for the CLI, where
     /// the terminal's Ctrl-C must still reach git and ssh must still be able to
@@ -395,12 +407,46 @@ fn remove_stale_locks(dir: &Path, depth: u32) {
             Ok(t) if t.is_dir() && depth < 8 && e.file_name() != "objects" => {
                 remove_stale_locks(&path, depth + 1);
             }
-            Ok(t) if t.is_file() && path.extension().is_some_and(|x| x == "lock") => {
+            Ok(t)
+                if t.is_file()
+                    && e.file_name() != OWNER_LOCK
+                    && path.extension().is_some_and(|x| x == "lock") =>
+            {
                 let _ = std::fs::remove_file(&path);
             }
             _ => {}
         }
     }
+}
+
+/// Signal every process of group `pgid` with SIGKILL through the system `kill`.
+/// False only when that program cannot be run; a non-zero exit (the group is
+/// already gone) is fine.
+#[cfg(unix)]
+fn kill_group(program: &str, pgid: u32) -> bool {
+    Command::new(program)
+        .args(["-s", "KILL", "--"])
+        .arg(format!("-{pgid}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
+/// Set once a missing `kill` has been reported.
+#[cfg(unix)]
+static KILL_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Print `msg` to stderr unless `flag` says it was already printed; true when it
+/// printed.
+#[cfg(unix)]
+fn warn_once(flag: &std::sync::atomic::AtomicBool, msg: &str) -> bool {
+    let first = !flag.swap(true, std::sync::atomic::Ordering::Relaxed);
+    if first {
+        eprintln!("{msg}");
+    }
+    first
 }
 
 /// Read up to `cap` bytes from `r` and discard the rest, so the writer never
@@ -568,8 +614,10 @@ impl GitBucket {
     /// cache directory is made under `parent` (the serve home's `.sc/tmp/`, created
     /// if missing) instead of the system temp directory, and every fetch
     /// leads its own process group so the watchdog, when it kills one, takes `ssh` or
-    /// `git-remote-https` with it. A killed server can leave the cache behind;
-    /// [`GitBucket::reap_stale`] removes such leftovers at the next start.
+    /// `git-remote-https` with it (which needs a `kill` program on the PATH). The
+    /// bucket holds a lock on `<cache>/.owner.lock` until it is dropped. A killed
+    /// server can leave the cache behind; [`GitBucket::reap_stale`] removes such
+    /// leftovers at the next start.
     pub fn open_in(url: &str, parent: &Path) -> Result<GitBucket> {
         let git = std::env::var("SC_GIT").unwrap_or_else(|_| "git".to_string());
         Self::open_full(url, git, CHUNK, Some(parent), true)
@@ -589,12 +637,13 @@ impl GitBucket {
         Self::validate_url(url)?;
         #[cfg(not(unix))]
         let _ = group; // process groups are unix-only; the watchdog kills the child alone
-        let cache = match parent {
+        let (cache, owner) = match parent {
             Some(p) => {
                 std::fs::create_dir_all(p)?;
-                new_cache_dir_in(p)?
+                let (cache, owner) = new_owned_cache_dir_in(p)?;
+                (cache, Some(owner))
             }
-            None => new_cache_dir_in(&std::env::temp_dir())?,
+            None => (new_cache_dir_in(&std::env::temp_dir())?, None),
         };
         let b = GitBucket {
             url: url.to_string(),
@@ -603,6 +652,7 @@ impl GitBucket {
             chunk: chunk.max(1),
             state: Mutex::new(HashMap::new()),
             tune: Tuning::default(),
+            owner,
             #[cfg(unix)]
             group,
         };
@@ -804,18 +854,13 @@ impl GitBucket {
             self.discard_download(&pack_dir, &before);
             return Err(over_budget(watch));
         }
-        let held = |what: &str| {
-            Error::Backend(format!(
-                "git exited but left its {what} open for {:?} (a helper outlived it)",
-                self.tune.idle
-            ))
-        };
-        let (stdout, over) = orx
-            .recv_timeout(self.tune.idle)
-            .map_err(|_| held("stdout"))?;
-        let stderr = erx
-            .recv_timeout(self.tune.idle)
-            .map_err(|_| held("stderr"))?;
+        // One deadline for both pipes. A helper that outlives git and holds one
+        // open is still in git's process group in serve mode, so the group is
+        // signalled before the error returns (the group is non-empty, so its id
+        // cannot have been reused).
+        let deadline = Instant::now() + self.tune.idle;
+        let (stdout, over) = self.receive(&mut child, &orx, deadline, "stdout")?;
+        let stderr = self.receive(&mut child, &erx, deadline, "stderr")?;
         if over {
             return Err(Error::Backend(format!(
                 "git output exceeded {max_out} bytes (hostile or corrupt remote)"
@@ -829,20 +874,45 @@ impl GitBucket {
         })
     }
 
+    /// Wait for a pipe reader's result until `deadline`. Past it, a helper that
+    /// outlived git holds the pipe: stop the group (serve mode) and fail.
+    fn receive<T>(
+        &self,
+        child: &mut Child,
+        rx: &mpsc::Receiver<T>,
+        deadline: Instant,
+        what: &str,
+    ) -> Result<T> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        rx.recv_timeout(left).map_err(|_| {
+            self.stop(child);
+            Error::Backend(format!(
+                "git exited but left its {what} open for {:?} (a helper outlived it)",
+                self.tune.idle
+            ))
+        })
+    }
+
     /// Kill a watched git. Called before the child is reaped, so its group id
-    /// cannot have been reused. In serve mode the child leads its own process
+    /// cannot have been reused (after a clean exit only [`Self::receive`] calls
+    /// it, and only while a helper still holds a pipe, so the group is not
+    /// empty). In serve mode the child leads its own process
     /// group and the whole group is signalled, so `ssh` and `git-remote-*`
-    /// die with it; the system `kill` keeps this std-only, with no `unsafe`.
+    /// die with it; the system `kill` keeps this std-only, with no `unsafe`, and
+    /// serve mode on unix therefore needs a `kill` on the PATH. Without one only
+    /// git itself is killed, and a warning says so once.
     fn stop(&self, child: &mut Child) {
         #[cfg(unix)]
-        if self.group {
-            let _ = Command::new("kill")
-                .args(["-s", "KILL", "--"])
-                .arg(format!("-{}", child.id()))
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+        if self.group && !kill_group(self.tune.kill, child.id()) {
+            warn_once(
+                &KILL_WARNED,
+                &format!(
+                    "sc: cannot run `{}` to stop a fetch's process group; only git itself is \
+                     killed, so ssh or git-remote-https may keep running (put a `kill` \
+                     program on the PATH)",
+                    self.tune.kill
+                ),
+            );
         }
         let _ = child.kill();
     }
@@ -967,7 +1037,9 @@ impl GitBucket {
     /// The download budget is [`FAMILY_BUDGET`]; a fetch of exactly one key
     /// goes through [`Self::fetch_one`] and gets that key's own, tighter one.
     fn fetch(&self, refspecs: &[String], family: bool) -> Result<Out> {
-        let what = "the 2 GiB budget of a family or batched fetch".to_string();
+        let what = "the 2 GiB budget of a family or batched fetch; a legitimate store whose \
+                    log, checkpoint or idx entries together exceed it needs compaction"
+            .to_string();
         self.fetch_watched(refspecs, family, FAMILY_BUDGET, what)
     }
 
@@ -1325,6 +1397,9 @@ impl GitBucket {
 
 impl Drop for GitBucket {
     fn drop(&mut self) {
+        // Release the lock first: an open file keeps a directory from being
+        // removed on Windows.
+        drop(self.owner.take());
         let _ = std::fs::remove_dir_all(&self.cache);
     }
 }
@@ -1332,33 +1407,43 @@ impl Drop for GitBucket {
 /// Prefix of every cache directory name: `sc-git-bucket-<pid>-<random>`.
 const CACHE_PREFIX: &str = "sc-git-bucket-";
 
+/// Name of the file whose lock marks a cache directory as owned by a live
+/// [`GitBucket::open_in`] bucket.
+const OWNER_LOCK: &str = ".owner.lock";
+
 impl GitBucket {
     /// Remove cache directories a killed process left under `parent`, and return
-    /// how many were removed. Only a `sc-git-bucket-<pid>-*` directory whose
-    /// owner process is provably gone is touched: several `sc serve --stdio`
-    /// processes can share one `parent`, and a live one's cache must survive.
-    /// A name that does not parse, this process's own directories, and a pid
-    /// that cannot be shown dead are all kept. Unix only; on other platforms it
-    /// removes nothing.
+    /// how many were removed. A `sc-git-bucket-*` directory is removed only when
+    /// its `.owner.lock` can be locked, which means no live bucket holds it: the
+    /// OS drops a lock with its holder, so liveness does not depend on pid
+    /// numbers (pid reuse, containers where every server is pid 1, several pid
+    /// namespaces on one host) or on any helper program. Several `sc serve
+    /// --stdio` processes can share one `parent`, and a live one's cache
+    /// survives. A directory with no lock file, a symlink, and any other name
+    /// are kept. The lock is an advisory file lock on one host: it is not
+    /// reliable over NFS and similar (as for `DirBucket`). Unix only; on other
+    /// platforms it removes nothing.
     pub fn reap_stale(parent: &Path) -> usize {
         #[cfg(unix)]
         {
             let mut removed = 0;
             for e in std::fs::read_dir(parent).into_iter().flatten().flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                let Some(rest) = name.strip_prefix(CACHE_PREFIX) else {
-                    continue;
-                };
-                let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
-                    continue;
-                };
                 // `file_type` does not follow a symlink, so only a real directory goes.
-                let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
-                if is_dir
-                    && pid != std::process::id()
-                    && pid_is_gone(pid)
-                    && std::fs::remove_dir_all(e.path()).is_ok()
+                if !e.file_name().to_string_lossy().starts_with(CACHE_PREFIX)
+                    || !e.file_type().is_ok_and(|t| t.is_dir())
                 {
+                    continue;
+                }
+                let lock = e.path().join(OWNER_LOCK);
+                if !std::fs::symlink_metadata(&lock).is_ok_and(|m| m.is_file()) {
+                    continue;
+                }
+                let Ok(held) = std::fs::OpenOptions::new().write(true).open(&lock) else {
+                    continue;
+                };
+                // Hold the lock through the removal: an owner that is just being
+                // created blocks on it, then sees its lock file gone and starts over.
+                if held.try_lock().is_ok() && std::fs::remove_dir_all(e.path()).is_ok() {
                     removed += 1;
                 }
             }
@@ -1372,20 +1457,33 @@ impl GitBucket {
     }
 }
 
-/// Is `pid` provably not running? `kill -0` says "No such process" for a pid
-/// that is gone; any other answer (alive, not permitted, unknown wording) is
-/// not proof, so the caller keeps what it owns.
-#[cfg(unix)]
-fn pid_is_gone(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .output()
-        .is_ok_and(|o| {
-            !o.status.success() && String::from_utf8_lossy(&o.stderr).contains("No such process")
-        })
+/// A fresh cache directory under `parent` with its owner lock taken. A sweep
+/// ([`GitBucket::reap_stale`]) that raced the creation either blocks the lock
+/// until it has removed the directory or removes it before the lock exists; both
+/// show as a missing lock file, and the next attempt starts over.
+fn new_owned_cache_dir_in(parent: &Path) -> Result<(PathBuf, std::fs::File)> {
+    for _ in 0..8 {
+        let dir = new_cache_dir_in(parent)?;
+        let lock = dir.join(OWNER_LOCK);
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+            .and_then(|f| f.lock().map(|()| f));
+        match held {
+            Ok(f) if std::fs::symlink_metadata(&lock).is_ok() => return Ok((dir, f)),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(e.into());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Err(Error::Backend(
+        "cannot create a locked cache directory".into(),
+    ))
 }
 
 /// Fresh private directory `sc-git-bucket-<pid>-<random>` (mode 0700) under `parent`.
@@ -3133,32 +3231,129 @@ mod tests {
     }
 
     /// A git that exits cleanly while a helper keeps its pipes open is an error
-    /// within `idle`, not a hang.
+    /// within `idle`, not a hang. In serve mode the helper is still in git's
+    /// process group, and the group is stopped before the error returns, so it
+    /// does not outlive the call; in CLI mode only git was ever its to kill.
     #[cfg(unix)]
     #[test]
     fn a_helper_holding_the_pipes_after_exit_is_an_error() {
         need_git!();
-        let t = Tmp::new("held");
+        for group in [true, false] {
+            let t = Tmp::new("held");
+            let (_, url) = hub(&t);
+            let pids = t.0.join("pids");
+            let body = format!(
+                "case \" $* \" in *\" fetch \"*) sleep 600 & echo $! > {}; exit 0;; esac",
+                pids.display()
+            );
+            let sh = shim(&t, "held.sh", &body);
+            let mut b = GitBucket::open_full(&url, sh, CHUNK, None, group).unwrap();
+            b.tune.idle = Duration::from_millis(800);
+            let started = Instant::now();
+            let e = get_err(&b, "manifest");
+            assert!(e.contains("left its"), "{e}");
+            assert!(started.elapsed() < Duration::from_secs(90));
+            let helper: u32 = std::fs::read_to_string(&pids)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            if !group {
+                kill_pid(helper);
+            }
+            wait_gone(helper);
+        }
+    }
+
+    /// Both pipes share one deadline after git exits. Here stdout is held for
+    /// half of `idle` and stderr for 1.25 times `idle`: waiting `idle` for each
+    /// in turn (the old behavior) would let the second one finish in time.
+    #[cfg(unix)]
+    #[test]
+    fn the_pipe_wait_after_exit_has_one_deadline() {
+        need_git!();
+        let t = Tmp::new("deadline");
+        let (_, url) = hub(&t);
+        let body = "case \" $* \" in *\" fetch \"*) sleep 4 2>/dev/null & sleep 10 >/dev/null & exit 0;; esac";
+        let sh = shim(&t, "deadline.sh", body);
+        let mut b = open_git(&url, &sh);
+        b.tune.idle = Duration::from_secs(8);
+        let e = get_err(&b, "manifest");
+        assert!(e.contains("left its stderr open"), "{e}");
+    }
+
+    /// Without a `kill` program serve mode cannot signal the group. It falls back
+    /// to killing git alone, returns, and warns once instead of staying silent.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_kill_program_falls_back_to_killing_git_and_warns_once() {
+        need_git!();
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(warn_once(&flag, "first"), "the first report prints");
+        assert!(!warn_once(&flag, "second"), "later reports stay quiet");
+        assert!(
+            !kill_group("/no/such/kill", 1),
+            "an unrunnable program is reported"
+        );
+
+        let t = Tmp::new("nokill");
         let (_, url) = hub(&t);
         let pids = t.0.join("pids");
         let body = format!(
-            "case \" $* \" in *\" fetch \"*) sleep 600 & echo $! > {}; exit 0;; esac",
+            "case \" $* \" in *\" fetch \"*) sleep 600 & echo $! > {}; wait;; esac",
             pids.display()
         );
-        let sh = shim(&t, "held.sh", &body);
-        let mut b = open_git(&url, &sh);
+        let sh = shim(&t, "nokill.sh", &body);
+        let mut b = GitBucket::open_full(&url, sh, CHUNK, None, true).unwrap();
         b.tune.idle = Duration::from_millis(800);
+        b.tune.kill = "/no/such/kill";
         let started = Instant::now();
         let e = get_err(&b, "manifest");
-        assert!(e.contains("left its"), "{e}");
+        assert!(e.contains("no progress"), "{e}");
         assert!(started.elapsed() < Duration::from_secs(90));
+        // Only git was killed: the helper outlives the call, which is the
+        // documented cost of a missing `kill`.
         let helper: u32 = std::fs::read_to_string(&pids)
             .unwrap()
             .trim()
             .parse()
             .unwrap();
+        let alive = Command::new("ps")
+            .args(["-o", "stat=", "-p", &helper.to_string()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&alive.stdout).trim().to_string();
+        assert!(!stat.is_empty() && !stat.starts_with('Z'), "stat {stat:?}");
         kill_pid(helper);
         wait_gone(helper);
+    }
+
+    /// The family budget is a cliff for a legitimate store; the error says so.
+    #[test]
+    fn a_family_fetch_over_budget_names_the_cap_and_compaction() {
+        need_git!();
+        let t = Tmp::new("family");
+        let (hubdir, url) = hub(&t);
+        plant_big(&hubdir, "log/1", 3 << 20, false);
+        let mut b = open(&url);
+        b.tune.budget = Some(256 << 10);
+        let e = get_err(&b, "log/1");
+        assert!(
+            e.contains("2 GiB budget of a family") && e.contains("needs compaction"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn the_forced_config_pins_the_download_redirect_switches() {
+        for pinned in [
+            "protocol.version=2",
+            "fetch.unpackLimit=1",
+            "fetch.uriProtocols=",
+            "transfer.bundleURI=false",
+        ] {
+            assert!(GIT_CONFIG.contains(&pinned), "{pinned}");
+        }
     }
 
     /// Serve mode (own cache parent, own process group) is the same store.
@@ -3178,49 +3373,103 @@ mod tests {
         assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 0);
     }
 
-    /// The startup sweep removes only what a dead process left. A live foreign
-    /// process (another `sc serve --stdio` on the same home), this process, an
-    /// unparsable name and unrelated entries stay.
+    /// The startup sweep goes by the owner lock, not by pid numbers. A cache
+    /// whose lock is free goes even when its pid is ours or alive (pid reuse,
+    /// every server being pid 1 in a container); one whose lock is held stays
+    /// even when its pid looks dead; so do a directory with no lock file, a
+    /// symlink, and other names. This process's own live buckets stay too.
     #[cfg(unix)]
     #[test]
-    fn reap_stale_removes_only_caches_of_dead_processes() {
+    fn reap_stale_goes_by_the_owner_lock_not_by_pid() {
         need_git!();
         let t = Tmp::new("reap");
         let (_, url) = hub(&t);
         let parent = t.0.join("tmp");
         std::fs::create_dir_all(&parent).unwrap();
-        let mk = |name: &str| {
+        let mk = |name: &str, lock: bool| {
             let p = parent.join(name);
             std::fs::create_dir_all(p.join("objects")).unwrap();
+            if lock {
+                std::fs::write(p.join(OWNER_LOCK), b"").unwrap();
+            }
             p
         };
         let mut gone = Command::new("true").spawn().unwrap();
         let dead = gone.id();
         gone.wait().unwrap();
-        let mut live = Command::new("sleep").arg("30").spawn().unwrap();
-        let stale = mk(&format!("{CACHE_PREFIX}{dead}-aaaa"));
-        let foreign = mk(&format!("{CACHE_PREFIX}{}-bbbb", live.id()));
-        let junk = mk(&format!("{CACHE_PREFIX}notapid-cccc"));
-        let other = mk("serve-bucket-1-0");
-        // two live buckets of this process, and a symlink named like a stale cache
+        // Free lock, whatever the pid says: our own pid, a live one, a junk name.
+        let stale_own = mk(&format!("{CACHE_PREFIX}{}-aaaa", std::process::id()), true);
+        let stale_one = mk(&format!("{CACHE_PREFIX}1-bbbb"), true);
+        let stale_junk = mk(&format!("{CACHE_PREFIX}notapid-cccc"), true);
+        // Held lock, whatever the pid says: a dead one (another namespace, or a
+        // server that is alive under a pid we cannot see).
+        let held_dir = mk(&format!("{CACHE_PREFIX}{dead}-dddd"), true);
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .open(held_dir.join(OWNER_LOCK))
+            .unwrap();
+        held.lock().unwrap();
+        // Never reaped: no lock file, another name, a symlink into a stale-looking dir.
+        let no_lock = mk(&format!("{CACHE_PREFIX}{dead}-eeee"), false);
+        let other = mk("serve-bucket-1-0", true);
+        let link = parent.join(format!("{CACHE_PREFIX}{dead}-link"));
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        // Two live buckets of this process.
         let (a, b) = (
             GitBucket::open_in(&url, &parent).unwrap(),
             GitBucket::open_in(&url, &parent).unwrap(),
         );
-        let link = parent.join(format!("{CACHE_PREFIX}{dead}-link"));
-        std::os::unix::fs::symlink(&other, &link).unwrap();
 
-        assert_eq!(GitBucket::reap_stale(&parent), 1);
-        assert!(!stale.exists());
-        for kept in [&foreign, &junk, &other, &link, &a.cache, &b.cache] {
+        assert_eq!(GitBucket::reap_stale(&parent), 3);
+        for gone in [&stale_own, &stale_one, &stale_junk] {
+            assert!(
+                !gone.exists(),
+                "{gone:?} has a free lock and must be reaped"
+            );
+        }
+        for kept in [&held_dir, &no_lock, &other, &link, &a.cache, &b.cache] {
             assert!(kept.exists(), "{kept:?} must survive");
         }
+        assert!(other.join(OWNER_LOCK).exists(), "a symlink is not followed");
         assert!(a.put_new("k", b"v").unwrap() && b.exists("k").unwrap());
-        live.kill().unwrap();
-        live.wait().unwrap();
-        // once its owner is dead the foreign cache goes too
+
+        // The holder going away (a killed server) is what frees the cache.
+        drop(held);
         assert_eq!(GitBucket::reap_stale(&parent), 1);
-        assert!(!foreign.exists());
+        assert!(!held_dir.exists());
+        // So does dropping a bucket: it removes its own directory.
+        let cache = a.cache.clone();
+        drop(a);
+        assert!(!cache.exists());
         assert_eq!(GitBucket::reap_stale(&parent.join("missing")), 0);
+    }
+
+    /// A sweep that runs while buckets are being opened and dropped never takes
+    /// a live bucket's cache: the owner lock is taken before the bucket is used,
+    /// and a sweep that raced the creation makes the opener start over.
+    #[cfg(unix)]
+    #[test]
+    fn a_sweep_never_removes_a_live_bucket_while_others_open() {
+        need_git!();
+        let t = Tmp::new("sweep");
+        let (_, url) = hub(&t);
+        let parent = t.0.join("tmp");
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    GitBucket::reap_stale(&parent);
+                }
+            });
+            for i in 0..12 {
+                let b = GitBucket::open_in(&url, &parent).unwrap();
+                assert!(
+                    b.put_new(&format!("k{i}"), b"v").unwrap(),
+                    "cache {i} was swept"
+                );
+            }
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 0);
     }
 }
