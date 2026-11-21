@@ -1,5 +1,5 @@
 //! `sc+git::` remote plumbing: URL parsing and the reserved prefix, the
-//! private-branch gate, and the refusals (`serve --store`, `remote compact`).
+//! private-branch gate, and the `serve --store` refusal.
 //! Nothing here reaches `GitBucket`'s real I/O except the URL-parse test.
 
 use super::*;
@@ -163,14 +163,12 @@ fn push_of_a_private_branch_to_a_git_carrier_refuses_before_any_io() {
 }
 
 #[test]
-fn serve_store_and_compact_refuse_git_carriers_before_parsing() {
+fn serve_store_refuses_git_carriers_before_parsing() {
     let url = "sc+git::file:///srv/r.git";
     assert!(invalid(refuse_git_store(url)).contains("sc serve --store"));
-    assert!(invalid(refuse_git_compact(url)).contains("remote compact"));
     // The reserved prefix is refused too, so a near miss never reaches a parser.
     assert!(refuse_git_store("sc+git:/x").is_err());
     assert!(refuse_git_store("sc+wal:///tmp/b").is_ok());
-    assert!(refuse_git_compact("sc+s3://b/p").is_ok());
 
     // The wire layer enforces it for both `--stdio` and `--http` serving, and
     // the client sees why at the handshake.
@@ -194,24 +192,6 @@ fn serve_store_and_compact_refuse_git_carriers_before_parsing() {
     assert!(err.to_string().contains("sc serve --store"), "{err}");
     srv.join().unwrap().unwrap();
     std::fs::remove_dir_all(&home).unwrap();
-}
-
-/// The compaction refusal lives in the repo layer, not only in the CLI: a
-/// transport opened from an `sc+git::` URL refuses `compact` outright.
-#[test]
-fn compact_refuses_a_git_carrier_transport() {
-    let d = root("compact-git");
-    let open = |git: bool| {
-        BucketTransport::build(
-            Box::new(scl_objio::DirBucket::open(d.to_str().unwrap()).unwrap()),
-            git,
-        )
-        .unwrap()
-    };
-    let msg = invalid(open(true).compact(&CompactOptions::default()));
-    assert!(msg.contains("remote compact"), "{msg}");
-    open(false).compact(&CompactOptions::default()).unwrap();
-    std::fs::remove_dir_all(&d).unwrap();
 }
 
 #[test]

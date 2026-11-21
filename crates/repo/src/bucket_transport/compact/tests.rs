@@ -1032,3 +1032,5 @@ fn candidates_that_are_each_large_once_decoded_are_not_merged_one_by_one() {
         t2.get_object(&tip).unwrap();
     }
 }
+
+mod git;

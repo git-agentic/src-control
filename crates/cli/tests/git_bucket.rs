@@ -141,21 +141,12 @@ fn sc_git_is_never_a_git_bridge_remote_and_the_opt_in_is_sc_git_only() {
     std::fs::remove_dir_all(&a).unwrap();
 }
 
-/// Deferred in v1: `sc remote compact` and `sc serve --store` refuse an
-/// `sc+git::` store with a clear message, before any I/O.
+/// Deferred in v1: `sc serve --store` refuses an `sc+git::` store with a clear
+/// message, before any I/O.
 #[test]
-fn compact_and_serve_store_refuse_sc_git() {
+fn serve_store_refuses_sc_git() {
     let a = tmp("deferred");
     init_repo(&a);
-    // Written by hand so the test does not depend on GitBucket validation.
-    std::fs::write(
-        a.join(".sc/config"),
-        "[remote.origin]\nurl = \"sc+git::file:///nonexistent/carrier.git\"\n",
-    )
-    .unwrap();
-    let e = err_text(&sc(&a, &["remote", "compact", "origin", "--dry-run"]));
-    assert!(e.contains("does not support sc+git::"), "{e}");
-
     let home = tmp("deferred-home");
     init_repo(&home);
     let e = err_text(&sc(
@@ -384,6 +375,43 @@ fn scenario(fx: Fixture, gated: bool) {
         ok(sc(a, &["push", "origin"]));
     }
     ok(sc(a, &["switch", "main", "--identity", idp]));
+
+    // Compact the same remote twice, a grace window apart; the clones below then
+    // prove everything still reads. On a Git carrier the first run only records
+    // when it first saw each object, so it deletes nothing and the second run
+    // (past the grace) is the one that removes refs.
+    let remote = if gated { "opted" } else { "origin" };
+    let compact = [
+        "remote",
+        "compact",
+        remote,
+        "--prune-expire",
+        "1s",
+        "--allow-short-grace",
+    ];
+    let first = ok(sc(a, &compact));
+    let mid = refs_on_carrier(&fx.carrier).lines().count();
+    if gated {
+        assert!(first.contains("first sighting"), "{first}");
+        assert!(
+            first.contains("deleted 0 log entries, 0 checkpoint(s), 0 pack(s)"),
+            "{first}"
+        );
+        assert!(
+            refs_on_carrier(&fx.carrier).contains("refs/sc/compact/sightings"),
+            "the age record is on the host"
+        );
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let second = ok(sc(a, &compact));
+    if gated {
+        assert!(!second.contains("deleted 0 log entries"), "{second}");
+        let end = refs_on_carrier(&fx.carrier).lines().count();
+        assert!(
+            end < mid,
+            "compaction removed refs from the host: {mid} -> {end}"
+        );
+    }
 
     // Keyless clone: public content and the branch marker only.
     let (keyless, out) = clone_into(&fx, "keyless", None, &[]);

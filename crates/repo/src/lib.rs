@@ -80,8 +80,8 @@ mod ws_refresh;
 pub use scl_objio::redact;
 
 pub use bucket_transport::{
-    check_private_push_allowed, is_bucket_url, is_git_bucket_url, refuse_git_compact,
-    refuse_git_store, BucketScheme, BucketTransport, BucketUrl, CompactOptions, CompactReport,
+    check_private_push_allowed, is_bucket_url, is_git_bucket_url, refuse_git_store, BucketScheme,
+    BucketTransport, BucketUrl, CompactOptions, CompactReport,
 };
 pub use conflicts::{ActiveOp, ConflictKind, ConflictVersions, ResolveSide, Side};
 pub use error::{Error, Result};
