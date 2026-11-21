@@ -3,8 +3,7 @@
 //! scenario (private branch + protected path + secret over a Git carrier).
 //!
 //! The scenario runs twice from one body: over `sc+wal://` as a control that
-//! proves the script itself (always on), and over `sc+git::file://<bare repo>`
-//! (`#[ignore = "needs real GitBucket"]` until the objio implementation lands).
+//! proves the script itself, and over `sc+git::file://<bare repo>`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -456,7 +455,6 @@ fn scenario_over_a_wal_bucket_is_the_control() {
 }
 
 #[test]
-#[ignore = "needs real GitBucket"]
 fn private_branch_protected_path_and_secret_round_trip_over_a_git_carrier() {
     scenario(git_carrier("roundtrip"), true);
 }
@@ -464,7 +462,6 @@ fn private_branch_protected_path_and_secret_round_trip_over_a_git_carrier() {
 /// Carrier URL forms through the CLI: file://, scp-form, ssh://, https://. No
 /// network is touched: `remote add` validates the URL and writes the config.
 #[test]
-#[ignore = "needs real GitBucket"]
 fn remote_add_accepts_scp_form_and_file_carrier_urls_and_notices_once() {
     let a = tmp("forms");
     init_repo(&a);

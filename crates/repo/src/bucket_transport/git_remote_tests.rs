@@ -1,7 +1,6 @@
 //! `sc+git::` remote plumbing: URL parsing and the reserved prefix, the
 //! private-branch gate, and the refusals (`serve --store`, `remote compact`).
-//! Nothing here reaches `GitBucket`'s real I/O except the test marked
-//! `#[ignore = "needs real GitBucket"]`, which needs the objio implementation.
+//! Nothing here reaches `GitBucket`'s real I/O except the URL-parse test.
 
 use super::*;
 use crate::error::Error;
@@ -172,7 +171,6 @@ fn serve_store_and_compact_refuse_git_carriers_before_parsing() {
 }
 
 #[test]
-#[ignore = "needs real GitBucket"]
 fn sc_git_urls_parse_with_the_inner_url_verbatim() {
     for inner in [
         "file:///srv/r.git",
