@@ -95,6 +95,18 @@ Aborted merges, refused writes and force-pushed history leave unreferenced objec
 - A pass also removes stale ref locks, commit-graph locks and quarantine directories of killed git processes, only when nothing can
   own them.
 
+## Native sc stores in `refs/sc/*`
+
+A repository can carry an sc bucket store (`sc+git::` remotes keep each key as a parentless commit at `refs/sc/<key>`). The server
+accepts pushes to exactly the `refs/sc/` prefix; other namespaces outside `refs/heads/*` and `refs/tags/*` stay refused.
+
+- Every repository writer can create, overwrite and delete `refs/sc/*`. There is no per-repository switch.
+- Branch protection does not apply to it.
+- It is advertised to every reader. Plain `git clone` and `git fetch` skip it unless asked for the exact refspec.
+- A deleted or replaced value stays fetchable by object id until a maintenance pass prunes it (`--gc-prune-expire`). The live
+  values are reachable from their refs, so gc and prune keep them.
+- `receive.maxInputSize` (`--max-pack-size`, default 2 GiB) bounds one pushed value.
+
 ## Resource limits (cgroups)
 
 The server bounds its own git children (timeouts, `RLIMIT_CPU`/`RLIMIT_FSIZE`, output caps, `--git-memory-limit` as `RLIMIT_DATA` on

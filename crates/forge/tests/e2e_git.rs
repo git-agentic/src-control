@@ -22,6 +22,17 @@ impl Client {
 
     /// Run the client's git with a scrubbed environment; `header` is the Authorization value.
     fn git_in(&self, cwd: &Path, header: Option<&str>, args: &[&str]) -> (bool, String) {
+        self.git_env(cwd, header, &[], args)
+    }
+
+    /// [`Client::git_in`] with extra environment variables (they override the defaults).
+    fn git_env(
+        &self,
+        cwd: &Path,
+        header: Option<&str>,
+        env: &[(&str, &str)],
+        args: &[&str],
+    ) -> (bool, String) {
         let mut cmd = Command::new("git");
         cmd.env_clear()
             .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
@@ -32,6 +43,7 @@ impl Client {
             .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
             .env("GIT_COMMITTER_NAME", "T")
             .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .envs(env.iter().copied())
             .current_dir(cwd);
         if let Some(h) = header {
             cmd.arg("-c")
@@ -1326,5 +1338,334 @@ fn a_malformed_service_keeps_the_fixed_error_order() {
         s.send("GET", p, Some(&auth), None).status,
         404,
         "then the dumb listing is refused"
+    );
+}
+
+// ---- refs/sc/*: a native sc bucket store carried by a hosted Git repository ----
+
+/// A parentless commit shaped like an `sc+git::` bucket value: fixed identity and date, a tree of
+/// regular blobs `c0000`, `c0001`, ..., and a `sc-bucket new <nonce>` message. Built in `store`
+/// with plain git (an isolated index), so the object exists locally for the push.
+fn bucket_value(c: &Client, store: &Path, nonce: &str, chunks: &[&str]) -> String {
+    let idx = c.dir.join(format!("idx-{nonce}"));
+    let idx = idx.to_str().unwrap();
+    let env = [
+        ("GIT_INDEX_FILE", idx),
+        ("GIT_AUTHOR_NAME", "sc"),
+        ("GIT_AUTHOR_EMAIL", "sc@invalid"),
+        ("GIT_COMMITTER_NAME", "sc"),
+        ("GIT_COMMITTER_EMAIL", "sc@invalid"),
+        ("GIT_AUTHOR_DATE", "946684800 +0000"),
+        ("GIT_COMMITTER_DATE", "946684800 +0000"),
+    ];
+    let run = |args: &[&str]| {
+        let (ok, text) = c.git_env(store, None, &env, args);
+        assert!(ok, "git {args:?}: {text}");
+        text.trim().to_string()
+    };
+    for (i, text) in chunks.iter().enumerate() {
+        let f = c.dir.join(format!("chunk-{nonce}-{i}"));
+        std::fs::write(&f, text).unwrap();
+        let blob = run(&["hash-object", "-w", f.to_str().unwrap()]);
+        run(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{blob},c{i:04}"),
+        ]);
+    }
+    let tree = run(&["write-tree"]);
+    run(&[
+        "commit-tree",
+        &tree,
+        "-m",
+        &format!("sc-bucket new {nonce}"),
+    ])
+}
+
+/// `git push` of `oid` to `refname` guarded by a compare-and-swap on `expect` ("" = must not exist),
+/// with no `+` in the refspec, as the sc client does it.
+fn cas_push(
+    c: &Client,
+    store: &Path,
+    auth: &str,
+    url: &str,
+    refname: &str,
+    expect: &str,
+    oid: &str,
+) -> (bool, String) {
+    c.git_in(
+        store,
+        Some(auth),
+        &[
+            "push",
+            &format!("--force-with-lease={refname}:{expect}"),
+            url,
+            &format!("{oid}:{refname}"),
+        ],
+    )
+}
+
+fn remote_ref(c: &Client, dir: &Path, auth: &str, url: &str, refname: &str) -> Option<String> {
+    let out = c.ok(dir, Some(auth), &["ls-remote", url, refname]);
+    out.split_whitespace().next().map(str::to_string)
+}
+
+/// A server with one repository and a local store repository (no branches) that pushes to it.
+fn store_world(tag: &str) -> (Srv, Client, String, String, PathBuf) {
+    let s = Srv::start();
+    let c = Client::new(tag);
+    let url = repo(&s, "smart");
+    let auth = token(&s.admin);
+    let store = c.dir.join("store");
+    c.ok(
+        &c.dir,
+        None,
+        &["init", "-q", "-b", "main", store.to_str().unwrap()],
+    );
+    (s, c, url, auth, store)
+}
+
+/// Seed a `main` branch from a scratch repository so the repository has a HEAD.
+fn seed_main(c: &Client, url: &str, auth: &str) {
+    let work = c.dir.join("seed");
+    c.ok(
+        &c.dir,
+        None,
+        &["init", "-q", "-b", "main", work.to_str().unwrap()],
+    );
+    put_commit(c, &work, "a.txt", "hello\n");
+    c.ok(&work, Some(auth), &["push", "-q", url, "main"]);
+}
+
+#[test]
+fn refs_sc_create_cas_update_fetch_and_delete_round_trip_through_the_real_receive_path() {
+    let (_s, c, url, auth, store) = store_world("sc-rt");
+    let m = "refs/sc/manifest";
+    let v1 = bucket_value(&c, &store, "n1", &["one\n", "uno\n"]);
+    let v2 = bucket_value(&c, &store, "n2", &["two\n"]);
+    let v3 = bucket_value(&c, &store, "n3", &["three\n"]);
+    // create: an empty lease means "must not exist"
+    let (ok, t) = cas_push(&c, &store, &auth, &url, m, "", &v1);
+    assert!(ok, "create: {t}");
+    assert_eq!(remote_ref(&c, &store, &auth, &url, m), Some(v1.clone()));
+    // creating again with the empty lease is refused and the ref is unchanged
+    let (ok, _) = cas_push(&c, &store, &auth, &url, m, "", &v2);
+    assert!(!ok, "create over an existing ref");
+    assert_eq!(remote_ref(&c, &store, &auth, &url, m), Some(v1.clone()));
+    // update to an unrelated parentless commit (a non-fast-forward), lease on the old value
+    let (ok, t) = cas_push(&c, &store, &auth, &url, m, &v1, &v2);
+    assert!(ok, "cas update: {t}");
+    assert_eq!(remote_ref(&c, &store, &auth, &url, m), Some(v2.clone()));
+    // a stale lease is refused and the ref stays at v2
+    let (ok, t) = cas_push(&c, &store, &auth, &url, m, &v1, &v3);
+    assert!(!ok, "stale lease must be refused: {t}");
+    assert_eq!(remote_ref(&c, &store, &auth, &url, m), Some(v2.clone()));
+    // a second key with a path-like name next to the first
+    let log = bucket_value(&c, &store, "n4", &["entry\n"]);
+    let k = "refs/sc/log/00000000000000000001";
+    let (ok, t) = cas_push(&c, &store, &auth, &url, k, "", &log);
+    assert!(ok, "{t}");
+    // fetch by exact refspec into a fresh repository
+    let fresh = c.dir.join("fresh");
+    c.ok(&c.dir, None, &["init", "-q", fresh.to_str().unwrap()]);
+    c.ok(
+        &fresh,
+        Some(&auth),
+        &["fetch", "-q", &url, "+refs/sc/*:refs/sc/*"],
+    );
+    assert_eq!(c.ok(&fresh, None, &["rev-parse", m]).trim(), v2);
+    assert_eq!(c.ok(&fresh, None, &["rev-parse", k]).trim(), log);
+    assert_eq!(
+        c.ok(&fresh, None, &["show", &format!("{m}:c0000")]),
+        "two\n"
+    );
+    c.ok(&fresh, None, &["fsck", "--strict", "--no-dangling"]);
+    // refs/sc is advertised to readers, but a plain clone does not fetch it
+    seed_main(&c, &url, &auth);
+    let adv = c.ok(&store, Some(&auth), &["ls-remote", &url]);
+    assert!(adv.contains(m), "advertised to readers: {adv}");
+    let clone = c.dir.join("clone");
+    c.ok(
+        &c.dir,
+        Some(&auth),
+        &["clone", "-q", &url, clone.to_str().unwrap()],
+    );
+    assert_eq!(c.ok(&clone, None, &["for-each-ref", "refs/sc"]), "");
+    // delete with a lease: a stale one fails, the right one wins
+    let del = |expect: &str| {
+        c.git_in(
+            &store,
+            Some(&auth),
+            &[
+                "push",
+                &format!("--force-with-lease={m}:{expect}"),
+                &url,
+                &format!(":{m}"),
+            ],
+        )
+    };
+    assert!(!del(&v1).0, "stale delete lease");
+    assert_eq!(remote_ref(&c, &store, &auth, &url, m), Some(v2.clone()));
+    let (ok, t) = del(&v2);
+    assert!(ok, "delete: {t}");
+    assert_eq!(remote_ref(&c, &store, &auth, &url, m), None);
+    // the namespace boundary is exactly `refs/sc/`
+    for r in ["refs/scx/x", "refs/sc", "refs/notes/x"] {
+        let (ok, t) = c.git_in(&store, Some(&auth), &["push", &url, &format!("{v2}:{r}")]);
+        assert!(!ok, "{r} must be refused: {t}");
+        assert_eq!(remote_ref(&c, &store, &auth, &url, r), None, "{r}");
+    }
+}
+
+/// One receive-pack request by hand (`old` and `new` are what the client believes), so the
+/// server's own compare-and-swap is exercised: the real client checks the advertisement first.
+fn raw_update(s: &Srv, auth: &str, old: &str, new: &str, refname: &str) -> String {
+    let pkt = |t: &str| format!("{:04x}{t}", t.len() + 4);
+    let mut body = pkt(&format!(
+        "{old} {new} {refname}\0 report-status object-format=sha1\n"
+    ))
+    .into_bytes();
+    body.extend_from_slice(b"0000");
+    if new.bytes().any(|b| b != b'0') {
+        // the pushed object is already on the server: an empty pack carries it
+        let out = Command::new("git")
+            .args(["pack-objects", "--stdout"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        body.extend_from_slice(&out.stdout);
+    }
+    let head = format!(
+        "POST /siteadmin/smart.git/git-receive-pack HTTP/1.1\r\nHost: x\r\nConnection: close\r\nAuthorization: {auth}\r\nContent-Type: application/x-git-receive-pack-request\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let r = s.raw(head.as_bytes(), &body);
+    assert_eq!(r.status, 200);
+    body_text(&r)
+}
+
+#[test]
+fn refs_sc_cas_is_enforced_by_the_server_under_the_ref_lock() {
+    let (s, c, url, auth, store) = store_world("sc-srv");
+    let m = "refs/sc/manifest";
+    let z = "0".repeat(40);
+    let v1 = bucket_value(&c, &store, "n1", &["one\n"]);
+    let v2 = bucket_value(&c, &store, "n2", &["two\n"]);
+    let v3 = bucket_value(&c, &store, "n3", &["three\n"]);
+    for (expect, oid) in [("", &v1), (v1.as_str(), &v2)] {
+        let (ok, t) = cas_push(&c, &store, &auth, &url, m, expect, oid);
+        assert!(ok, "{t}");
+    }
+    // stale old value: refused for an update and for a delete, ref unchanged
+    let out = raw_update(&s, &auth, &v3, &v1, m);
+    assert!(out.contains(&format!("ng {m}")), "{out}");
+    let out = raw_update(&s, &auth, &v1, &z, m);
+    assert!(out.contains(&format!("ng {m}")), "{out}");
+    assert_eq!(remote_ref(&c, &store, &auth, &url, m), Some(v2.clone()));
+    // the same request with the right old value is accepted (the request shape is valid)
+    let out = raw_update(&s, &auth, &v2, &v1, m);
+    assert!(out.contains(&format!("ok {m}")), "{out}");
+    assert_eq!(remote_ref(&c, &store, &auth, &url, m), Some(v1.clone()));
+    // a name outside the namespace is refused by the hook, whatever the old value
+    let out = raw_update(&s, &auth, &z, &v1, "refs/scx/x");
+    assert!(
+        out.contains("refs/scx/x") && !out.contains("ok refs/scx/x"),
+        "{out}"
+    );
+    assert_eq!(remote_ref(&c, &store, &auth, &url, "refs/scx/x"), None);
+}
+
+#[test]
+fn racing_refs_sc_cas_pushes_have_exactly_one_winner() {
+    let (_s, c, url, auth, store) = store_world("sc-race");
+    let m = "refs/sc/manifest";
+    let mut cur = bucket_value(&c, &store, "r0", &["zero\n"]);
+    let (ok, t) = cas_push(&c, &store, &auth, &url, m, "", &cur);
+    assert!(ok, "{t}");
+    for round in 0..6 {
+        let a = bucket_value(&c, &store, &format!("r{round}a"), &["a\n"]);
+        let b = bucket_value(&c, &store, &format!("r{round}b"), &["b\n"]);
+        let (ra, rb) = std::thread::scope(|sc| {
+            let ta = sc.spawn(|| cas_push(&c, &store, &auth, &url, m, &cur, &a));
+            let tb = sc.spawn(|| cas_push(&c, &store, &auth, &url, m, &cur, &b));
+            (ta.join().unwrap(), tb.join().unwrap())
+        });
+        assert!(
+            ra.0 ^ rb.0,
+            "round {round}: exactly one wins: {ra:?} {rb:?}"
+        );
+        let winner = if ra.0 { &a } else { &b };
+        assert_eq!(
+            remote_ref(&c, &store, &auth, &url, m).as_ref(),
+            Some(winner),
+            "round {round}"
+        );
+        cur = winner.clone();
+    }
+}
+
+#[test]
+fn maintenance_keeps_the_live_refs_sc_values() {
+    use scl_forge::maintenance::Cfg;
+    use std::time::Duration;
+    let s = Srv::start_maint(
+        Cfg {
+            interval: Duration::ZERO,
+            min_free: 0,
+            gate_wait: Duration::from_secs(5),
+            prune_expire: Duration::from_secs(1),
+            ..Cfg::default()
+        },
+        None,
+    );
+    let c = Client::new("sc-maint");
+    let url = repo(&s, "smart");
+    let auth = token(&s.admin);
+    let store = c.dir.join("store");
+    c.ok(
+        &c.dir,
+        None,
+        &["init", "-q", "-b", "main", store.to_str().unwrap()],
+    );
+    let m = "refs/sc/manifest";
+    let k = "refs/sc/packs/00ff.pack";
+    let old = bucket_value(&c, &store, "m1", &["old\n"]);
+    let live = bucket_value(&c, &store, "m2", &["live\n", "live2\n"]);
+    let pack = bucket_value(&c, &store, "m3", &["packbytes\n"]);
+    for (r, expect, oid) in [(m, "", &old), (m, old.as_str(), &live), (k, "", &pack)] {
+        let (ok, t) = cas_push(&c, &store, &auth, &url, r, expect, oid);
+        assert!(ok, "{t}");
+    }
+    std::thread::sleep(Duration::from_millis(2200));
+    let before = s.app.maint.passes();
+    let r = s.send("POST", "/api/v1/admin/cron/git_gc_repos", Some(&auth), None);
+    assert_eq!(r.status, 204, "{}", r.s_text());
+    let end = std::time::Instant::now() + Duration::from_secs(60);
+    while s.app.maint.passes() <= before {
+        assert!(std::time::Instant::now() < end, "the pass never finished");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(remote_ref(&c, &store, &auth, &url, m), Some(live.clone()));
+    assert_eq!(remote_ref(&c, &store, &auth, &url, k), Some(pack.clone()));
+    assert!(s.git_try(1, &["cat-file", "-e", &live]).is_some());
+    assert!(s
+        .git_try(1, &["fsck", "--strict", "--no-dangling"])
+        .is_some());
+    assert!(
+        s.git_try(1, &["cat-file", "-e", &old]).is_none(),
+        "the replaced value is pruned (fetchable by id only until then)"
+    );
+    // what survived still fetches and reads back
+    let fresh = c.dir.join("fresh");
+    c.ok(&c.dir, None, &["init", "-q", fresh.to_str().unwrap()]);
+    c.ok(
+        &fresh,
+        Some(&auth),
+        &["fetch", "-q", &url, "+refs/sc/*:refs/sc/*"],
+    );
+    assert_eq!(
+        c.ok(&fresh, None, &["show", &format!("{m}:c0001")]),
+        "live2\n"
     );
 }

@@ -379,7 +379,7 @@
     "refs/tags/"
    ]
   },
-  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/* and refs/tags/*: 'refusing to update <ref>: only refs/heads/* and refs/tags/* are writable'"
+  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/*, refs/tags/* and refs/sc/*: 'refusing to update <ref>: only refs/heads/*, refs/tags/* and refs/sc/* are writable'"
  },
  {
   "scenario": "S",
@@ -393,7 +393,7 @@
     "refs/tags/"
    ]
   },
-  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/* and refs/tags/*: 'refusing to update <ref>: only refs/heads/* and refs/tags/* are writable'"
+  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/*, refs/tags/* and refs/sc/*: 'refusing to update <ref>: only refs/heads/*, refs/tags/* and refs/sc/* are writable'"
  },
  {
   "scenario": "S",
@@ -407,7 +407,7 @@
     "refs/tags/"
    ]
   },
-  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/* and refs/tags/*: 'refusing to update <ref>: only refs/heads/* and refs/tags/* are writable'"
+  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/*, refs/tags/* and refs/sc/*: 'refusing to update <ref>: only refs/heads/*, refs/tags/* and refs/sc/* are writable'"
  },
  {
   "scenario": "S",
@@ -421,7 +421,7 @@
     "refs/tags/"
    ]
   },
-  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/* and refs/tags/*: 'refusing to update <ref>: only refs/heads/* and refs/tags/* are writable'"
+  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/*, refs/tags/* and refs/sc/*: 'refusing to update <ref>: only refs/heads/*, refs/tags/* and refs/sc/* are writable'"
  },
  {
   "scenario": "S",
@@ -435,7 +435,7 @@
     "refs/tags/"
    ]
   },
-  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/* and refs/tags/*: 'refusing to update <ref>: only refs/heads/* and refs/tags/* are writable'"
+  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/*, refs/tags/* and refs/sc/*: 'refusing to update <ref>: only refs/heads/*, refs/tags/* and refs/sc/* are writable'"
  },
  {
   "scenario": "S",
@@ -449,7 +449,7 @@
     "refs/tags/"
    ]
   },
-  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/* and refs/tags/*: 'refusing to update <ref>: only refs/heads/* and refs/tags/* are writable'"
+  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/*, refs/tags/* and refs/sc/*: 'refusing to update <ref>: only refs/heads/*, refs/tags/* and refs/sc/* are writable'"
  },
  {
   "scenario": "S",
@@ -463,7 +463,7 @@
     "refs/tags/"
    ]
   },
-  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/* and refs/tags/*: 'refusing to update <ref>: only refs/heads/* and refs/tags/* are writable'"
+  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/*, refs/tags/* and refs/sc/*: 'refusing to update <ref>: only refs/heads/*, refs/tags/* and refs/sc/* are writable'"
  },
  {
   "scenario": "S",
@@ -477,7 +477,7 @@
     "refs/tags/"
    ]
   },
-  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/* and refs/tags/*: 'refusing to update <ref>: only refs/heads/* and refs/tags/* are writable'"
+  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/*, refs/tags/* and refs/sc/*: 'refusing to update <ref>: only refs/heads/*, refs/tags/* and refs/sc/* are writable'"
  },
  {
   "scenario": "S",
@@ -491,7 +491,7 @@
     "refs/tags/"
    ]
   },
-  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/* and refs/tags/*: 'refusing to update <ref>: only refs/heads/* and refs/tags/* are writable'"
+  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/*, refs/tags/* and refs/sc/*: 'refusing to update <ref>: only refs/heads/*, refs/tags/* and refs/sc/* are writable'"
  },
  {
   "scenario": "S",

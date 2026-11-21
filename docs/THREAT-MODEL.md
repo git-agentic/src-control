@@ -1074,7 +1074,8 @@ unless said otherwise).
   `objects/info/alternates` and every other file are 404. Objects of a deleted branch stay readable by anyone with read
   access to *that* repository (`uploadpack.allowAnySHA1InWant=true` is what makes fetch by id work; it is not a
   cross-tenant read, since each repository is a separate object store and no alternates exist).
-- **Ref namespace.** Only `refs/heads/*` and `refs/tags/*` are writable: `refs/replace/*`, `refs/pull/*`, `refs/notes/*`,
+- **Ref namespace.** Only `refs/heads/*`, `refs/tags/*` and `refs/sc/*` (a native sc store, writable by every repository
+  writer, outside branch protection; see ADR-0058's addendum) are writable: `refs/replace/*`, `refs/pull/*`, `refs/notes/*`,
   `refs/changes/*` and everything else are refused by the `pre-receive` hook
   (`the_ref_policy_is_enforced_for_every_unwritable_namespace_and_the_default_branch`); `refs/forge/` (reserved for the
   server) is hidden from both services (`transfer.hideRefs`) and cannot be fetched by name
