@@ -1033,7 +1033,8 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
   filter it by prefix server-side, a packet trace showed the full list) and a
   cold read fetches every `log/` and `checkpoints/` entry, and with compaction
   refused (1) refs grow by at least three per push, so a long-lived store slows
-  down until compaction or a ref-filtering host exists.
+  down until compaction or a ref-filtering host exists; (8) SHA-256 Git
+  repositories (v1 pins its cache to SHA-1 and handles SHA-1 ids only).
 - **Serve-side persistent pack cache (P36c follow-on).** A bucket-backed
   serve instance re-downloads packs per connection; a content-addressed
   on-disk cache in the serve home would make warm instances cheap without

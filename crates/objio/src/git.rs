@@ -430,9 +430,18 @@ impl GitBucket {
             chunk: chunk.max(1),
             state: Mutex::new(HashMap::new()),
         };
-        // An early `?` drops `b`, which removes the cache dir.
+        // An early `?` drops `b`, which removes the cache dir. The cache is
+        // pinned to sha1 whatever the user's `init.defaultObjectFormat`: values
+        // and tags are sha1 ids (shortcut: sha256 carriers are unsupported in v1).
         b.run_ok(
-            &["init", "--bare", "--quiet", "--template=", "."],
+            &[
+                "init",
+                "--bare",
+                "--quiet",
+                "--template=",
+                "--object-format=sha1",
+                ".",
+            ],
             None,
             &[],
             SMALL_CAP,
@@ -1025,13 +1034,14 @@ impl Bucket for GitBucket {
             return Ok(Fetched::Absent);
         };
         if cached_tag == Some(remote.as_str()) {
-            st.entry(key.to_string())
-                .and_modify(|k| k.at = Instant::now())
-                .or_insert(Known {
-                    oid: remote,
-                    create_only: false,
-                    at: Instant::now(),
-                });
+            // Refresh only a cache entry for this very value; an entry for an
+            // older value would otherwise look fresh. A cold hit stays uncached.
+            match st.get_mut(key) {
+                Some(k) if k.oid == remote => k.at = Instant::now(),
+                _ => {
+                    st.remove(key);
+                }
+            }
             return Ok(Fetched::Unchanged);
         }
         let full = format!("{NS}{key}");
@@ -1684,11 +1694,12 @@ mod tests {
         let none = shim(&t, "none.sh", "export GIT_CONFIG_GLOBAL=/dev/null");
         let b = open_git(&url, &none);
         assert!(b.put_new("a", b"1").unwrap());
-        // signing on and an unusable gpg program, a hooks dir, and a bad identity
+        // signing on and an unusable gpg program, a hooks dir, a bad identity and
+        // a sha256 default object format (the cache must stay sha1)
         let cfg = t.0.join("gitconfig");
         std::fs::write(
             &cfg,
-            "[commit]\n\tgpgSign = true\n[tag]\n\tgpgSign = true\n[push]\n\tgpgSign = true\n[gpg]\n\tprogram = /nonexistent/gpg\n[user]\n\tname = X\n\temail = x@x\n[core]\n\thooksPath = /nonexistent/hooks\n",
+            "[commit]\n\tgpgSign = true\n[tag]\n\tgpgSign = true\n[push]\n\tgpgSign = true\n[gpg]\n\tprogram = /nonexistent/gpg\n[user]\n\tname = X\n\temail = x@x\n[core]\n\thooksPath = /nonexistent/hooks\n[init]\n\tdefaultObjectFormat = sha256\n",
         )
         .unwrap();
         let signing = shim(
@@ -1701,6 +1712,27 @@ mod tests {
         let tag = b.put_if_tag("m", b"1", None).unwrap().unwrap();
         assert!(b.put_if_tag("m", b"2", Some(&tag)).unwrap().is_some());
         assert_eq!(b.list("").unwrap(), vec!["a", "b", "m"]);
+    }
+
+    #[test]
+    fn confirming_a_newer_tag_does_not_refresh_an_older_cached_value() {
+        need_git!();
+        let t = Tmp::new("stale");
+        let (_, url) = hub(&t);
+        let a = GitBucket::open(&url).unwrap();
+        let b = GitBucket::open(&url).unwrap();
+        let t1 = a.put_if_tag("manifest", b"v1", None).unwrap().unwrap();
+        let t2 = b.put_if_tag("manifest", b"v2", Some(&t1)).unwrap().unwrap();
+        // `a` caches t1; a caller that already knows t2 asks `a` to confirm it.
+        assert!(matches!(
+            a.get("manifest", Some(&t2)).unwrap(),
+            Fetched::Unchanged
+        ));
+        // Asking about the stale t1 right after must not be answered from the cache.
+        let Fetched::New { bytes, tag } = a.get("manifest", Some(&t1)).unwrap() else {
+            panic!("stale tag answered as unchanged")
+        };
+        assert_eq!((bytes.as_slice(), tag.as_str()), (&b"v2"[..], t2.as_str()));
     }
 
     #[test]

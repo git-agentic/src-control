@@ -138,7 +138,7 @@ Bucket remotes take `sc remote add <name> sc+wal://<dir>` or
 serves a bucket from a disposable instance (`--stdio` also works;
 `sc serve --help`).
 `sc remote add <name> sc+git::<git-url>` (or `sc clone sc+git::<git-url> <dst>`)
-stores the same bucket inside any Git repository as `refs/sc/*`, so private
+stores the same bucket inside any (SHA-1) Git repository as `refs/sc/*`, so private
 branches, protected paths and secrets travel through a Git host that a plain
 `git clone` never sees into (ADR-0060). Pushing a private branch there needs
 `--allow-private-branches` (its name and recipient ids become readable by

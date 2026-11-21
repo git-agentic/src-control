@@ -188,6 +188,9 @@ behind.
 - `sc serve --store sc+git::...` is refused. A daemon cannot answer ssh or
   credential prompts, and it would sit between clients and the client-side
   private-branch gate.
+- SHA-256 Git repositories are not supported: values and tags are SHA-1 ids, and
+  the local cache is created with `--object-format=sha1` whatever the user's
+  `init.defaultObjectFormat`.
 
 ### sc-forge
 
