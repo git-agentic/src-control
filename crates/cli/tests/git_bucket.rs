@@ -141,28 +141,246 @@ fn sc_git_is_never_a_git_bridge_remote_and_the_opt_in_is_sc_git_only() {
     std::fs::remove_dir_all(&a).unwrap();
 }
 
-/// Deferred in v1: `sc serve --store` refuses an `sc+git::` store with a clear
-/// message, before any I/O.
+/// `sc serve --allow-private-branches` is the operator's opt-in for a `sc+git::`
+/// store and means nothing for any other, so it is refused there instead of
+/// being ignored.
 #[test]
-fn serve_store_refuses_sc_git() {
-    let a = tmp("deferred");
-    init_repo(&a);
-    let home = tmp("deferred-home");
+fn serve_allow_private_branches_needs_a_git_store() {
+    let home = tmp("serve-flag");
     init_repo(&home);
-    let e = err_text(&sc(
+    let h = home.to_str().unwrap();
+    for store in [&["--store", "sc+wal:///nonexistent/bucket"][..], &[][..]] {
+        let mut args = vec!["serve", "--stdio", "--allow-private-branches"];
+        args.extend_from_slice(store);
+        args.push(h);
+        let e = err_text(&sc(&home, &args));
+        assert!(e.contains("applies only to --store sc+git::"), "{e}");
+    }
+    std::fs::remove_dir_all(&home).unwrap();
+}
+
+/// Spawn `sc serve --http 127.0.0.1:0 --store <store> <home> <extra…>`; returns
+/// the child and its announced `host:port` (as `http_remote.rs` does).
+fn spawn_serve(home: &Path, store: &str, extra: &[&str]) -> (std::process::Child, String) {
+    spawn_serve_in(None, home.as_os_str(), store, extra)
+}
+
+/// [`spawn_serve`] with the serve home given as supplied (`.` is a relative
+/// home) and an optional working directory for the server.
+fn spawn_serve_in(
+    cwd: Option<&Path>,
+    home: &std::ffi::OsStr,
+    store: &str,
+    extra: &[&str],
+) -> (std::process::Child, String) {
+    use std::io::BufRead;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sc"));
+    cmd.args(["serve", "--http", "127.0.0.1:0", "--store", store])
+        .args(extra)
+        .arg(home)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    let mut child = cmd.spawn().expect("spawn sc serve");
+    let mut line = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .expect("read the announce line");
+    let addr = line
+        .trim()
+        .strip_prefix("listening on ")
+        .unwrap_or_else(|| panic!("unexpected serve startup line: {line:?}"))
+        .to_string();
+    (child, addr)
+}
+
+/// A client returns before the server has dropped its session, and a killed
+/// server leaves its cache behind, so wait (bounded) for `dir` to empty before
+/// the server is stopped.
+fn wait_until_empty(dir: &Path) {
+    for _ in 0..100 {
+        let left = std::fs::read_dir(dir).map_or(0, Iterator::count);
+        if left == 0 {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("a session left something in {dir:?}");
+}
+
+/// A bare Git repository, `sc serve --http --store sc+git::<it>` in front, and
+/// real clients: a public push and a clone work, a private branch is refused
+/// before anything reaches the repository, and only a server restarted with
+/// `--allow-private-branches` takes it.
+#[test]
+fn serve_store_sc_git_gates_private_branches_until_the_operator_opts_in() {
+    let root = tmp("serve-git");
+    let keys = tmp("serve-git-keys");
+    let hub = root.join("hub.git");
+    assert!(Command::new("git")
+        .args(["init", "--bare", "-q", hub.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    let store = format!("sc+git::file://{}", hub.display());
+    let home = root.join("home");
+    init_repo(&home);
+    let (id, pk) = keygen(&keys, "alice");
+    let idp = id.to_str().unwrap();
+    let a = root.join("a");
+    init_repo(&a);
+    std::fs::write(
+        a.join(".sc/recipients.toml"),
+        format!("[recipients]\nalice = \"{pk}\"\n"),
+    )
+    .unwrap();
+    std::fs::write(a.join("README.md"), "public\n").unwrap();
+    ok(sc(&a, &["commit", "-m", "base"]));
+
+    let (mut gated, addr) = spawn_serve(&home, &store, &[]);
+    let origin = format!("sc+http://{addr}/x");
+    ok(sc(&a, &["remote", "add", "origin", &origin]));
+    ok(sc(&a, &["push", "origin"])); // public content needs no opt-in
+    let public_refs = refs_on_carrier(&hub);
+    assert!(public_refs.contains("refs/sc/manifest"), "{public_refs}");
+
+    ok(sc(
         &a,
         &[
+            "branch",
+            "hotfix",
+            "--private",
+            "--to",
+            "alice",
+            "--identity",
+            idp,
+        ],
+    ));
+    ok(sc(&a, &["switch", "hotfix", "--identity", idp]));
+    std::fs::write(a.join("embargo.txt"), "embargoed\n").unwrap();
+    ok(sc(&a, &["commit", "-m", "embargoed", "--identity", idp]));
+    let e = err_text(&sc(&a, &["push", "origin"]));
+    assert!(e.contains("--allow-private-branches"), "{e}");
+    assert!(e.contains("No private-branch object was uploaded"), "{e}");
+    assert_eq!(
+        refs_on_carrier(&hub),
+        public_refs,
+        "refused: host unchanged"
+    );
+    wait_until_empty(&home.join(".sc").join("tmp"));
+    gated.kill().unwrap();
+    gated.wait().unwrap();
+
+    let (mut open, addr) = spawn_serve(&home, &store, &["--allow-private-branches"]);
+    let opted = format!("sc+http://{addr}/x");
+    ok(sc(&a, &["remote", "add", "opted", &opted]));
+    ok(sc(&a, &["push", "opted"]));
+    assert_ne!(refs_on_carrier(&hub), public_refs);
+    let keyless = root.join("keyless");
+    ok(sc(&root, &["clone", &opted, keyless.to_str().unwrap()]));
+    let listing = ok(sc(&keyless, &["branch", "list"]));
+    assert!(listing.contains("hotfix (private, no access)"), "{listing}");
+    // No Git cache outlives its sessions in the serve home.
+    wait_until_empty(&home.join(".sc").join("tmp"));
+    open.kill().unwrap();
+    open.wait().unwrap();
+    for d in [&root, &keys] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+/// The serve home is used as supplied, so `.` (with the server's working
+/// directory set to it) must work: git runs with the cache as its working
+/// directory, and a relative cache path used to be resolved from inside it.
+#[test]
+fn serve_store_sc_git_works_with_a_relative_serve_home() {
+    let root = tmp("serve-rel");
+    let hub = root.join("hub.git");
+    assert!(Command::new("git")
+        .args(["init", "--bare", "-q", hub.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    let store = format!("sc+git::file://{}", hub.display());
+    let home = root.join("home");
+    init_repo(&home);
+    let a = root.join("a");
+    init_repo(&a);
+    std::fs::write(a.join("README.md"), "public\n").unwrap();
+    ok(sc(&a, &["commit", "-m", "base"]));
+
+    let (mut srv, addr) = spawn_serve_in(Some(&home), std::ffi::OsStr::new("."), &store, &[]);
+    let url = format!("sc+http://{addr}/x");
+    ok(sc(&a, &["remote", "add", "origin", &url]));
+    ok(sc(&a, &["push", "origin"]));
+    assert!(refs_on_carrier(&hub).contains("refs/sc/manifest"));
+    let clone = root.join("clone");
+    ok(sc(&root, &["clone", &url, clone.to_str().unwrap()]));
+    assert_eq!(
+        std::fs::read_to_string(clone.join("README.md")).unwrap(),
+        "public\n"
+    );
+    wait_until_empty(&home.join(".sc").join("tmp"));
+    srv.kill().unwrap();
+    srv.wait().unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// A starting `sc serve --store sc+git::` removes the Git caches a killed
+/// earlier server left in the serve home, and only those nobody holds: another
+/// server on the same home may be live, and liveness is the owner lock, not a
+/// pid (the test process holds one lock, in a directory named for a dead pid).
+/// Unix only, like the sweep.
+#[cfg(unix)]
+#[test]
+fn serve_start_reaps_caches_nobody_holds() {
+    let root = tmp("serve-reap");
+    let home = root.join("home");
+    init_repo(&home);
+    let scratch = home.join(".sc").join("tmp");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let mut gone = Command::new("true").spawn().unwrap();
+    let dead = gone.id();
+    gone.wait().unwrap();
+    // A killed server's cache: the lock file is there, nobody holds it. Its pid
+    // is that of the running test, which no pid check could tell from a live one.
+    let stale = scratch.join(format!("sc-git-bucket-{}-aaaa", std::process::id()));
+    // A live server's cache: the lock is held (by this process, from the point
+    // of view of the `sc serve` that sweeps), whatever its pid looks like.
+    let live = scratch.join(format!("sc-git-bucket-{dead}-bbbb"));
+    // Not a cache this sweep can judge: no lock file.
+    let unlocked = scratch.join(format!("sc-git-bucket-{dead}-cccc"));
+    for d in [&stale, &live, &unlocked] {
+        std::fs::create_dir_all(d.join("objects")).unwrap();
+    }
+    for d in [&stale, &live] {
+        std::fs::write(d.join(".owner.lock"), b"").unwrap();
+    }
+    let held = std::fs::OpenOptions::new()
+        .write(true)
+        .open(live.join(".owner.lock"))
+        .unwrap();
+    held.lock().unwrap();
+    // No stdin: the session ends at once, after the startup sweep.
+    let out = Command::new(env!("CARGO_BIN_EXE_sc"))
+        .args([
             "serve",
             "--stdio",
             "--store",
             "sc+git::file:///nonexistent/carrier.git",
             home.to_str().unwrap(),
-        ],
-    ));
-    assert!(e.contains("does not support sc+git::"), "{e}");
-    for d in [&a, &home] {
-        std::fs::remove_dir_all(d).unwrap();
-    }
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let _ = out;
+    assert!(!stale.exists(), "the dead server's cache must be reaped");
+    assert!(live.exists(), "a cache whose lock is held must stay");
+    assert!(unlocked.exists(), "a directory with no lock file must stay");
+    drop(held);
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 /// The private-branch gate through the binary, with a config written by hand

@@ -738,7 +738,8 @@ The bucket model above applies unchanged, with the Git repository as the bucket 
   leak, now to every reader of a Git host). Protected-path and secret ciphertext stays
   ciphertext. Because that exposure is wider, pushing a private branch needs the per-remote
   opt-in `--allow-private-branches`, enforced in `repo` before any upload; protected paths and
-  secrets need none.
+  secrets need none. A server in front of the repository carries the same gate under the
+  operator's own `--allow-private-branches` (below).
 - **Deleting a ref is not erasure.** A host can keep the objects fetchable by id (sc-forge does,
   until its gc prune stage), and forks, mirrors and clones keep their own copies. A deleted
   private-branch ciphertext or a pre-rewrap value should be treated as published; the cutover
@@ -755,14 +756,54 @@ The bucket model above applies unchanged, with the Git repository as the bucket 
   prompts are disabled. `http` stays allowed because plaintext is the user's choice, as in git.
   Errors carry git's captured stderr with URL userinfo redacted and control bytes escaped, so a
   hostile hook message cannot drive the terminal.
-- **A hostile host is bounded on read, not on download.** A pack value is capped at 2 GiB, any other value at 256 MiB
+- **A hostile host is bounded per fetch, on disk only: not in RAM inside `index-pack`, not in the
+  total cache.** A pack value is capped at 2 GiB, any other value at 256 MiB
   (checked before reading into memory), and a chunk at 32 MiB, a tree at 10,000
   chunks, captured `ls-remote` output at 64 MiB; fetches are shallow so a hostile commit's parents
   are never downloaded; a fetched value must be a parentless commit over contiguous regular chunk
   blobs or it is refused as corrupt. The WAL's own 256 MiB metadata cap and pack bounds still
-  apply. `git fetch` has no input-size limit, so a hostile host or repository writer can still
-  make a fetch write an oversized value into the temp cache before the caps refuse it (disk, not
-  RAM; the cache is removed afterwards), the same class as an unbounded S3 `get`.
+  apply. `git fetch` has no input-size limit, so every fetch runs under a watchdog:
+  `fetch.unpackLimit=1` puts all incoming data in one `objects/pack/tmp_pack_*`, the growth of
+  `objects/pack` is polled (2 ms at first, backing off to 50 ms), and git is killed once it
+  passes the budget (the key's value cap plus 0.1% and 1 MiB for a fetch of one key, 2 GiB for a
+  family or batched fetch) or after 120 s with no growth and no exit. What the fetch added is
+  removed and the error names the cap. A fetch that ends between two polls is caught by a check
+  after it exits, and the measuring goes on while a helper still holds git's pipes and once
+  more after they close. Every breach (budget, budget after exit, no progress, a pipe held open
+  after exit) stops git, waits up to 5 s for helpers to go and the directory to settle, then
+  discards. The process group is signalled only while git is unreaped, when its pid pins the
+  group id; after the reap it is never signalled, because the id may have been reused by an
+  unrelated process group of the same user and nothing observable shows otherwise (pinning the
+  pid without reaping needs `unsafe`). The limits, plainly:
+  - The bound is disk bytes per fetch. It does not cover git's memory while `index-pack`
+    resolves a pack, and it does not cover the total size of the cache, which grows by what each
+    fetch keeps and lives as long as the process. An HTTP daemon opens one cold cache per
+    connection, so its disk cost is up to the per-fetch budget times `--max-connections`, plus
+    what the caches keep.
+  - Refs a family fetch writes are not measured. A hostile host can advertise a great many refs;
+    only the 120 s no-progress deadline bounds that.
+  - A family fetch (`log/`, `checkpoints/`, `packs/*.idx`) over the 2 GiB budget is killed and
+    discarded, then the reader falls back to one fetch per key, each under its own value cap
+    (256 MiB, or 2 GiB for a `.pack`), and remembers it for that instance, so a legitimate
+    store that has grown past the family budget stays readable and can compact itself. A
+    hostile host can force that slower path (one git round trip per key) by serving a big
+    family; it cannot lift any per-key cap by doing so.
+  - Only serve mode on unix is disk-bounded against a hostile HTTP host, and only while git
+    runs. There git runs in its own process group and the whole group is killed while git is
+    unreaped (through the system `kill`; without one the watchdog warns once and kills git
+    alone), so `ssh`, `git-remote-https` and `index-pack` die with it. Outside serve mode (the
+    unix CLI, Windows), and possibly against a smart-HTTP host on protocol v0 or v1, the kill may
+    not reach the helper chain that writes the pack, which can keep writing after git is killed:
+    those cases are not disk-bounded. The call still returns, since detached pipe readers keep a
+    surviving helper from blocking it.
+  - A helper that outlives git's exit (a smart-HTTP v0/v1 helper chain, an ssh `ControlPersist`
+    master, a hostile process) is not killed in any mode, because the process group is never
+    signalled after the leader is reaped. It may keep writing after the discard until it exits.
+  - A fetch in its own process group outlives a killed `sc serve`; a supervisor that kills the
+    whole cgroup covers it.
+  - Only fetches are watched. `ls-remote` and push run unwatched: over HTTP
+    `http.lowSpeedLimit`/`lowSpeedTime` bound them, over ssh the operator should set
+    `ServerAliveInterval` for the daemon's ssh user.
 - **Rejections are classified by re-reading the ref**, not by the host's wording, so a hook or
   permission refusal is never reported as a lost race. The atomic CAS relies on the host checking
   the sent old value under its ref lock: stock `git receive-pack` and sc-forge do (verified);
@@ -789,12 +830,32 @@ The bucket model above applies unchanged, with the Git repository as the bucket 
   re-created it) keeps every candidate pack for that run. **Every pusher holds
   delete** (a push to `refs/sc/*` is a push); unlike S3, delete rights cannot be withheld from
   them. Run compaction from one host (clocks).
-- **Not built in v1.** `sc serve --store sc+git::` is refused (a daemon cannot answer prompts
-  and would bypass the client-side private-branch opt-in).
-- **Scaling.** Every `ls-remote` and push downloads the whole ref advertisement (the pattern given to `ls-remote` filters on the client; a packet trace showed the server sends every ref, protocol v2 `ref-prefix` or not), and a cold read fetches every `log/` and `checkpoints/` entry behind the last checkpoint. Refs grow by at least three per push (a log entry, a pack and its idx); `sc remote compact` bounds that by merging small packs and deleting what nothing names, so a long-lived store should be compacted on a schedule. Between runs the advertisement still grows until a ref-filtering host exists.
+- **Serving a Git store (`sc serve --store sc+git::<url>`).** The server is a client of the Git
+  host with the operator's credentials, so git must authenticate without prompting (an ssh
+  agent, a key without a passphrase, or a credential helper); the server holds a credential as
+  strong as any bucket writer's. A server not started with `--allow-private-branches` (the flag
+  is refused for other stores) refuses, as `InvalidArgument` with no wire change, every object of
+  a sealed-branch kind (`Sealed`, `Manifest`) in `PutPack` (before anything is uploaded, in any
+  record order) and in `PutObject` (before it is staged), and any `UpdateRef` whose new tip is a
+  manifest, even one already on the chain, so no private-branch ciphertext reaches the Git host
+  through it and an existing private branch cannot be advanced or re-pointed. A client cannot
+  lift the gate: the opt-in is the operator's, and without it any holder of a server token is
+  kept from publishing private-branch names, recipient ids and sizes to everyone who can read
+  the repository. It does not hide what is already on the host (reads still serve existing
+  private branches), and a writer with direct push access bypasses the server. The refusal says
+  that no private-branch object was uploaded, not that nothing was: public objects of the same
+  push may already sit on the host as an orphan pack. An ssh user who can run `sc serve` is an
+  operator: they can pass `--store` and `--allow-private-branches`, so the gate protects against
+  the server's clients, not against whoever starts it.
+- **Scaling.** `ls-remote` and push download the whole ref advertisement (the pattern given to `ls-remote` filters on the client; a packet trace showed the server sends every ref; the manifest read no longer does, it is one `git fetch` that a protocol v2 host answers with that ref alone), and a cold read fetches every `log/` and `checkpoints/` entry behind the last checkpoint. Refs grow by at least three per push (a log entry, a pack and its idx); `sc remote compact` bounds that by merging small packs and deleting what nothing names, so a long-lived store should be compacted on a schedule. Between runs the advertisement still grows until a ref-filtering host exists.
 - **Local cache.** A temporary bare repository `sc-git-bucket-<pid>-<random>` (mode 0700) holds
   fetched store objects and is removed on exit; a killed process (SIGKILL, or SIGINT) can leave it
-  behind, and there is no reaper.
+  behind. The CLI has no reaper. `sc serve` keeps the cache under the serve home's `.sc/tmp/`, holds
+  an advisory lock on `<cache>/.owner.lock` for the bucket's life, and at startup removes the caches
+  whose lock is free (unix). Liveness is that lock, not a pid, so a live `sc serve --stdio`
+  session's cache on the same home is never removed and pid reuse, pid-1 containers and several pid
+  namespaces on one host do not matter; it is an advisory lock on one host, unreliable over NFS and
+  similar, as for `DirBucket`.
 - Not tested against real GitHub. The "not independently audited, do not commit production
   secrets" warning at the top of this document applies unchanged.
 

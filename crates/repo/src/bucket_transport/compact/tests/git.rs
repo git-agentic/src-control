@@ -120,6 +120,15 @@ impl Hub {
         BucketTransport::open(&format!("sc+git::{}", self.url())).unwrap()
     }
 
+    /// A compactor/reader whose whole-family fetches are capped at one byte, so
+    /// every `log/`, `checkpoints/` and `packs/*.idx` family counts as over the
+    /// family download budget (the real one is 2 GiB).
+    fn tiny_family_carrier(&self) -> BucketTransport {
+        let mut b = GitBucket::open(&self.url()).unwrap();
+        b.cap_family_fetches_at(1);
+        BucketTransport::build(Box::new(b), true).unwrap()
+    }
+
     /// A compactor whose bucket calls pass through `hook(op, key, after)`.
     fn hooked(&self, hook: Hook) -> BucketTransport {
         BucketTransport::build(Box::new(self.wrapped(hook)), true).unwrap()
@@ -527,6 +536,39 @@ fn the_first_run_deletes_nothing_it_never_saw_and_a_run_past_the_grace_deletes_w
     let mut all = refs;
     all.push(push_label(&hub, "after"));
     assert_readable(&hub, &all);
+}
+
+/// A store whose key families passed the family download budget must still be
+/// readable, or it could never compact itself out of that state: the cold read
+/// (and so the compactor's own refresh) falls back to one fetch per key.
+#[test]
+fn a_carrier_whose_families_exceed_the_family_budget_still_compacts() {
+    need_git!();
+    let (hub, refs) = seeded_hub("git-big-families");
+    let start = t0();
+
+    // Run 1 reads and merges through single-key fetches only.
+    let r1 = hub.tiny_family_carrier().compact(&at(start)).unwrap();
+    assert_eq!((r1.packs_merged, r1.packs_created), (12, 1), "{r1:?}");
+    assert_eq!(
+        (r1.logs_deleted, r1.checkpoints_deleted, r1.packs_deleted),
+        (0, 0, 0),
+        "{r1:?}"
+    );
+    assert_readable(&hub, &refs);
+
+    // Run 2, two days later, deletes what aged, over the same oversized families.
+    let r2 = hub
+        .tiny_family_carrier()
+        .compact(&at(start + 2 * DAY))
+        .unwrap();
+    assert_eq!(
+        (r2.logs_deleted, r2.checkpoints_deleted, r2.packs_deleted),
+        (13, 1, 12),
+        "{r2:?}"
+    );
+    tight(&hub);
+    assert_readable(&hub, &refs);
 }
 
 #[test]

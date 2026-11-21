@@ -431,8 +431,8 @@ cargo run --bin sc -- remote add <name> sc+git::<git-url> [--allow-private-branc
                                               # `git ls-remote` lists them; the same repo can also
                                               # hold a `--git` mirror of public branches. Anyone
                                               # with push to the repo holds bucket put + delete;
-                                              # deleting a ref is not erasure. `serve --store`
-                                              # refuses it in v1; `remote compact` works (below);
+                                              # deleting a ref is not erasure. `remote compact`
+                                              # and `serve --store` work (below);
                                               # clone --filter refused as for any bucket. Untested
                                               # against real GitHub
 cargo run --bin sc -- remote compact <name> [--dry-run] [--prune-expire 24h] [--allow-short-grace]
@@ -468,6 +468,20 @@ cargo run --bin sc -- serve --http <addr> <home> --store sc+wal://<dir>|sc+s3://
                                               # all content lives in the bucket (instance is
                                               # disposable); <home> still needs `.sc/` for tokens,
                                               # the TLS identity and scratch space
+cargo run --bin sc -- serve --http <addr> <home> --store sc+git::<git-url> [--allow-private-branches]
+                                              # the same in front of a Git repository (ADR-0060):
+                                              # git must authenticate WITHOUT prompting (ssh agent,
+                                              # key without passphrase, credential helper). Without
+                                              # --allow-private-branches (refused for any other
+                                              # store) the server refuses every private-branch
+                                              # object and a ref at a manifest before anything
+                                              # reaches the host; only the operator can lift it.
+                                              # The git cache lives under <home>/.sc/tmp/, locked
+                                              # while a session lives; a start reaps caches whose
+                                              # lock is free (unix, one host, not NFS). Every
+                                              # fetch runs under a download watchdog (disk per
+                                              # fetch; 120 s no-progress deadline); serve mode
+                                              # needs a `kill` on the PATH to kill git's group
 bash demo/run_git_carrier_demo.sh             # sc+git:: proof (P39): a bare Git repo as the host;
                                               # protected path + secret + private branch pushed
                                               # (private branch refused without the opt-in), plain

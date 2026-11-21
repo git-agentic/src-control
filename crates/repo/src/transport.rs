@@ -131,13 +131,20 @@ fn check_servable_size(id: &ObjectId, len: u64, max: usize) -> Result<()> {
     Ok(())
 }
 
+/// The object kinds only a private branch produces: sealed members and branch
+/// manifests (P34). `sc serve --store sc+git::` refuses them at ingest unless the
+/// operator opted in (ADR-0060), so this is the one place that names the kinds.
+pub(crate) fn is_sealed_branch_object(obj: &Object) -> bool {
+    matches!(obj, Object::Sealed(_) | Object::Manifest(_))
+}
+
 /// Object kinds a by-id read never serves (ADR-0047): sealed private-branch
 /// members and branch manifests. Filtered transfers already exclude them
 /// (`filter_manifest_wants`); this keeps the by-id verb consistent with that
 /// rule. It is a consistency rule, not a confidentiality boundary: sealed
 /// objects are ciphertext and an unfiltered pack still serves them.
 fn refused_by_id(obj: &Object) -> bool {
-    matches!(obj, Object::Sealed(_) | Object::Manifest(_))
+    is_sealed_branch_object(obj)
 }
 
 /// What the unlocked half of a local `update_ref` leaned on, for the locked

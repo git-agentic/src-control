@@ -143,8 +143,9 @@ branches, protected paths and secrets travel through a Git host that a plain
 `git clone` never sees into (ADR-0060). Pushing a private branch there needs
 `--allow-private-branches` (its name and recipient ids become readable by
 everyone who can read the repository). `sc remote compact` works on it (run it
-from one host; the first run only records when it first saw each object);
-`serve --store` is not supported on it yet. Proven by
+from one host; the first run only records when it first saw each object).
+`sc serve --store sc+git::<git-url>` serves it and refuses private branches
+unless the operator passes `--allow-private-branches`. Proven by
 `demo/run_git_carrier_demo.sh`; not tested against GitHub itself.
 
 ## How Phase 1 works

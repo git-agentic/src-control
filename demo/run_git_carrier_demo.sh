@@ -23,8 +23,16 @@
 #      plaintext, no embargoed file, and cannot read the secret value.
 #   6. KEYED: an sc clone with alice's identity reads the protected file, the
 #      secret and the embargoed branch.
-#   7. Zero residue: no leftover `sc-git-bucket-*` temp dirs (TMPDIR is private
-#      to each run, so any leftover is ours) and no .sc/tmp residue.
+#   7. SERVE: `sc serve --http --store sc+git::<host>` in front of the same host.
+#      A public push and a keyless clone work through it; a private push is
+#      refused by the SERVER (no private-branch object reaches the host) until
+#      the operator restarts it with --allow-private-branches.
+#   8. FILTERED READ: every manifest fetch sc makes (traced through an SC_GIT
+#      shim with GIT_TRACE_PACKET) sends `ref-prefix refs/sc/manifest`, and the
+#      host lists that one ref, not its branches or the other refs/sc/* keys.
+#   9. Zero residue: no leftover `sc-git-bucket-*` temp dirs (TMPDIR is private
+#      to each run, so any leftover is ours), nothing in the serve home's
+#      .sc/tmp and no .sc/tmp residue.
 #
 # Self-checking: every claim is an assertion; any failure exits non-zero before
 # the RESULT line. Run twice to prove repeatability. The forge leg needs
@@ -53,7 +61,14 @@ fail() { echo "FAIL: $1"; exit 1; }
 
 WORK=""
 FORGE_PID=""
+SERVE_PID=""
+SERVE_ADDR=""
 cleanup() {
+  if [ -n "$SERVE_PID" ]; then
+    kill "$SERVE_PID" 2>/dev/null || true
+    wait "$SERVE_PID" 2>/dev/null || true
+    SERVE_PID=""
+  fi
   if [ -n "$FORGE_PID" ]; then
     kill "$FORGE_PID" 2>/dev/null || true
     wait "$FORGE_PID" 2>/dev/null || true
@@ -72,6 +87,46 @@ SENT_SECRET="SECRET-VALUE-SENTINEL-4c1e"
 no_cache_residue() {
   if ls "$WORK/tmp" 2>/dev/null | grep -q '^sc-git-bucket-'; then
     fail "leftover sc-git-bucket-* temp dir in $WORK/tmp"
+  fi
+}
+
+# start_serve <home> <store url> [extra sc serve flags]: runs `sc serve --http`
+# on a free loopback port in the background; sets SERVE_PID and SERVE_ADDR.
+start_serve() {
+  local home="$1" store="$2" i
+  shift 2
+  : > "$WORK/serve.out"
+  "$SC" serve --http 127.0.0.1:0 --store "$store" "$@" "$home" \
+    > "$WORK/serve.out" 2> "$WORK/serve.err" &
+  SERVE_PID=$!
+  SERVE_ADDR=""
+  for i in $(seq 1 100); do
+    SERVE_ADDR=$(sed -n 's/^listening on //p' "$WORK/serve.out" | head -1)
+    [ -n "$SERVE_ADDR" ] && return 0
+    kill -0 "$SERVE_PID" 2>/dev/null || { cat "$WORK/serve.err"; fail "sc serve exited"; }
+    sleep 0.1
+  done
+  fail "sc serve did not announce an address"
+}
+
+# wait_serve_idle <home>: every session removes its Git cache when it ends, but
+# the client can return before the server thread has finished; wait for that so
+# killing the server cannot leave a cache behind (a killed server's leftovers
+# are only reaped by the next start).
+wait_serve_idle() {
+  local i
+  for i in $(seq 1 100); do
+    [ -z "$(ls -A "$1/.sc/tmp" 2>/dev/null)" ] && return 0
+    sleep 0.1
+  done
+  fail "the server's sessions did not clean up under $1/.sc/tmp"
+}
+
+stop_serve() {
+  if [ -n "$SERVE_PID" ]; then
+    kill "$SERVE_PID" 2>/dev/null || true
+    wait "$SERVE_PID" 2>/dev/null || true
+    SERVE_PID=""
   fi
 }
 
@@ -214,14 +269,77 @@ scenario() {
   echo "keyed clone: protected file decrypts, secret injects, embargoed branch reads ✔"
 
   echo
-  echo "=== [$label] 7: zero residue ==="
+  echo "=== [$label] 7: SERVE — sc serve --store sc+git:: in front of the host ==="
+  local home="$WORK/serve-home-$idx" after2
+  mkdir -p "$home" && ( cd "$home" && "$SC" init >/dev/null )
+  cd "$a"
+  start_serve "$home" "$url"
+  "$SC" remote add gated "sc+http://$SERVE_ADDR/x" >/dev/null 2>&1
+  echo "public via server" > served.txt
+  "$SC" commit -m "public via server" --author alice --identity "$key" >/dev/null
+  before=$(git ls-remote "$giturl" 'refs/sc/*' | sort)
+  "$SC" push gated >/dev/null || fail "a public push through the server must work"
+  after=$(git ls-remote "$giturl" 'refs/sc/*' | sort)
+  [ "$before" != "$after" ] || fail "the public push through the server must reach the host"
+  "$SC" switch hotfix --identity "$key" >/dev/null
+  echo "more embargoed" > embargo2.txt
+  "$SC" commit -m "embargo via server" --author alice --identity "$key" >/dev/null
+  before="$after"
+  out=$("$SC" push gated 2>&1 || true)
+  echo "$out" | grep -q -- "--allow-private-branches" \
+    || fail "the server must refuse the private push and name its flag (got: $out)"
+  echo "$out" | grep -q "No private-branch object was uploaded" \
+    || fail "the server's refusal must say no private-branch object was uploaded (got: $out)"
+  after=$(git ls-remote "$giturl" 'refs/sc/*' | sort)
+  [ "$before" = "$after" ] || fail "the refused private push must leave refs/sc/* on the host unchanged"
+  wait_serve_idle "$home"
+  stop_serve
+  start_serve "$home" "$url" --allow-private-branches
+  "$SC" remote add opted-srv "sc+http://$SERVE_ADDR/x" >/dev/null 2>&1
+  "$SC" push opted-srv >/dev/null || fail "the private push must work once the operator opted in"
+  after2=$(git ls-remote "$giturl" 'refs/sc/*' | sort)
+  [ "$before" != "$after2" ] || fail "the private push must reach the host with the flag"
+  "$SC" switch main --identity "$key" >/dev/null
+  "$SC" clone "sc+http://$SERVE_ADDR/x" "$WORK/srv-keyless-$idx" >/dev/null 2>&1 \
+    || fail "a keyless clone through the server must work"
+  ( cd "$WORK/srv-keyless-$idx" && "$SC" branch list | grep -q "hotfix (private, no access)" ) \
+    || fail "a keyless clone through the server must see the private branch only as a marker"
+  wait_serve_idle "$home"
+  stop_serve
+  echo "gated server: public push ok, private push refused (host unchanged); with the operator's flag it lands ✔"
+
+  echo
+  echo "=== [$label] 8: FILTERED READ — a manifest fetch asks the host for one ref ==="
+  local trace="$WORK/trace-$idx" f refs nrefs fetches=0
+  mkdir -p "$trace"
+  SC_GIT="$WORK/sc-git-trace" TRACE_DIR="$trace" \
+    "$SC" clone "$url" "$WORK/traced-$idx" >/dev/null 2>&1 || fail "the traced clone must work"
+  nrefs=$(git ls-remote "$giturl" | wc -l | tr -d ' ')
+  for f in "$trace"/manifest-*.log; do
+    [ -e "$f" ] || continue
+    grep -q 'ref-prefix refs/sc/manifest' "$f" \
+      || fail "a manifest fetch must ask for the ref by prefix ($f)"
+    refs=$(grep 'fetch<' "$f" | grep -o ' refs/[^ ]*$' | sort -u | tr -d ' ' | tr '\n' ' ')
+    [ "$refs" = "refs/sc/manifest " ] \
+      || fail "the host must list only refs/sc/manifest in a manifest fetch, got: $refs"
+    fetches=$((fetches + 1))
+  done
+  [ "$fetches" -ge 1 ] || fail "no manifest fetch was traced"
+  # Show the evidence: the request prefix and the ref listing the host answered with.
+  f=$(ls "$trace"/manifest-*.log | head -1)
+  grep -E 'fetch> ref-prefix refs/sc/manifest$|fetch< [0-9a-f]{40} refs/' "$f" \
+    | sed 's/^[^ ]* *pkt-line.c:[0-9]* *packet: */    /'
+  echo "$fetches manifest fetch(es) traced: each sent 'ref-prefix refs/sc/manifest' and the host listed refs/sc/manifest alone, though it holds $nrefs refs ✔"
+
+  echo
+  echo "=== [$label] 9: zero residue ==="
   no_cache_residue
-  for r in "$a" "$WORK/keyless-$idx" "$WORK/keyed-$idx"; do
+  for r in "$a" "$WORK/keyless-$idx" "$WORK/keyed-$idx" "$WORK/srv-keyless-$idx" "$WORK/traced-$idx"; do
     if [ -d "$r/.sc/tmp" ] && [ -n "$(ls -A "$r/.sc/tmp" 2>/dev/null)" ]; then
       fail "$r/.sc/tmp is not empty"
     fi
   done
-  echo "no sc-git-bucket-* temp dir, no .sc/tmp residue ✔"
+  echo "no sc-git-bucket-* temp dir, no .sc/tmp residue (serve home included) ✔"
 }
 
 start_forge() {
@@ -256,6 +374,16 @@ run_demo() {
   local run_label="$1"
   WORK=$(mktemp -d "$tmp_base/sc-git-carrier-demo.XXXXXX")
   mkdir -p "$WORK/home" "$WORK/tmp"
+  # SC_GIT shim: GIT_TRACE_PACKET is scrubbed from the environment sc hands git,
+  # so the shim sets it, for manifest fetches only, one trace file per call.
+  cat > "$WORK/sc-git-trace" <<'SHIM'
+#!/bin/sh
+case " $* " in
+  *" +refs/sc/manifest:refs/sc/manifest "*) export GIT_TRACE_PACKET="$TRACE_DIR/manifest-$$.log" ;;
+esac
+exec git "$@"
+SHIM
+  chmod +x "$WORK/sc-git-trace"
   export HOME="$WORK/home"
   export TMPDIR="$WORK/tmp"     # any sc-git-bucket-* left behind lands here
   export GIT_CONFIG_NOSYSTEM=1
@@ -297,5 +425,9 @@ echo "rode along as an ordinary Git branch. sc remote compact then shrank"
 echo "refs/sc/* on the host in two runs a grace window apart (the first only"
 echo "recorded first sightings and deleted nothing), and after it a keyless sc"
 echo "clone saw only the branch marker and ciphertext, a keyed clone read all"
-echo "three. Verified across two independent runs, zero sc-git-bucket-* or"
-echo ".sc/tmp residue."
+echo "three. An sc serve --store sc+git:: in front of the same host took public"
+echo "pushes and refused a private push itself (no private-branch object reached"
+echo "the host) until its operator passed --allow-private-branches; every"
+echo "manifest fetch asked for one ref and the host listed that ref alone."
+echo "Verified across two independent runs, zero sc-git-bucket-* or .sc/tmp"
+echo "residue."

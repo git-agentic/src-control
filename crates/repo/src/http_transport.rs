@@ -852,6 +852,11 @@ pub struct ServeLimits {
     /// The CLI refuses `0`. The default is
     /// [`crate::wire::default_max_conn_bytes`] of the default pack cap.
     pub max_conn_bytes: u64,
+    /// Forwarded to [`crate::wire::WirePolicy::allow_private_branches`]: not a
+    /// bound, but the one served-store policy the HTTP path carries beside the
+    /// limits. Only a `sc+git::` store looks at it; `false` refuses
+    /// private-branch objects (ADR-0060).
+    pub allow_private_branches: bool,
 }
 impl Default for ServeLimits {
     fn default() -> Self {
@@ -860,6 +865,7 @@ impl Default for ServeLimits {
             timeout_secs: 300,
             max_pack_size: crate::wire::DEFAULT_MAX_PACK_SIZE,
             max_conn_bytes: crate::wire::default_max_conn_bytes(crate::wire::DEFAULT_MAX_PACK_SIZE),
+            allow_private_branches: false,
         }
     }
 }
@@ -1405,6 +1411,7 @@ fn handle_http_connection(
         max_pack_size: limits.max_pack_size,
         ro_drain_cap: crate::wire::RO_DRAIN_CAP,
         max_conn_bytes: limits.max_conn_bytes,
+        allow_private_branches: limits.allow_private_branches,
     };
     match store {
         Some(url) => {

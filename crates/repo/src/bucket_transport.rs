@@ -17,6 +17,8 @@ use std::io::Write;
 mod compact;
 #[cfg(test)]
 mod git_remote_tests;
+#[cfg(test)]
+mod git_serve_tests;
 pub use compact::{CompactOptions, CompactReport};
 
 /// How many times a read restarts from a fresh manifest after an object the
@@ -102,6 +104,12 @@ pub struct BucketTransport {
     /// age, so compaction keeps its own record of when it first saw each object
     /// (`compact/sightings`) and deletes with leases (ADR-0057 addendum).
     git_carrier: bool,
+    /// Set by [`BucketTransport::open_for_serve`] on a `sc+git::` store whose
+    /// operator did not pass `--allow-private-branches`: objects of the
+    /// sealed-branch kinds (`transport::is_sealed_branch_object`) are refused at
+    /// ingest and a ref may not point at a manifest, so no private-branch
+    /// ciphertext reaches the Git host through this server (ADR-0060).
+    refuse_sealed: bool,
 }
 
 /// A leaf object a pack holds that no tree or snapshot references, so the
@@ -229,20 +237,6 @@ pub fn check_private_push_allowed(url: &str, allowed: bool, branch: &str) -> Res
     )))
 }
 
-/// `sc serve --store sc+git::…` is refused (deferred): a daemon cannot answer
-/// ssh or credential prompts, and it would sit between clients and the
-/// client-side private-branch gate. Checked on the prefix, before any parse.
-pub fn refuse_git_store(url: &str) -> Result<()> {
-    if is_git_bucket_url(url) {
-        return Err(Error::InvalidArgument(
-            "sc serve --store does not support sc+git:: remotes yet (deferred); \
-             serve an sc+wal:// or sc+s3:// store, or push to the Git repository with `sc push`"
-                .into(),
-        ));
-    }
-    Ok(())
-}
-
 /// A parsed `sc+wal://<dir>`, `sc+s3://<bucket>/<prefix…>` or
 /// `sc+git::<git-url>` remote URL.
 /// `sc+wal` treats everything after the scheme as a directory path (so
@@ -334,6 +328,44 @@ impl BucketTransport {
         BucketTransport::build(bucket, parsed.scheme == BucketScheme::Git)
     }
 
+    /// Open the store behind `sc serve --store` (ADR-0060). For `sc+wal://` and
+    /// `sc+s3://` this is [`BucketTransport::open`]. For `sc+git::` the Git
+    /// cache lives under `scratch` (the serve home's `.sc/tmp/`), every fetch
+    /// call runs in its own process group so the fetch watchdog can take a
+    /// stuck `ssh` or `git-remote-https` down with it, and private-branch
+    /// objects are refused unless `allow_private_branches` is set: a Git host
+    /// shows the branch name, recipient ids and sizes to every reader and keeps
+    /// the ciphertext, so the opt-in belongs to the operator, not to a client.
+    pub fn open_for_serve(
+        url: &str,
+        scratch: &std::path::Path,
+        allow_private_branches: bool,
+    ) -> Result<BucketTransport> {
+        let parsed = BucketUrl::parse(url)?;
+        if parsed.scheme != BucketScheme::Git {
+            return Self::open(url);
+        }
+        let bucket = Box::new(scl_objio::GitBucket::open_in(&parsed.bucket, scratch)?);
+        let mut t = Self::build(bucket, true)?;
+        t.refuse_sealed = !allow_private_branches;
+        Ok(t)
+    }
+
+    /// The refusal for private-branch objects on a gated `sc+git::` store. The
+    /// text names the server-side flag; it never shows the store URL. It does
+    /// not claim that the whole push uploaded nothing: public objects of the same
+    /// push may already sit on the host as an orphan pack.
+    fn sealed_refusal() -> Error {
+        Error::InvalidArgument(
+            "this server stores into a Git repository (sc+git::) and was not started with \
+             --allow-private-branches, so it refuses private-branch objects: a Git host shows \
+             the branch name, recipient ids and sizes to everyone who can read the repository \
+             and keeps the ciphertext after any later revoke. No private-branch object was \
+             uploaded. The operator can restart `sc serve` with --allow-private-branches"
+                .into(),
+        )
+    }
+
     /// Open a transport directly over an already-constructed bucket backend.
     /// Fails only if the initial `refresh` (a conditional GET of the
     /// manifest plus a walk of its parent chain) errors — an entirely empty
@@ -360,6 +392,7 @@ impl BucketTransport {
             saw_absent: Cell::new(false),
             attempt_tag: RefCell::new(None),
             git_carrier,
+            refuse_sealed: false,
         };
         t.refresh()?;
         Ok(t)
@@ -951,6 +984,10 @@ impl Transport for BucketTransport {
         if obj.id() != *id {
             return Err(Error::CorruptObject(*id)); // decodes, but not canonically
         }
+        // Before staging: a refused object is never held, flushed or uploaded.
+        if self.refuse_sealed && crate::transport::is_sealed_branch_object(&obj) {
+            return Err(Self::sealed_refusal());
+        }
         self.pending_objects.borrow_mut().note(*id, obj);
         self.staged.borrow_mut().push((*id, bytes.to_vec()));
         Ok(())
@@ -965,7 +1002,17 @@ impl Transport for BucketTransport {
         // pack still content-addresses identically for identical input.
         let mut objects: Vec<(ObjectId, Vec<u8>)> = Vec::new();
         let mut received = PendingObjects::default();
-        scl_core::pack::parse_pack_reader(src, |id, obj| {
+        let mut sealed = false;
+        let parsed = scl_core::pack::parse_pack_reader(src, |id, obj| {
+            // Stop at the first sealed-branch object on a gated store, before
+            // anything is uploaded (the callback cannot return our own error
+            // type, so the flag says why the parse was aborted).
+            if self.refuse_sealed && crate::transport::is_sealed_branch_object(&obj) {
+                sealed = true;
+                return Err(scl_core::Error::PackCorrupt(
+                    "private-branch object refused".into(),
+                ));
+            }
             // The upload below re-encodes each object; bytes that decode but
             // are not canonical would be stored under an id they do not hash
             // to, and every later read would fail verification.
@@ -978,7 +1025,11 @@ impl Transport for BucketTransport {
             received.note(id, obj);
             objects.push((id, bytes));
             Ok(())
-        })?;
+        });
+        if sealed {
+            return Err(Self::sealed_refusal());
+        }
+        parsed?;
         let (hash, ids) = self.upload_pack(&objects)?;
         self.pending_packs.borrow_mut().push(hash);
         // Only after the upload: a failed one must not leave ids that no pack holds.
@@ -1066,6 +1117,16 @@ impl Transport for BucketTransport {
                     pending: &pending_objects,
                 };
                 let trusted = crate::ref_guard::check_ref_move(&mut objects, &tips, current, *id)?;
+                // A manifest tip is a private branch: refused on a gated store
+                // even when its objects are already on the chain (put by a direct
+                // writer), so an existing private branch cannot be advanced or
+                // re-pointed through this server without the opt-in.
+                if self.refuse_sealed {
+                    use crate::ref_guard::RefObjects as _;
+                    if let Some(crate::ref_guard::Node::Manifest(_)) = objects.node(id)? {
+                        return Err(Self::sealed_refusal());
+                    }
+                }
                 checked_against = Some((current, trusted));
             }
             // Claim a log slot for this attempt. `put_new` on `log/<seq>` is

@@ -1519,6 +1519,66 @@ fn refs_sc_create_cas_update_fetch_and_delete_round_trip_through_the_real_receiv
     }
 }
 
+/// How `sc+git::` reads one mutable key (`GitBucket::get`, ADR-0060): a single
+/// `git fetch` of exactly `refs/sc/<key>` under protocol v2. The host must answer
+/// the ref listing with that ref alone: the branch and the other keys never cross
+/// the wire, which the old `ls-remote` plus `fetch` pair did not achieve.
+#[test]
+fn a_v2_fetch_of_one_sc_ref_gets_a_filtered_advertisement() {
+    let (_s, c, url, auth, store) = store_world("sc-filtered");
+    seed_main(&c, &url, &auth);
+    let m = "refs/sc/manifest";
+    let v1 = bucket_value(&c, &store, &["one\n"]);
+    let log = bucket_value(&c, &store, &["entry\n"]);
+    assert!(cas_push(&c, &store, &auth, &url, m, "", &v1).0);
+    let other = "refs/sc/log/00000000000000000001";
+    assert!(cas_push(&c, &store, &auth, &url, other, "", &log).0);
+
+    let fresh = c.dir.join("fresh");
+    c.ok(&c.dir, None, &["init", "-q", fresh.to_str().unwrap()]);
+    let trace = c.dir.join("trace.log");
+    let (ok, text) = c.git_env(
+        &fresh,
+        Some(&auth),
+        &[("GIT_TRACE_PACKET", trace.to_str().unwrap())],
+        &[
+            "-c",
+            "protocol.version=2",
+            "-c",
+            "fetch.unpackLimit=1",
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--depth=1",
+            "--end-of-options",
+            &url,
+            &format!("+{m}:{m}"),
+            // The five spellings `GitBucket` excludes so that a branch, tag or
+            // remote-tracking ref cannot stand in for the key (`exact_only` in objio).
+            &format!("^refs/{m}"),
+            &format!("^refs/tags/{m}"),
+            &format!("^refs/heads/{m}"),
+            &format!("^refs/remotes/{m}"),
+            &format!("^refs/remotes/{m}/HEAD"),
+        ],
+    );
+    assert!(ok, "fetch: {text}");
+    assert_eq!(c.ok(&fresh, None, &["rev-parse", m]).trim(), v1);
+
+    let text = std::fs::read_to_string(&trace).unwrap();
+    assert!(
+        text.contains(&format!("ref-prefix {m}")),
+        "the client must ask for the ref by prefix: {text}"
+    );
+    // The reply to the ls-refs request: every `<oid> <ref>` the host listed.
+    let listed: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("fetch<") && l.contains(" refs/"))
+        .filter_map(|l| l.split_whitespace().last())
+        .collect();
+    assert_eq!(listed, [m], "the host must not list other refs: {text}");
+}
+
 /// One receive-pack request by hand (`old` and `new` are what the client believes), so the
 /// server's own compare-and-swap is exercised: the real client checks the advertisement first.
 fn raw_update(s: &Srv, auth: &str, old: &str, new: &str, refname: &str) -> String {
