@@ -5,8 +5,14 @@
 //! The scenario runs twice from one body: over `sc+wal://` as a control that
 //! proves the script itself, and over `sc+git::file://<bare repo>`.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+thread_local! {
+    /// `TMPDIR` for every `sc` this test thread runs (each test owns its thread).
+    static SC_TMPDIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
 
 fn tmp(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("scl-cli-gitbucket-{tag}-{}", std::process::id()));
@@ -26,6 +32,9 @@ fn sc_as(dir: &Path, identity: Option<&Path>, args: &[&str]) -> Output {
         .env_remove("SC_IDENTITY");
     if let Some(id) = identity {
         cmd.env("SC_IDENTITY", id);
+    }
+    if let Some(t) = SC_TMPDIR.with(|t| t.borrow().clone()) {
+        cmd.env("TMPDIR", t);
     }
     cmd.output().expect("sc runs")
 }
@@ -210,12 +219,21 @@ fn pushing_a_private_branch_to_a_git_carrier_needs_the_opt_in() {
     let e = err_text(&sc(&a, &["push", "origin"]));
     for needle in [
         "--allow-private-branches",
+        "sc remote set <name> --allow-private-branches",
         "readable by everyone who can read the Git repository",
         "after any later revoke",
     ] {
         assert!(e.contains(needle), "missing {needle:?}: {e}");
     }
     assert!(!carrier.exists(), "nothing was uploaded");
+    // The suggested command works on the existing remote: the gate is passed
+    // (the push now fails later, opening the nonexistent carrier).
+    ok(sc(
+        &a,
+        &["remote", "set", "origin", "--allow-private-branches"],
+    ));
+    let e = err_text(&sc(&a, &["push", "origin"]));
+    assert!(!e.contains("Nothing was uploaded"), "{e}");
     for d in [&a, &keys] {
         std::fs::remove_dir_all(d).unwrap();
     }
@@ -319,6 +337,11 @@ fn clone_into(
 /// The shared body. `gated` is true for `sc+git::`, where a private branch
 /// needs the per-remote opt-in.
 fn scenario(fx: Fixture, gated: bool) {
+    // Every `sc` runs with its own empty TMPDIR, so the carrier's temporary
+    // cache repositories are findable afterwards.
+    let tmpdir = fx.root.join("sc-tmpdir");
+    std::fs::create_dir_all(&tmpdir).unwrap();
+    SC_TMPDIR.with(|t| *t.borrow_mut() = Some(tmpdir.clone()));
     let idp = fx.id.clone();
     let idp = idp.to_str().unwrap();
     let a = &fx.a;
@@ -433,7 +456,17 @@ fn scenario(fx: Fixture, gated: bool) {
     // A partial clone of a bucket remote is refused, as for sc+wal://.
     let (partial, out) = clone_into(&fx, "partial", None, &["--filter", "config/"]);
     let e = err_text(&out);
-    assert!(!e.is_empty() && !partial.exists(), "{e}");
+    assert!(
+        e.contains("partial clone from bucket remotes is not supported"),
+        "{e}"
+    );
+    assert!(!partial.exists(), "{e}");
+
+    let left: Vec<_> = std::fs::read_dir(&tmpdir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "temp cache left behind: {left:?}");
 
     std::fs::remove_dir_all(&fx.root).unwrap();
     std::fs::remove_dir_all(&fx.keys).unwrap();
@@ -496,6 +529,7 @@ fn remote_add_accepts_scp_form_and_file_carrier_urls_and_notices_once() {
         "relative/path",
         "-oProxyCommand=x",
         "https://u:pw@h/r.git",
+        "https://token@h/r.git",
         "",
     ] {
         let url = format!("sc+git::{bad}");
@@ -504,5 +538,97 @@ fn remote_add_accepts_scp_form_and_file_carrier_urls_and_notices_once() {
             "{url}"
         );
     }
+    std::fs::remove_dir_all(&a).unwrap();
+}
+
+/// No message of ours shows a credential from an `sc+git::` URL.
+#[test]
+fn rejected_urls_and_flag_errors_never_echo_credentials() {
+    let a = tmp("redact");
+    init_repo(&a);
+    let dst = a.join("dst");
+    let cred = "sc+git::https://u:hunter2@h/r.git";
+    let out = sc(&a, &["remote", "add", "bad", cred]);
+    let seen = |o: &Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        )
+    };
+    assert!(!out.status.success());
+    assert!(!seen(&out).contains("hunter2"), "{}", seen(&out));
+    // the --git refusals, in both commands
+    for url in [cred, "sc+git::git@h:o/r.git"] {
+        for args in [
+            vec!["remote", "add", "x", url, "--git"],
+            vec!["clone", "--git", url, dst.to_str().unwrap()],
+        ] {
+            let out = sc(&a, &args);
+            assert!(seen(&out).contains("--git cannot be used"), "{args:?}");
+            assert!(!seen(&out).contains("hunter2"), "{}", seen(&out));
+        }
+    }
+    // a valid URL with an ssh user is echoed without the user part
+    let out = sc(&a, &["remote", "add", "ok", "sc+git::ssh://deploy@h/r.git"]);
+    assert!(!seen(&out).contains("deploy@"), "{}", seen(&out));
+    assert!(out.status.success());
+    // near misses in the other letter cases are refused too
+    for url in ["SC+GIT::https://u:hunter2@h/r.git", "Sc+Git:x"] {
+        let out = sc(&a, &["remote", "add", "y", url]);
+        assert!(!out.status.success(), "{url}");
+        assert!(!seen(&out).contains("hunter2"), "{}", seen(&out));
+    }
+    assert_eq!(ok(sc(&a, &["remote", "list"])).lines().count(), 1);
+    std::fs::remove_dir_all(&a).unwrap();
+}
+
+/// `sc remote set` flips the private-branch opt-in on an existing remote.
+#[test]
+fn remote_set_changes_the_private_branch_opt_in() {
+    let a = tmp("remote-set");
+    init_repo(&a);
+    ok(sc(
+        &a,
+        &["remote", "add", "origin", "sc+git::file:///srv/hub.git"],
+    ));
+    ok(sc(&a, &["remote", "add", "w", "sc+wal:///srv/w"]));
+    let cfg = || std::fs::read_to_string(a.join(".sc/config")).unwrap();
+    assert!(!cfg().contains("allow_private_branches = true"));
+    ok(sc(
+        &a,
+        &["remote", "set", "origin", "--allow-private-branches"],
+    ));
+    assert!(cfg().contains("allow_private_branches = true"), "{}", cfg());
+    ok(sc(
+        &a,
+        &["remote", "set", "origin", "--no-allow-private-branches"],
+    ));
+    assert!(
+        !cfg().contains("allow_private_branches = true"),
+        "{}",
+        cfg()
+    );
+    // refusals
+    let e = err_text(&sc(&a, &["remote", "set", "origin"]));
+    assert!(e.contains("nothing to set"), "{e}");
+    let e = err_text(&sc(&a, &["remote", "set", "w", "--allow-private-branches"]));
+    assert!(e.contains("only to sc+git::"), "{e}");
+    let e = err_text(&sc(
+        &a,
+        &["remote", "set", "nope", "--allow-private-branches"],
+    ));
+    assert!(e.contains("no such remote"), "{e}");
+    let e = err_text(&sc(
+        &a,
+        &[
+            "remote",
+            "set",
+            "origin",
+            "--allow-private-branches",
+            "--no-allow-private-branches",
+        ],
+    ));
+    assert!(e.contains("cannot be used with"), "{e}");
     std::fs::remove_dir_all(&a).unwrap();
 }

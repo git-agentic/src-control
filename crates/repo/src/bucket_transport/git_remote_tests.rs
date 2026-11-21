@@ -32,9 +32,23 @@ fn sc_git_near_misses_are_refused_at_parse() {
         "sc+git:file:///x",
         "sc+git::file:///x\n",
         "sc+git::file:///x\r",
+        // the prefix is case-insensitive: only exact lowercase `sc+git::` parses
+        "SC+GIT::file:///x",
+        "Sc+Git:x",
+        "sc+GIT::file:///x",
+        "SC+git:/x",
     ] {
         let msg = invalid(BucketUrl::parse(url));
         assert!(msg.contains("bad bucket url"), "{url}: {msg}");
+    }
+    // No message echoes a credential from the URL.
+    for url in [
+        "sc+git::https://u:hunter2@h/r.git",
+        "SC+GIT::https://u:hunter2@h/r.git",
+        "sc+git:https://u:hunter2@h/r.git",
+    ] {
+        let msg = invalid(BucketUrl::parse(url));
+        assert!(!msg.contains("hunter2"), "{url}: {msg}");
     }
     // Not under the prefix at all: the generic refusal names all three schemes.
     assert!(invalid(BucketUrl::parse("sc+gitx::y")).contains("sc+git::"));
@@ -50,6 +64,8 @@ fn is_bucket_url_recognises_every_bucket_scheme_and_the_reserved_prefix() {
         // reserved prefix: routed to the bucket transport so parse refuses it
         "sc+git:/x",
         "sc+git://x",
+        "SC+GIT::x",
+        "Sc+Git:x",
     ] {
         assert!(is_bucket_url(url), "{url}");
     }
@@ -75,11 +91,13 @@ fn a_near_miss_never_opens_as_a_local_path() {
     let d = root("nearmiss");
     // A directory that a path reading of the URL would find.
     std::fs::create_dir_all(d.join(".sc")).unwrap();
-    let url = format!("sc+git:{}", d.display());
-    let Err(err) = crate::stdio_transport::open_transport(&url) else {
-        panic!("a near miss is refused");
-    };
-    assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+    for prefix in ["sc+git:", "SC+GIT::", "Sc+Git:"] {
+        let url = format!("{prefix}{}", d.display());
+        let Err(err) = crate::stdio_transport::open_transport(&url) else {
+            panic!("a near miss is refused: {url}");
+        };
+        assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+    }
     std::fs::remove_dir_all(&d).unwrap();
 }
 
@@ -94,9 +112,17 @@ fn the_private_branch_gate_names_the_flag_and_the_exposure() {
         "readable by everyone who can read the Git repository",
         "after any later revoke",
         "Nothing was uploaded",
+        "sc remote set <name> --allow-private-branches",
     ] {
         assert!(msg.contains(needle), "missing {needle:?}: {msg}");
     }
+    // the message never shows userinfo
+    let msg = invalid(check_private_push_allowed(
+        "sc+git::https://u:hunter2@h/r.git",
+        false,
+        "hotfix",
+    ));
+    assert!(!msg.contains("hunter2"), "{msg}");
     assert!(check_private_push_allowed(url, true, "hotfix").is_ok());
     // Other remote kinds are unchanged.
     for other in ["sc+wal:///tmp/b", "sc+s3://b/p", "ssh://h/r", "/srv/repo"] {
@@ -170,6 +196,24 @@ fn serve_store_and_compact_refuse_git_carriers_before_parsing() {
     std::fs::remove_dir_all(&home).unwrap();
 }
 
+/// The compaction refusal lives in the repo layer, not only in the CLI: a
+/// transport opened from an `sc+git::` URL refuses `compact` outright.
+#[test]
+fn compact_refuses_a_git_carrier_transport() {
+    let d = root("compact-git");
+    let open = |git: bool| {
+        BucketTransport::build(
+            Box::new(scl_objio::DirBucket::open(d.to_str().unwrap()).unwrap()),
+            git,
+        )
+        .unwrap()
+    };
+    let msg = invalid(open(true).compact(&CompactOptions::default()));
+    assert!(msg.contains("remote compact"), "{msg}");
+    open(false).compact(&CompactOptions::default()).unwrap();
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
 #[test]
 fn sc_git_urls_parse_with_the_inner_url_verbatim() {
     for inner in [
@@ -190,6 +234,7 @@ fn sc_git_urls_parse_with_the_inner_url_verbatim() {
         "-oProxyCommand=x",
         "relative/path",
         "https://u:pw@h/r.git",
+        "https://token@h/r.git",
     ] {
         assert!(
             BucketUrl::parse(&format!("sc+git::{inner}")).is_err(),

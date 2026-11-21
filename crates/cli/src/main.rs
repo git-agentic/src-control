@@ -902,6 +902,17 @@ enum RemoteOp {
         #[arg(long)]
         allow_private_branches: bool,
     },
+    /// Change a setting of an existing remote.
+    Set {
+        name: String,
+        /// Let this remote receive private branches (`sc+git::` only); see
+        /// `sc remote add --allow-private-branches` for what that exposes.
+        #[arg(long, conflicts_with = "no_allow_private_branches")]
+        allow_private_branches: bool,
+        /// Stop this remote receiving private branches again.
+        #[arg(long)]
+        no_allow_private_branches: bool,
+    },
     /// List configured remotes.
     List,
     /// Compact a bucket remote (`sc+wal://`, `sc+s3://`; not `sc+git::` yet): merge small packs,
@@ -4063,7 +4074,8 @@ fn run_clone(
     let git_bucket = scl_repo::is_git_bucket_url(&src);
     if git_bucket && git {
         anyhow::bail!(
-            "--git cannot be used with {src}: sc+git:: carries a native sc store, not a Git history"
+            "--git cannot be used with {}: sc+git:: carries a native sc store, not a Git history",
+            scl_repo::redact(&src)
         );
     }
     if allow_private_branches && !git_bucket {
@@ -4477,7 +4489,8 @@ fn run_remote(op: RemoteOp) -> Result<()> {
             let git_bucket = scl_repo::is_git_bucket_url(&url);
             if git_bucket && git {
                 anyhow::bail!(
-                    "--git cannot be used with {url}: sc+git:: carries a native sc store, not a Git history"
+                    "--git cannot be used with {}: sc+git:: carries a native sc store, not a Git history",
+                    scl_repo::redact(&url)
                 );
             }
             if allow_private_branches && !git_bucket {
@@ -4509,11 +4522,48 @@ fn run_remote(op: RemoteOp) -> Result<()> {
                     scl_repo::BucketUrl::parse(&url)?; // fail fast on malformed URLs
                 }
                 repo.remote_add_opts(&name, &url, allow_private_branches)?;
-                println!("added remote {name} -> {url}");
+                // A bucket URL can carry userinfo; never echo it back.
+                let shown = if git_bucket {
+                    scl_repo::redact(&url)
+                } else {
+                    url.clone()
+                };
+                println!("added remote {name} -> {shown}");
                 if git_bucket {
                     eprintln!("{GIT_BUCKET_NOTICE}");
                 }
             }
+        }
+        RemoteOp::Set {
+            name,
+            allow_private_branches,
+            no_allow_private_branches,
+        } => {
+            if !allow_private_branches && !no_allow_private_branches {
+                anyhow::bail!(
+                    "nothing to set: pass --allow-private-branches or --no-allow-private-branches"
+                );
+            }
+            if allow_private_branches {
+                let url = repo
+                    .remotes()?
+                    .into_iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, u)| u)
+                    .ok_or_else(|| anyhow::anyhow!("no such remote: {name}"))?;
+                if !scl_repo::is_git_bucket_url(&url) {
+                    anyhow::bail!("--allow-private-branches applies only to sc+git:: URLs");
+                }
+            }
+            repo.remote_set_allow_private_branches(&name, allow_private_branches)?;
+            println!(
+                "remote {name}: private branches {}",
+                if allow_private_branches {
+                    "allowed"
+                } else {
+                    "not allowed"
+                }
+            );
         }
         RemoteOp::Compact {
             name,
