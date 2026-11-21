@@ -528,11 +528,10 @@ impl GitBucket {
         Ok(v)
     }
 
-    /// Fetch `refspecs`. `family` = a glob fetch of a whole key family: it
-    /// prunes stale local refs and omits `--depth=1`, because a shallow fetch
-    /// that matches no ref exits 1 with no error text, which cannot be told
-    /// from a failure. Exact-ref fetches stay shallow so a hostile commit's
-    /// parents are never downloaded.
+    /// Fetch `refspecs`, always shallow so a hostile commit's parents are never
+    /// downloaded. `family` = a glob fetch of a whole key family, which also
+    /// prunes stale local refs. A shallow glob fetch that matches no ref exits 1
+    /// with no error text; [`Self::get_family`] tells that apart by listing.
     fn fetch(&self, refspecs: &[String], family: bool) -> Result<Out> {
         let mut a = vec![
             "fetch",
@@ -540,7 +539,10 @@ impl GitBucket {
             "--no-write-fetch-head",
             "--no-recurse-submodules",
         ];
-        a.push(if family { "--prune" } else { "--depth=1" });
+        a.push("--depth=1");
+        if family {
+            a.push("--prune");
+        }
         a.extend(["--end-of-options", &self.url]);
         a.extend(refspecs.iter().map(String::as_str));
         self.run(&a, None, &[], SMALL_CAP)
@@ -761,7 +763,17 @@ impl GitBucket {
         let pat = fam.glob();
         let out = self.fetch(&[format!("+{pat}:{pat}")], true)?;
         if !out.success {
-            return Err(self.fail("fetch", &out));
+            // A shallow glob fetch that matches nothing fails too: an empty
+            // family is absence, anything else is a real failure.
+            if self
+                .remote_list(fam.dir)?
+                .iter()
+                .any(|(k, _)| fam.matches(k))
+            {
+                return Err(self.fail("fetch", &out));
+            }
+            st.retain(|k, _| !fam.matches(k));
+            return Ok(Fetched::Absent);
         }
         let local: Vec<_> = self
             .local_refs(&format!("{NS}{}", fam.dir))?
