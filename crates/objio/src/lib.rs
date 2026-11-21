@@ -9,7 +9,7 @@
 mod dir;
 pub use dir::DirBucket;
 mod git;
-pub use git::GitBucket;
+pub use git::{redact, GitBucket};
 mod s3;
 pub use s3::S3Bucket;
 

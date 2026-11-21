@@ -12,6 +12,7 @@
 //! Git is driven through the system `git` binary (`SC_GIT` overrides it), never
 //! through `gix`, which stays quarantined in `gitio`. A per-instance temporary
 //! bare repository caches fetched objects and is removed on `Drop`; a SIGKILL
+//! or a SIGINT (the CLI installs no signal handler, so Ctrl-C skips `Drop`)
 //! can leave `sc-git-bucket-<pid>-<random>` behind in the temp directory.
 //!
 //! Every rejected write is classified by re-reading the exact ref with
@@ -32,6 +33,10 @@ const CHUNK: usize = 32 << 20;
 /// Largest value written or read: GitHub's per-push cap and sc-forge's
 /// `receive.maxInputSize`. Values are buffered in RAM like on S3.
 const MAX_VALUE: u64 = 2 << 30;
+/// Cap for every value that is not a `.pack` (manifest, log entries,
+/// checkpoints, `.idx`): they are small by construction, so a hostile host
+/// cannot make a reader buffer gigabytes of one.
+const MAX_SMALL_VALUE: u64 = 256 << 20;
 /// Most chunk entries a value tree may hold (names are `c0000`..`c9999`).
 const MAX_CHUNKS: usize = 10_000;
 /// How long a tag this instance itself observed or wrote is trusted for a
@@ -54,6 +59,11 @@ const GIT_CONFIG: &[&str] = &[
     "protocol.ssh.allow=always",
     "protocol.https.allow=always",
     "protocol.http.allow=always",
+    // A user config must not re-enable helper transports a hostile URL could abuse.
+    "protocol.ext.allow=never",
+    "protocol.fd.allow=never",
+    "protocol.git.allow=never",
+    "fetch.fsckObjects=true",
     "core.hooksPath=/dev/null",
     "gc.auto=0",
     "maintenance.auto=false",
@@ -96,6 +106,11 @@ const IDENTITY_ENV: &[(&str, &str)] = &[
 ];
 
 fn keep_env(name: &str) -> bool {
+    // Windows environment names are case-insensitive: `git_dir` is `GIT_DIR`.
+    #[cfg(windows)]
+    let upper = name.to_ascii_uppercase();
+    #[cfg(windows)]
+    let name = upper.as_str();
     !name.starts_with("GIT_") || KEEP_GIT_ENV.contains(&name)
 }
 
@@ -137,10 +152,20 @@ fn family_of(key: &str) -> Option<&'static Family> {
     FAMILIES.iter().find(|f| f.matches(key))
 }
 
+/// Keys whose value is write-once by the WAL layout: log entries, checkpoints
+/// and pack files. Decided by the key alone, never by anything a remote
+/// writer controls (a commit message), so a hostile or buggy writer cannot
+/// make a mutable key look immutable.
+fn create_only_key(key: &str) -> bool {
+    key.starts_with("log/")
+        || key.starts_with("checkpoints/")
+        || (key.starts_with("packs/") && (key.ends_with(".pack") || key.ends_with(".idx")))
+}
+
 /// What this instance knows about a key's current remote value.
 struct Known {
     oid: String,
-    /// Written by `put_new`: the value never changes, so reads are served from
+    /// [`create_only_key`]: the value never changes, so reads are served from
     /// the local cache with no network call.
     create_only: bool,
     /// When the oid was last observed or written by this instance.
@@ -217,33 +242,92 @@ fn check_prefix(prefix: &str) -> Result<()> {
     Ok(())
 }
 
-/// Replace URL userinfo (`user@`) with `***@` for error text.
-fn redact(s: &str) -> String {
-    if let Some((scheme, rest)) = s.split_once("://") {
+/// Replace URL userinfo (`user@`) with `***@` in text that is printed, for a
+/// bare Git URL or one under the `sc+git::` prefix, `scheme://` and scp forms
+/// alike. Any message that shows a remote URL goes through this.
+pub fn redact(s: &str) -> String {
+    let (lead, inner) = match s.get(..8) {
+        Some(p) if p.eq_ignore_ascii_case("sc+git::") => s.split_at(8),
+        _ => ("", s),
+    };
+    if let Some((scheme, rest)) = inner.split_once("://") {
         let end = rest.find('/').unwrap_or(rest.len());
         if let Some((_, host)) = rest[..end].rsplit_once('@') {
-            return format!("{scheme}://***@{host}{}", &rest[end..]);
+            return format!("{lead}{scheme}://***@{host}{}", &rest[end..]);
+        }
+    } else if let Some((left, path)) = inner.split_once(':') {
+        if let Some((_, host)) = left.rsplit_once('@') {
+            if !left.contains('/') {
+                return format!("{lead}***@{host}:{path}");
+            }
         }
     }
     s.to_string()
 }
 
-/// Refuse a value over the per-value cap before building anything.
-fn check_len(len: u64) -> Result<()> {
-    if len > MAX_VALUE {
+/// The size cap of `key`'s value: pack files may be large, everything else small.
+fn value_cap(key: &str) -> u64 {
+    if key.ends_with(".pack") {
+        MAX_VALUE
+    } else {
+        MAX_SMALL_VALUE
+    }
+}
+
+/// Refuse a value over the per-key cap before building or reading anything.
+fn check_len(key: &str, len: u64) -> Result<()> {
+    let cap = value_cap(key);
+    if len > cap {
         return Err(Error::Backend(format!(
-            "value of {len} bytes exceeds the {MAX_VALUE}-byte git bucket cap"
+            "value of {len} bytes for {key:?} exceeds the {cap}-byte git bucket cap"
         )));
     }
     Ok(())
+}
+
+/// How a refused write turned out, judged by re-reading the exact ref.
+#[derive(Debug, PartialEq, Eq)]
+enum Settled {
+    /// The remote holds our new commit: the push landed and only its
+    /// acknowledgement was lost.
+    Landed,
+    /// Someone else's value (or a deletion) beat the lease.
+    Lost,
+    /// The ref still holds what the lease expected (or a create found
+    /// nothing): the host refused for its own reasons (hook, permissions).
+    Genuine,
+}
+
+/// Classify a refused push of `ours` under `lease` (`""` = create-only) from
+/// the ref's current remote value.
+fn classify_refusal(ours: &str, lease: &str, remote: Option<&str>) -> Settled {
+    match remote {
+        Some(cur) if cur == ours => Settled::Landed,
+        Some(cur) if cur != lease => Settled::Lost,
+        None if !lease.is_empty() => Settled::Lost,
+        _ => Settled::Genuine,
+    }
+}
+
+/// Result of [`GitBucket::put`].
+enum Written {
+    Landed(String),
+    Lost,
+    Failed(Error),
 }
 
 fn corrupt(why: impl std::fmt::Display) -> Error {
     Error::Backend(format!("corrupt git bucket value: {why}"))
 }
 
+/// A host (optionally `:port`, or a bracketed IPv6 literal) that cannot be read
+/// as an option or smuggle URL/shell syntax.
 fn host_ok(host: &str) -> bool {
-    !host.is_empty() && !host.starts_with('-') && !host.contains(' ')
+    !host.is_empty()
+        && !host.starts_with('-')
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'[' | b']' | b':'))
 }
 
 impl GitBucket {
@@ -251,7 +335,9 @@ impl GitBucket {
     /// the network. Accepts `https://`, `http://`, `ssh://`, `file:///abs`,
     /// scp-form `user@host:path` and absolute local paths; refuses everything
     /// else (leading `-`, control characters, `::` transport helpers, `git://`,
-    /// relative paths, and a password in the URL: use git's credential helper).
+    /// relative paths, a password in the URL, and any userinfo at all on
+    /// `http(s)://`: credentials go through git's credential helper, never into
+    /// a URL that is stored in `.sc/config` and echoed).
     pub fn validate_url(url: &str) -> Result<()> {
         let bad = |why: &str| {
             Err(Error::Backend(format!(
@@ -286,8 +372,14 @@ impl GitBucket {
                     }
                     let host = match authority.rsplit_once('@') {
                         Some((userinfo, host)) => {
+                            if scheme != "ssh" {
+                                return bad("credentials in url; use a credential helper");
+                            }
                             if userinfo.contains(':') {
                                 return bad("password in url; use a credential helper");
+                            }
+                            if userinfo.starts_with('-') {
+                                return bad("user starts with '-'");
                             }
                             host
                         }
@@ -308,14 +400,11 @@ impl GitBucket {
         if let Some((left, path)) = url.split_once(':') {
             if let Some((user, host)) = left.split_once('@') {
                 let user_ok = !user.is_empty()
+                    && !user.starts_with('-')
                     && user
                         .bytes()
                         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
-                let host_chars = host.bytes().all(|b| {
-                    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'[' | b']' | b':')
-                });
-                if user_ok && host_ok(host) && host_chars && !left.contains('/') && !path.is_empty()
-                {
+                if user_ok && host_ok(host) && !left.contains('/') && !path.is_empty() {
                     return Ok(());
                 }
             }
@@ -589,8 +678,8 @@ impl GitBucket {
 
     /// Build the value commit locally: chunk blobs, tree, parentless commit
     /// with a unique nonce so a fresh write can never be "up to date".
-    fn make_commit(&self, bytes: &[u8], kind: &str) -> Result<String> {
-        check_len(bytes.len() as u64)?;
+    fn make_commit(&self, key: &str, bytes: &[u8], kind: &str) -> Result<String> {
+        check_len(key, bytes.len() as u64)?;
         let mut tree = String::new();
         for (i, c) in bytes.chunks(self.chunk).enumerate() {
             let o = self.run_ok(
@@ -612,11 +701,11 @@ impl GitBucket {
         Self::out_oid(&c)
     }
 
-    /// Tree id and create-only flag of a cached value commit; refuses parents.
-    fn commit_info(&self, oid: &str) -> Result<(String, bool)> {
+    /// Tree id of a cached value commit; refuses parents.
+    fn commit_info(&self, oid: &str) -> Result<String> {
         let out = self.run_ok(&["cat-file", "commit", oid], None, &[], SMALL_CAP)?;
         let text = String::from_utf8_lossy(&out.stdout);
-        let (head, msg) = text.split_once("\n\n").unwrap_or((&text, ""));
+        let head = text.split_once("\n\n").map_or(&*text, |(h, _)| h);
         let mut tree = None;
         for line in head.lines() {
             if line.starts_with("parent ") {
@@ -627,14 +716,15 @@ impl GitBucket {
             }
         }
         match tree {
-            Some(t) if is_oid(&t) => Ok((t, msg.starts_with("sc-bucket new "))),
+            Some(t) if is_oid(&t) => Ok(t),
             _ => Err(corrupt("commit has no tree")),
         }
     }
 
-    /// Validate a cached value's shape and sizes without reading any content.
-    fn inspect(&self, oid: &str) -> Result<(bool, Vec<(String, u64)>)> {
-        let (tree, create_only) = self.commit_info(oid)?;
+    /// Validate a cached value's shape and sizes (against `key`'s cap) without
+    /// reading any content.
+    fn inspect(&self, key: &str, oid: &str) -> Result<Vec<(String, u64)>> {
+        let tree = self.commit_info(oid)?;
         let raw = self
             .run_ok(&["cat-file", "tree", &tree], None, &[], SMALL_CAP)?
             .stdout;
@@ -681,15 +771,18 @@ impl GitBucket {
                 return Err(corrupt(format!("chunk of {size} bytes exceeds {CHUNK}")));
             }
             total += size;
-            if total > MAX_VALUE {
-                return Err(corrupt(format!("value exceeds the {MAX_VALUE}-byte cap")));
+            if total > value_cap(key) {
+                return Err(corrupt(format!(
+                    "value exceeds the {}-byte cap",
+                    value_cap(key)
+                )));
             }
             chunks.push((o.clone(), size));
         }
         if chunks.len() != oids.len() {
             return Err(corrupt("chunk listing incomplete"));
         }
-        Ok((create_only, chunks))
+        Ok(chunks)
     }
 
     fn read_chunks(&self, chunks: &[(String, u64)]) -> Result<Vec<u8>> {
@@ -713,12 +806,12 @@ impl GitBucket {
         oid: &str,
         cached: Option<&str>,
     ) -> Result<Fetched> {
-        let (create_only, chunks) = self.inspect(oid)?;
+        let chunks = self.inspect(key, oid)?;
         st.insert(
             key.to_string(),
             Known {
                 oid: oid.to_string(),
-                create_only,
+                create_only: create_only_key(key),
                 at: Instant::now(),
             },
         );
@@ -778,7 +871,7 @@ impl GitBucket {
         let local: Vec<_> = self
             .local_refs(&format!("{NS}{}", fam.dir))?
             .into_iter()
-            .filter(|(k, _, _)| fam.matches(k))
+            .filter(|(k, _, _)| fam.matches(k) && check_key(k).is_ok())
             .collect();
         st.retain(|k, _| !fam.matches(k) || local.iter().any(|(l, _, _)| l == k));
         for (k, oid, ty) in &local {
@@ -791,12 +884,12 @@ impl GitBucket {
             match st.get_mut(k) {
                 Some(known) if known.oid == *oid => known.at = Instant::now(),
                 _ => {
-                    let (_, create_only) = self.commit_info(oid)?;
+                    self.commit_info(oid)?;
                     st.insert(
                         k.clone(),
                         Known {
                             oid: oid.clone(),
-                            create_only,
+                            create_only: create_only_key(k),
                             at: Instant::now(),
                         },
                     );
@@ -807,38 +900,54 @@ impl GitBucket {
             None => Ok(Fetched::Absent),
             Some(k) => {
                 let oid = k.oid.clone();
-                self.answer(&oid, cached)
+                self.answer(key, &oid, cached)
             }
         }
     }
 
-    fn answer(&self, oid: &str, cached: Option<&str>) -> Result<Fetched> {
+    fn answer(&self, key: &str, oid: &str, cached: Option<&str>) -> Result<Fetched> {
         if cached == Some(oid) {
             return Ok(Fetched::Unchanged);
         }
-        let (_, chunks) = self.inspect(oid)?;
+        let chunks = self.inspect(key, oid)?;
         Ok(Fetched::New {
             bytes: self.read_chunks(&chunks)?,
             tag: oid.to_string(),
         })
     }
 
-    fn put(&self, key: &str, bytes: &[u8], kind: &str, lease: &str) -> Result<Result<String>> {
-        let oid = self.make_commit(bytes, kind)?;
-        match self.push(key, Some(&oid), Some(lease))? {
-            Pushed::Done => {
-                self.lock().insert(
-                    key.to_string(),
-                    Known {
-                        oid: oid.clone(),
-                        create_only: kind == "new",
-                        at: Instant::now(),
-                    },
-                );
-                Ok(Ok(oid))
+    /// Write `bytes` under `lease` (`""` = create-only). Any outcome but a
+    /// landed write drops the key's cached tag, so the freshness window can
+    /// never vouch for a tag that just lost. A refusal is settled by
+    /// re-reading the exact ref (see [`classify_refusal`]).
+    fn put(&self, key: &str, bytes: &[u8], kind: &str, lease: &str) -> Result<Written> {
+        let oid = self.make_commit(key, bytes, kind)?;
+        let refusal = match self.push(key, Some(&oid), Some(lease)) {
+            Ok(Pushed::Done) => None,
+            Ok(Pushed::Refused(msg)) => Some(Error::Backend(msg)),
+            Err(e) => Some(e),
+        };
+        if let Some(refusal) = refusal {
+            self.lock().remove(key);
+            let settled = match self.remote_ref(key) {
+                Ok(remote) => classify_refusal(&oid, lease, remote.as_deref()),
+                Err(_) => Settled::Genuine,
+            };
+            match settled {
+                Settled::Lost => return Ok(Written::Lost),
+                Settled::Genuine => return Ok(Written::Failed(refusal)),
+                Settled::Landed => {}
             }
-            Pushed::Refused(msg) => Ok(Err(Error::Backend(msg))),
         }
+        self.lock().insert(
+            key.to_string(),
+            Known {
+                oid: oid.clone(),
+                create_only: create_only_key(key),
+                at: Instant::now(),
+            },
+        );
+        Ok(Written::Landed(oid))
     }
 }
 
@@ -902,7 +1011,7 @@ impl Bucket for GitBucket {
         if let Some(k) = st.get(key) {
             if k.create_only {
                 let oid = k.oid.clone();
-                return self.answer(&oid, cached_tag);
+                return self.answer(key, &oid, cached_tag);
             }
             if cached_tag == Some(k.oid.as_str()) && k.at.elapsed() < FRESH {
                 return Ok(Fetched::Unchanged);
@@ -938,32 +1047,26 @@ impl Bucket for GitBucket {
                 Some(_) => Err(self.fail("fetch", &out)),
             };
         }
-        let rp = self.run_ok(
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("{full}^{{commit}}"),
-            ],
-            None,
-            &[],
-            SMALL_CAP,
-        );
-        let oid = match rp {
-            Ok(o) => Self::out_oid(&o)?,
-            Err(_) => return Err(corrupt("ref does not point at a commit")),
+        // The ref must point directly at a commit: no peeling of tag objects.
+        let Some((_, oid, ty)) = self
+            .local_refs(&full)?
+            .into_iter()
+            .find(|(k, _, _)| k == key)
+        else {
+            return Err(corrupt("fetched ref is missing"));
         };
+        if ty != "commit" {
+            return Err(corrupt("ref does not point at a commit"));
+        }
         self.finish_read(&mut st, key, &oid, cached_tag)
     }
 
     fn put_new(&self, key: &str, bytes: &[u8]) -> Result<bool> {
         check_key(key)?;
         match self.put(key, bytes, "new", "")? {
-            Ok(_) => Ok(true),
-            Err(refusal) => match self.remote_ref(key) {
-                Ok(Some(_)) => Ok(false),
-                _ => Err(refusal),
-            },
+            Written::Landed(_) => Ok(true),
+            Written::Lost => Ok(false),
+            Written::Failed(refusal) => Err(refusal),
         }
     }
 
@@ -980,15 +1083,9 @@ impl Bucket for GitBucket {
             Some(_) => return Ok(None),
         };
         match self.put(key, bytes, "cas", lease)? {
-            Ok(oid) => Ok(Some(oid)),
-            Err(refusal) => match self.remote_ref(key) {
-                // Someone else holds a different value (or deleted it): lost the race.
-                Ok(Some(cur)) if cur != lease => Ok(None),
-                Ok(None) if expected_tag.is_some() => Ok(None),
-                // The ref still holds what we expected (or a create found nothing):
-                // a genuine refusal (hook, permissions), never a lost race.
-                _ => Err(refusal),
-            },
+            Written::Landed(oid) => Ok(Some(oid)),
+            Written::Lost => Ok(None),
+            Written::Failed(refusal) => Err(refusal),
         }
     }
 
@@ -1022,12 +1119,12 @@ impl Bucket for GitBucket {
         let now = SystemTime::now();
         let mut metas = Vec::new();
         for (key, oid) in listed {
-            let (create_only, chunks) = self.inspect(&oid)?;
+            let chunks = self.inspect(&key, &oid)?;
             st.insert(
                 key.clone(),
                 Known {
                     oid,
-                    create_only,
+                    create_only: create_only_key(&key),
                     at: Instant::now(),
                 },
             );
@@ -1376,6 +1473,16 @@ mod tests {
 
     /// Plant a value commit straight into the hub, bypassing GitBucket.
     fn plant(hubdir: &Path, key: &str, parent: bool, entries: &[(&str, &str, &str)]) {
+        plant_msg(hubdir, key, parent, entries, "planted");
+    }
+
+    fn plant_msg(
+        hubdir: &Path,
+        key: &str,
+        parent: bool,
+        entries: &[(&str, &str, &str)],
+        msg: &str,
+    ) {
         let blob = git(hubdir, &["hash-object", "-w", "--stdin"], "data");
         let empty = git(hubdir, &["mktree"], "");
         let lines: String = entries
@@ -1386,7 +1493,7 @@ mod tests {
             })
             .collect();
         let tree = git(hubdir, &["mktree"], &lines);
-        let mut args = vec!["commit-tree", &tree, "-m", "planted"];
+        let mut args = vec!["commit-tree", &tree, "-m", msg];
         let base;
         if parent {
             base = git(hubdir, &["commit-tree", &empty, "-m", "base"], "");
@@ -1473,6 +1580,14 @@ mod tests {
             "host:path",
             "https://user:pass@host/x",
             "ssh://user:pw@host/x",
+            "https://user@host/x.git",
+            "http://token@host/x.git",
+            "https://@host/x.git",
+            "ssh://-oProxyCommand=x@host/x",
+            "ssh://host%2e/x",
+            "ssh://ho$t/x",
+            "ssh://ho;st/x",
+            "git@ho$t:x",
             "https://-evil/x",
             "ssh://git@-evil/x",
             "git@-evil:x",
@@ -1489,7 +1604,6 @@ mod tests {
         for good in [
             "https://host/x.git",
             "http://127.0.0.1:8080/x.git",
-            "https://user@host/x.git",
             "ssh://git@host/x",
             "ssh://git@host:2222/org/x.git",
             "git@host:org/x.git",
@@ -1506,6 +1620,14 @@ mod tests {
             .to_string();
         assert!(!e.contains("hunter2"), "{e}");
         assert_eq!(redact("https://u:pw@h/x"), "https://***@h/x");
+        assert_eq!(
+            redact("sc+git::https://u:hunter2@h/r.git"),
+            "sc+git::https://***@h/r.git"
+        );
+        assert_eq!(redact("SC+GIT::git@h:o/r.git"), "SC+GIT::***@h:o/r.git");
+        assert_eq!(redact("git@h:o/r.git"), "***@h:o/r.git");
+        assert_eq!(redact("/abs/a@b/x.git"), "/abs/a@b/x.git");
+        assert_eq!(redact("https://h/x@y"), "https://h/x@y");
     }
 
     #[test]
@@ -1650,10 +1772,207 @@ mod tests {
     }
 
     #[test]
-    fn value_cap_is_enforced() {
-        assert!(check_len(MAX_VALUE).is_ok());
-        let e = check_len(MAX_VALUE + 1).unwrap_err().to_string();
+    fn value_cap_is_enforced_per_key_kind() {
+        assert!(check_len("packs/a.pack", MAX_VALUE).is_ok());
+        let e = check_len("packs/a.pack", MAX_VALUE + 1)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("cap"), "{e}");
+        // everything that is not a pack is held to the small cap
+        for k in ["manifest", "log/1", "checkpoints/1", "packs/a.idx"] {
+            assert!(check_len(k, MAX_SMALL_VALUE).is_ok(), "{k}");
+            assert!(check_len(k, MAX_SMALL_VALUE + 1).is_err(), "{k}");
+        }
+    }
+
+    #[test]
+    fn create_only_is_decided_by_key_layout() {
+        for k in ["log/1", "checkpoints/9", "packs/a.pack", "packs/a.idx"] {
+            assert!(create_only_key(k), "{k}");
+        }
+        for k in ["manifest", "other", "packs/a.txt", "logger/x", "x/log/1"] {
+            assert!(!create_only_key(k), "{k}");
+        }
+    }
+
+    #[test]
+    fn refusal_classification() {
+        let (ours, old, other) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+        let c = |lease: &str, remote: Option<&str>| classify_refusal(&ours, lease, remote);
+        // the remote holds our new commit: a lost ack is a success
+        assert_eq!(c("", Some(&ours)), Settled::Landed);
+        assert_eq!(c(&old, Some(&ours)), Settled::Landed);
+        // someone else's value or a deletion beat the lease
+        assert_eq!(c("", Some(&other)), Settled::Lost);
+        assert_eq!(c(&old, Some(&other)), Settled::Lost);
+        assert_eq!(c(&old, None), Settled::Lost);
+        // the ref is as the lease expected (or a create found nothing): the host refused
+        assert_eq!(c(&old, Some(&old)), Settled::Genuine);
+        assert_eq!(c("", None), Settled::Genuine);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lost_push_ack_is_success_when_the_remote_holds_our_commit() {
+        need_git!();
+        let t = Tmp::new("lostack");
+        let (_, url) = hub(&t);
+        // The push really lands, but git reports failure.
+        let sh = shim(
+            &t,
+            "ack.sh",
+            "for a in \"$@\"; do if [ \"$a\" = push ]; then git \"$@\" >/dev/null 2>&1; exit 1; fi; done",
+        );
+        let b = open_git(&url, &sh);
+        assert!(b.put_new("log/1", b"x").unwrap());
+        let tag = b.put_if_tag("manifest", b"v1", None).unwrap().unwrap();
+        let tag2 = b
+            .put_if_tag("manifest", b"v2", Some(&tag))
+            .unwrap()
+            .unwrap();
+        let Fetched::New { bytes, tag: seen } = open(&url).get("manifest", None).unwrap() else {
+            panic!()
+        };
+        assert_eq!((bytes, seen), (b"v2".to_vec(), tag2));
+    }
+
+    #[test]
+    fn a_lost_cas_forgets_the_tag_it_lost_with() {
+        need_git!();
+        let t = Tmp::new("lostcas");
+        let (_, url) = hub(&t);
+        let (a, b) = (open(&url), open(&url));
+        let old = a.put_if_tag("manifest", b"v1", None).unwrap().unwrap();
+        let new = b
+            .put_if_tag("manifest", b"v2", Some(&old))
+            .unwrap()
+            .unwrap();
+        // A still trusts `old` inside the freshness window, but its CAS loses...
+        assert!(a
+            .put_if_tag("manifest", b"v3", Some(&old))
+            .unwrap()
+            .is_none());
+        // ...so the window must no longer vouch for it.
+        let Fetched::New { tag, .. } = a.get("manifest", Some(&old)).unwrap() else {
+            panic!("a lost tag must not read as unchanged")
+        };
+        assert_eq!(tag, new);
+        // a refused create-only write forgets its key too
+        assert!(a.put_new("log/1", b"x").unwrap());
+        assert!(!b.put_new("log/1", b"y").unwrap());
+        assert!(!a.put_new("log/1", b"z").unwrap());
+        assert!(!a.lock().contains_key("log/1"));
+    }
+
+    #[test]
+    fn a_writer_cannot_make_a_mutable_key_immutable_with_its_commit_message() {
+        need_git!();
+        let t = Tmp::new("newmsg");
+        let (hubdir, url) = hub(&t);
+        plant_msg(
+            &hubdir,
+            "manifest",
+            false,
+            &[("100644", "blob", "c0000")],
+            "sc-bucket new decoy",
+        );
+        let a = open(&url);
+        let Fetched::New { bytes, tag } = a.get("manifest", None).unwrap() else {
+            panic!()
+        };
+        assert_eq!(bytes, b"data");
+        let b = open(&url);
+        let tag2 = b
+            .put_if_tag("manifest", b"v2", Some(&tag))
+            .unwrap()
+            .unwrap();
+        std::thread::sleep(FRESH + Duration::from_millis(200));
+        let Fetched::New { bytes, tag: seen } = a.get("manifest", Some(&tag)).unwrap() else {
+            panic!("a mutable key must be re-read from the network")
+        };
+        assert_eq!((bytes, seen), (b"v2".to_vec(), tag2));
+    }
+
+    #[test]
+    fn a_ref_at_an_annotated_tag_is_corrupt_not_peeled() {
+        need_git!();
+        let t = Tmp::new("atag");
+        let (hubdir, url) = hub(&t);
+        plant(&hubdir, "tmp", false, &[("100644", "blob", "c0000")]);
+        let c = git(&hubdir, &["rev-parse", "refs/sc/tmp"], "");
+        let tag = git(
+            &hubdir,
+            &["mktag"],
+            &format!("object {c}\ntype commit\ntag t\ntagger t <t@invalid> 0 +0000\n\nm\n"),
+        );
+        git(&hubdir, &["update-ref", "refs/sc/atag", &tag], "");
+        let err = open(&url).get("atag", None);
+        assert!(
+            matches!(&err, Err(Error::Backend(m)) if m.contains("corrupt")),
+            "{:?}",
+            err.err()
+        );
+        // the same ref under a family key is refused too
+        git(&hubdir, &["update-ref", "refs/sc/log/1", &tag], "");
+        assert!(open(&url).get("log/1", None).is_err());
+    }
+
+    #[test]
+    fn family_ref_names_are_checked_before_they_enter_state() {
+        need_git!();
+        let t = Tmp::new("famname");
+        let (hubdir, url) = hub(&t);
+        let ok = [("100644", "blob", "c0000")];
+        plant(&hubdir, "log/1", false, &ok);
+        plant(&hubdir, "log/a@b", false, &ok);
+        let r = open(&url);
+        assert!(matches!(r.get("log/1", None).unwrap(), Fetched::New { .. }));
+        let st = r.lock();
+        assert!(st.contains_key("log/1"));
+        assert!(!st.contains_key("log/a@b"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_config_cannot_reenable_helper_transports() {
+        need_git!();
+        let t = Tmp::new("ext");
+        let (_, url) = hub(&t);
+        let cfg = t.0.join("gitconfig");
+        std::fs::write(&cfg, "[protocol \"ext\"]\n\tallow = always\n").unwrap();
+        // control: with that config alone, git does run the ext helper
+        let control = t.0.join("control");
+        let _ = Command::new("git")
+            .args(["ls-remote", &format!("ext::touch {}", control.display())])
+            .env("GIT_CONFIG_GLOBAL", &cfg)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            control.exists(),
+            "control: ext should be enabled by the config"
+        );
+        let marker = t.0.join("marker");
+        let sh = shim(
+            &t,
+            "ext.sh",
+            &format!("export GIT_CONFIG_GLOBAL={}", cfg.display()),
+        );
+        let b = open_git(&url, &sh);
+        let out = b
+            .run(
+                &[
+                    "ls-remote",
+                    "--end-of-options",
+                    &format!("ext::touch {}", marker.display()),
+                ],
+                None,
+                &[],
+                SMALL_CAP,
+            )
+            .unwrap();
+        assert!(!out.success);
+        assert!(!marker.exists(), "ext transport ran");
     }
 
     #[cfg(unix)]
@@ -1664,12 +1983,41 @@ mod tests {
         for n in [4usize, 24] {
             let t = Tmp::new("count");
             let (_, url) = hub(&t);
-            let w = open(&url);
+            let wlog = t.0.join("wcalls.log");
+            let wsh = shim(
+                &t,
+                "wcount.sh",
+                &format!(
+                    "s=; k=0; for x in \"$@\"; do if [ $k = 1 ]; then k=0; continue; fi; if [ \"$x\" = -c ]; then k=1; continue; fi; s=$x; break; done; echo \"$s\" >> {}",
+                    wlog.display()
+                ),
+            );
+            let w = open_git(&url, &wsh);
             for i in 1..=n {
                 assert!(w.put_new(&format!("log/{i:020}"), b"entry").unwrap());
                 assert!(w.put_new(&format!("packs/h{i}.idx"), b"idx").unwrap());
             }
             let m = w.put_if_tag("manifest", b"m", None).unwrap().unwrap();
+            let count = |log: &Path| -> usize {
+                std::fs::read_to_string(log)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|l| matches!(*l, "fetch" | "ls-remote" | "push"))
+                    .count()
+            };
+            // a create-only key just written is served locally, a freshly
+            // written CAS tag is trusted inside the window: zero network calls
+            let wbefore = count(&wlog);
+            assert!(matches!(
+                w.get("manifest", Some(&m)).unwrap(),
+                Fetched::Unchanged
+            ));
+            assert!(matches!(
+                w.get(&format!("log/{:020}", 1), None).unwrap(),
+                Fetched::New { .. }
+            ));
+            assert!(wbefore > 0, "the writer's shim must see its own calls");
+            assert_eq!(count(&wlog), wbefore, "writer re-read its own writes");
             let log = t.0.join("calls.log");
             let sh = shim(
                 &t,
@@ -1679,13 +2027,7 @@ mod tests {
                     log.display()
                 ),
             );
-            let calls = || -> usize {
-                std::fs::read_to_string(&log)
-                    .unwrap_or_default()
-                    .lines()
-                    .filter(|l| matches!(*l, "fetch" | "ls-remote" | "push"))
-                    .count()
-            };
+            let calls = || count(&log);
             let r = open_git(&url, &sh);
             // cold read of the manifest, every log entry and every idx
             assert!(matches!(
@@ -1708,14 +2050,6 @@ mod tests {
                 Fetched::Absent
             ));
             let cold = calls();
-            // a create-only key just written is served locally, a freshly
-            // written CAS tag is trusted inside the window: zero network calls
-            let before = calls();
-            assert!(matches!(
-                w.get("manifest", Some(&m)).unwrap(),
-                Fetched::Unchanged
-            ));
-            assert_eq!(calls(), before);
             // incremental: one new log entry + idx written elsewhere, then polled
             assert!(w.put_new(&format!("log/{:020}", n + 1), b"new").unwrap());
             assert!(w.put_new("packs/hnew.idx", b"idx").unwrap());
