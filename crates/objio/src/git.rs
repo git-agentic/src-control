@@ -1114,9 +1114,10 @@ impl Bucket for GitBucket {
             .collect())
     }
 
-    // shortcut: downloads every listed value to read its size; only compaction
-    // (refused on git remotes in v1) and tests call it. Upgrade to a filtered
-    // fetch if listing large stores becomes slow.
+    // shortcut: downloads every listed value to read its size; only tests and
+    // callers that opened a carrier as a plain bucket call it (compaction on a
+    // carrier lists with `list_tags` and sizes packs from their idx). Upgrade to
+    // a filtered fetch if listing large stores becomes slow.
     fn list_meta(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
         check_prefix(prefix)?;
         let listed = self.remote_list(prefix)?;

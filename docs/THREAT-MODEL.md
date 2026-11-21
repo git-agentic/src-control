@@ -781,7 +781,12 @@ The bucket model above applies unchanged, with the Git repository as the bucket 
   re-created since survives, and the manifest is read uncached before every destructive batch.
   Left open: a pusher reusing an aged orphan pack byte for byte can still lose it if the delete
   lands after the manifest check and before its commit (no lease on the manifest), and a push
-  that stalls past the grace window loses its pack, as on any backend. **Every pusher holds
+  that stalls past the grace window loses its pack, as on any backend. A writer can also make the
+  compactor download a pack it did not need to: sizes for the merge plan come from the pack's idx,
+  which the writer controls, so a pack whose idx understates it is downloaded whole (up to the
+  2 GiB value cap, in RAM) before the real length is checked and the pack is left unmerged.
+  A retained log entry or checkpoint whose value changed since the listing (a writer deleted and
+  re-created it) keeps every candidate pack for that run. **Every pusher holds
   delete** (a push to `refs/sc/*` is a push); unlike S3, delete rights cannot be withheld from
   them. Run compaction from one host (clocks).
 - **Not built in v1.** `sc serve --store sc+git::` is refused (a daemon cannot answer prompts

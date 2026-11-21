@@ -338,6 +338,12 @@ impl BucketTransport {
     /// Fails only if the initial `refresh` (a conditional GET of the
     /// manifest plus a walk of its parent chain) errors — an entirely empty
     /// bucket is a valid, successfully-opened remote with no refs yet.
+    ///
+    /// A Git carrier must be opened with [`BucketTransport::open`] and an
+    /// `sc+git::` URL, not through here: this constructor cannot tell the
+    /// bucket is one, so `compact` takes the plain-backend path (bucket
+    /// modification times and unleased deletes), which a Git host cannot make
+    /// safe. It stays public for tests and for callers with their own backend.
     pub fn from_bucket(bucket: Box<dyn Bucket>) -> Result<BucketTransport> {
         Self::build(bucket, false)
     }

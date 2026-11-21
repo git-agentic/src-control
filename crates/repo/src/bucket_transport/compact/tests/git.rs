@@ -122,14 +122,12 @@ impl Hub {
 
     /// A compactor whose bucket calls pass through `hook(op, key, after)`.
     fn hooked(&self, hook: Hook) -> BucketTransport {
-        BucketTransport::build(
-            Box::new(Wrapped {
-                inner: Box::new(GitBucket::open(&self.url()).unwrap()),
-                hook,
-            }),
-            true,
-        )
-        .unwrap()
+        BucketTransport::build(Box::new(self.wrapped(hook)), true).unwrap()
+    }
+
+    /// The bucket behind [`Hub::hooked`], for a test that configures it further.
+    fn wrapped(&self, hook: Hook) -> Wrapped {
+        Wrapped::new(Box::new(GitBucket::open(&self.url()).unwrap()), hook)
     }
 
     /// `refs/sc/*` names on the hub, sorted.
@@ -226,12 +224,44 @@ type Hook = Box<dyn Fn(&str, &str, bool) -> scl_objio::Result<()> + Send>;
 /// Forwards every operation, including `list_tags` and `delete_leased`, through
 /// a hook. `list_meta` is refused: it downloads every value on a Git carrier, so
 /// compaction must never ask for it.
+///
+/// It can also play the host's caches, both of which a real `GitBucket` has:
+/// [`Wrapped::stale_window`] answers a conditional `manifest` read with
+/// `Unchanged` while the tag matches the last one served (the 2 s freshness
+/// window), and [`Wrapped::pin`] keeps serving the value a create-only key had
+/// when it was read (the carrier answers such a key from its cache).
 struct Wrapped {
     inner: Box<dyn Bucket>,
     hook: Hook,
+    stale_window: bool,
+    last_manifest: Mutex<Option<String>>,
+    pinned: Mutex<BTreeMap<String, (Vec<u8>, String)>>,
 }
 
 impl Wrapped {
+    fn new(inner: Box<dyn Bucket>, hook: Hook) -> Wrapped {
+        Wrapped {
+            inner,
+            hook,
+            stale_window: false,
+            last_manifest: Mutex::new(None),
+            pinned: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Answer a conditional manifest read from the last tag served, never asking
+    /// the bucket: the freshness window of `GitBucket`, made deterministic.
+    fn stale_window(mut self) -> Wrapped {
+        self.stale_window = true;
+        self
+    }
+
+    /// Serve `key` as `(bytes, tag)` whatever the bucket now holds.
+    fn pin(self, key: &str, bytes: Vec<u8>, tag: String) -> Wrapped {
+        self.pinned.lock().unwrap().insert(key.into(), (bytes, tag));
+        self
+    }
+
     fn around<T>(
         &self,
         op: &str,
@@ -247,7 +277,26 @@ impl Wrapped {
 
 impl Bucket for Wrapped {
     fn get(&self, key: &str, tag: Option<&str>) -> scl_objio::Result<Fetched> {
-        self.around("get", key, || self.inner.get(key, tag))
+        self.around("get", key, || {
+            if let Some((bytes, pinned)) = self.pinned.lock().unwrap().get(key) {
+                return Ok(Fetched::New {
+                    bytes: bytes.clone(),
+                    tag: pinned.clone(),
+                });
+            }
+            if key != "manifest" || !self.stale_window {
+                return self.inner.get(key, tag);
+            }
+            let mut last = self.last_manifest.lock().unwrap();
+            if tag.is_some() && tag == last.as_deref() {
+                return Ok(Fetched::Unchanged);
+            }
+            let got = self.inner.get(key, tag)?;
+            if let Fetched::New { tag, .. } = &got {
+                *last = Some(tag.clone());
+            }
+            Ok(got)
+        })
     }
     fn put_new(&self, key: &str, bytes: &[u8]) -> scl_objio::Result<bool> {
         self.around("put_new", key, || self.inner.put_new(key, bytes))
@@ -736,8 +785,14 @@ fn a_key_re_created_between_the_listing_and_the_delete_survives_its_lease() {
     assert_readable(&hub, &refs);
 }
 
-/// The scenario of a pusher that reuses an aged orphan pack by identical bytes
-/// and lands before the compactor looks at the manifest again.
+/// A pusher reuses an aged orphan pack by identical bytes and its commit lands
+/// after the compactor listed, but before the compactor's manifest check. This
+/// proves the check, and that it reads the manifest uncached: the bucket here
+/// answers a conditional manifest read `Unchanged` from its freshness window
+/// (as `GitBucket` does for 2 s), so a check that reused the cached tag would
+/// call the manifest unmoved and delete the pack. What it does not prove, and
+/// nothing can without a lease on the manifest, is the window between the check
+/// and the delete: a commit landing there is the residual race ADR-0057 names.
 #[test]
 fn a_push_landing_after_the_listing_is_seen_by_the_manifest_check_and_its_pack_kept() {
     need_git!();
@@ -766,7 +821,8 @@ fn a_push_landing_after_the_listing_is_seen_by_the_manifest_check_and_its_pack_k
         }
         Ok(())
     });
-    let rep = hub.hooked(hook).compact(&at(start + 2 * DAY)).unwrap();
+    let t = BucketTransport::build(Box::new(hub.wrapped(hook).stale_window()), true).unwrap();
+    let rep = t.compact(&at(start + 2 * DAY)).unwrap();
     for k in &keys {
         assert!(hub.bucket().exists(k).unwrap(), "{k} was deleted: {rep:?}");
     }
@@ -936,15 +992,9 @@ fn a_failure_at_every_operation_boundary_on_a_git_carrier_leaves_a_readable_buck
             }
             Ok(())
         });
-        let outcome = BucketTransport::build(
-            Box::new(Wrapped {
-                inner: work.bucket(),
-                hook,
-            }),
-            true,
-        )
-        // A zero grace sees every first sighting as already old: one run deletes.
-        .and_then(|t| t.compact(&eager()));
+        let outcome = BucketTransport::build(Box::new(Wrapped::new(work.bucket(), hook)), true)
+            // A zero grace sees every first sighting as already old: one run deletes.
+            .and_then(|t| t.compact(&eager()));
 
         // Whatever happened, a fresh reader still sees everything.
         assert_readable(&work, &refs);
@@ -983,14 +1033,7 @@ fn a_manifest_that_moves_during_leased_pack_deletion_stops_the_deletes() {
         }
         Ok(())
     });
-    let t = BucketTransport::build(
-        Box::new(Wrapped {
-            inner: mem.bucket(),
-            hook,
-        }),
-        true,
-    )
-    .unwrap();
+    let t = BucketTransport::build(Box::new(Wrapped::new(mem.bucket(), hook)), true).unwrap();
     let rep = t.compact(&eager()).unwrap();
     assert!(
         rep.notes
@@ -1034,6 +1077,22 @@ fn the_double_leases_like_git_and_a_replayed_compaction_changes_nothing() {
         "a replay must not add or remove a key"
     );
     assert_readable(&mem, &refs);
+}
+
+/// `idx` with every entry rewritten to start at `offset` and be `length` long:
+/// an idx is the writer's word about its pack.
+fn lying_idx(idx: &[u8], offset: u64, length: u64) -> Vec<u8> {
+    let entries = scl_core::pack::parse_index(idx).unwrap();
+    let mut lie = Vec::new();
+    lie.extend_from_slice(b"SCIX");
+    lie.extend_from_slice(&1u32.to_le_bytes());
+    lie.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+    for e in &entries {
+        lie.extend_from_slice(e.id.as_bytes());
+        lie.extend_from_slice(&offset.to_le_bytes());
+        lie.extend_from_slice(&length.to_le_bytes());
+    }
+    lie
 }
 
 /// A push's objects and the tip it moves a branch to.
@@ -1125,17 +1184,7 @@ fn packs_are_sized_from_their_idx_and_one_far_over_its_idx_is_left_unmerged() {
             if i != 2 {
                 return idx;
             }
-            let entries = scl_core::pack::parse_index(&idx).unwrap();
-            let mut lie = Vec::new();
-            lie.extend_from_slice(b"SCIX");
-            lie.extend_from_slice(&1u32.to_le_bytes());
-            lie.extend_from_slice(&(entries.len() as u64).to_le_bytes());
-            for e in &entries {
-                lie.extend_from_slice(e.id.as_bytes());
-                lie.extend_from_slice(&8u64.to_le_bytes());
-                lie.extend_from_slice(&1u64.to_le_bytes());
-            }
-            lie
+            lying_idx(&idx, 8, 1)
         },
     );
     let opts = CompactOptions {
@@ -1182,4 +1231,262 @@ fn the_idx_length_is_the_end_of_the_furthest_record_and_saturates() {
     assert_eq!(declared_pack_len(&[huge(u64::MAX, 1)]), u64::MAX);
     assert_eq!(declared_pack_len(&[huge(8, u64::MAX)]), u64::MAX);
     assert_eq!(declared_pack_len(&[huge(u64::MAX - 3, 0)]), u64::MAX);
+}
+
+// ---- review fixes: ages per member, per-attempt clock, retained tags, sums ---
+
+/// A hook that never interferes.
+fn quiet() -> Hook {
+    Box::new(|_, _, _| Ok(()))
+}
+
+/// Put the pack of `commit(label)` straight into `b` as an orphan; `idx_of` may
+/// rewrite its idx. Returns the pack hash.
+fn put_orphan(b: &dyn Bucket, label: &str, idx_of: impl Fn(Vec<u8>) -> Vec<u8>) -> String {
+    let (_, objects) = commit(label);
+    let (pack, idx) = scl_core::pack::build_pack(&objects).unwrap();
+    let hash = hex::encode(blake3::hash(&pack).as_bytes());
+    b.put_new(&pack_key(&hash), &pack).unwrap();
+    b.put_new(&idx_key(&hash), &idx_of(idx)).unwrap();
+    hash
+}
+
+/// The age record in `s`.
+fn record_in(s: &impl Store) -> Sightings {
+    let Fetched::New { bytes, .. } = s.bucket().get(sightings::KEY, None).unwrap() else {
+        panic!("no record")
+    };
+    Sightings::decode(&bytes, u64::MAX / 2).unwrap()
+}
+
+#[test]
+fn a_pack_is_deleted_only_when_every_object_of_it_has_aged() {
+    let mem = Arc::new(GitLike::default());
+    let refs = hand_built(&mem, 12, 10);
+    let start = t0();
+    // The body alone (what an idx-first crash leaves), sighted by run 1.
+    let (_, objects) = commit("lone");
+    let (pack, idx) = scl_core::pack::build_pack(&objects).unwrap();
+    let hash = hex::encode(blake3::hash(&pack).as_bytes());
+    let b = mem.bucket();
+    b.put_new(&pack_key(&hash), &pack).unwrap();
+    like_carrier(&mem).compact(&at(start)).unwrap();
+    // A fresh idx for the same hash appears afterwards.
+    b.put_new(&idx_key(&hash), &idx).unwrap();
+    let both = |mem: &Arc<GitLike>| {
+        let b = mem.bucket();
+        (
+            b.exists(&pack_key(&hash)).unwrap(),
+            b.exists(&idx_key(&hash)).unwrap(),
+        )
+    };
+    // Two days on the body is old and the idx is not: neither goes.
+    let r2 = like_carrier(&mem).compact(&at(start + 2 * DAY)).unwrap();
+    assert_eq!(both(&mem), (true, true), "{r2:?}");
+    assert_eq!(r2.packs_held_back, 1, "{r2:?}");
+    // Once the idx has aged too, the pair goes.
+    like_carrier(&mem).compact(&at(start + 4 * DAY)).unwrap();
+    assert_eq!(both(&mem), (false, false));
+    assert_readable(&mem, &refs);
+}
+
+#[test]
+fn a_key_first_listed_in_a_replan_is_stamped_with_that_attempts_clock() {
+    let mem = Arc::new(GitLike::default());
+    hand_built(&mem, 12, 10);
+    let late = mem.clone();
+    let state = Arc::new(AtomicUsize::new(0));
+    let hook_at = Arc::new(AtomicU64::new(0));
+    let (st, at_secs) = (state.clone(), hook_at.clone());
+    let hook: Hook = Box::new(move |op, key, after| {
+        match (op, after, st.load(Ordering::SeqCst)) {
+            ("list_tags", true, 0) => st.store(1, Ordering::SeqCst),
+            // The first manifest read after the listing: a push lands, and a
+            // while passes before the compactor looks again.
+            ("get", false, 1) if key == "manifest" => {
+                st.store(2, Ordering::SeqCst);
+                push_commits(&open(&late), "late", 1);
+                std::thread::sleep(Duration::from_millis(1100));
+                at_secs.store(secs(SystemTime::now()), Ordering::SeqCst);
+            }
+            _ => {}
+        }
+        Ok(())
+    });
+    // The wall clock (no injected `now`), zero grace so the first attempt reaches
+    // its manifest check and replans.
+    BucketTransport::build(Box::new(Wrapped::new(mem.bucket(), hook)), true)
+        .unwrap()
+        .compact(&eager())
+        .unwrap();
+    assert_eq!(state.load(Ordering::SeqCst), 2, "the push never landed");
+    // The late push's pack exists only from the second attempt on.
+    let (_, objects) = commit("late-0");
+    let (pack, _) = scl_core::pack::build_pack(&objects).unwrap();
+    let hash = hex::encode(blake3::hash(&pack).as_bytes());
+    let stamped = record_in(&mem)
+        .first_seen(&pack_key(&hash))
+        .expect("the late pack is tracked");
+    assert!(
+        stamped >= hook_at.load(Ordering::SeqCst),
+        "first seen at {stamped}, but the replan began at {}",
+        hook_at.load(Ordering::SeqCst)
+    );
+}
+
+#[test]
+fn a_retained_entry_that_changed_since_the_listing_keeps_the_packs_it_might_name() {
+    let mem = Arc::new(GitLike::default());
+    let refs = hand_built(&mem, 12, 10);
+    let start = t0();
+    let b = mem.bucket();
+    let hidden = put_orphan(b.as_ref(), "hidden", |idx| idx);
+    let keys = [
+        format!("packs/{hidden}.idx"),
+        format!("packs/{hidden}.pack"),
+    ];
+    like_carrier(&mem).compact(&at(start)).unwrap(); // sights the orphan
+    let head = manifest(&mem).head_seq;
+    let entry = |packs: Vec<String>| {
+        LogEntry {
+            seq: head + 1,
+            parent_seq: head,
+            packs,
+            updates: vec![],
+        }
+        .encode()
+    };
+    let slot = log_key(head + 1);
+    assert!(b.put_new(&slot, &entry(vec![])).unwrap());
+    let Fetched::New { bytes, tag } = b.get(&slot, None).unwrap() else {
+        panic!()
+    };
+    // A writer deletes that entry and creates it again naming the orphan. A
+    // carrier that already read the first one keeps serving it from its cache.
+    b.delete(&slot).unwrap();
+    assert!(b.put_new(&slot, &entry(vec![hidden.clone()])).unwrap());
+    let stale = Wrapped::new(mem.bucket(), quiet()).pin(&slot, bytes, tag);
+    let rep = BucketTransport::build(Box::new(stale), true)
+        .unwrap()
+        .compact(&at(start + 2 * DAY))
+        .unwrap();
+    for k in &keys {
+        assert!(b.exists(k).unwrap(), "{k} was deleted: {rep:?}");
+    }
+    assert!(
+        rep.notes
+            .iter()
+            .any(|n| n.contains("packs kept") && n.contains("changed since the listing")),
+        "{rep:?}"
+    );
+    // A fresh process reads the entry as it is and keeps the pack it names.
+    like_carrier(&mem).compact(&at(start + 2 * DAY)).unwrap();
+    for k in &keys {
+        assert!(b.exists(k).unwrap(), "{k} was deleted by the rerun");
+    }
+    assert_readable(&mem, &refs);
+}
+
+#[test]
+fn byte_counts_saturate_when_an_idx_declares_an_absurd_length() {
+    let mem = Arc::new(GitLike::default());
+    let refs = hand_built(&mem, 12, 10);
+    let start = t0();
+    let b = mem.bucket();
+    // Two orphans whose idx puts every record at the end of the address space.
+    let lies: Vec<String> = ["lie-1", "lie-2"]
+        .iter()
+        .map(|l| put_orphan(b.as_ref(), l, |idx| lying_idx(&idx, u64::MAX, 1)))
+        .collect();
+    like_carrier(&mem).compact(&at(start)).unwrap();
+    // A sum of two such sizes overflows a u64 (a panic in a debug build).
+    let dry = like_carrier(&mem)
+        .compact(&CompactOptions {
+            dry_run: true,
+            ..at(start + 2 * DAY)
+        })
+        .unwrap();
+    assert_eq!(
+        (dry.packs_deleted, dry.bytes_deleted),
+        (14, u64::MAX),
+        "{dry:?}"
+    );
+    let real = like_carrier(&mem).compact(&at(start + 2 * DAY)).unwrap();
+    assert_eq!(
+        (real.packs_deleted, real.bytes_deleted),
+        (14, u64::MAX),
+        "{real:?}"
+    );
+    for h in &lies {
+        assert!(!b.exists(&pack_key(h)).unwrap());
+    }
+    assert_readable(&mem, &refs);
+}
+
+#[test]
+fn an_age_record_that_keeps_losing_its_cas_is_named_in_the_note() {
+    let mem = Arc::new(GitLike::default());
+    hand_built(&mem, 12, 10);
+    let rival = mem.bucket();
+    let n = Arc::new(AtomicUsize::new(0));
+    // Every time the compactor is about to write the record, another compactor
+    // gets in first with a record of its own.
+    let hook: Hook = Box::new(move |op, key, after| {
+        if op == "put_if_tag" && key == sightings::KEY && !after {
+            let i = n.fetch_add(1, Ordering::SeqCst);
+            let cur = match rival.get(sightings::KEY, None)? {
+                Fetched::New { tag, .. } => Some(tag),
+                _ => None,
+            };
+            let line = format!("1 {} packs/rival{i}.pack\n", "c".repeat(40));
+            rival.put_if_tag(sightings::KEY, line.as_bytes(), cur.as_deref())?;
+        }
+        Ok(())
+    });
+    let rep = BucketTransport::build(Box::new(Wrapped::new(mem.bucket(), hook)), true)
+        .unwrap()
+        .compact(&eager())
+        .unwrap();
+    assert!(
+        rep.notes
+            .iter()
+            .any(|n| n.contains("age record") && n.contains("compare-and-swap")),
+        "{rep:?}"
+    );
+    assert!(!rep.notes.iter().any(|n| n.contains("manifest kept moving")));
+    assert_eq!(
+        (rep.logs_deleted, rep.checkpoints_deleted, rep.packs_deleted),
+        (0, 0, 0),
+        "{rep:?}"
+    );
+}
+
+#[test]
+fn the_byte_note_is_there_whenever_a_carrier_run_deletes_anything() {
+    let mem = Arc::new(GitLike::default());
+    hand_built(&mem, 12, 10);
+    let start = t0();
+    // No merging, so the second run deletes log entries only (no pack).
+    let opts = |now| CompactOptions {
+        small_pack_bytes: 0,
+        ..at(now)
+    };
+    let first = like_carrier(&mem).compact(&opts(start)).unwrap();
+    assert!(
+        !first.notes.iter().any(|n| n.contains("byte counts")),
+        "nothing was deleted, nothing was counted: {first:?}"
+    );
+    let second = like_carrier(&mem).compact(&opts(start + 2 * DAY)).unwrap();
+    assert_eq!(
+        (second.logs_deleted, second.packs_deleted),
+        (10, 0),
+        "{second:?}"
+    );
+    assert!(
+        second
+            .notes
+            .iter()
+            .any(|n| n.contains("byte counts are the pack bodies their idx declares")),
+        "{second:?}"
+    );
 }

@@ -1047,7 +1047,12 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
   does not support them and sc-forge is SHA-1, so the value is low and the cost
   moderate (the cache's object format would have to be detected before the first
   fetch); (S2, from review) the ssh user name that `remote list` prints is not a
-  credential, and `http(s)` userinfo is refused at validation.
+  credential, and `http(s)` userinfo is refused at validation. Known issue,
+  recorded and not fixed: a push to `refs/sc/K` fails with "dst refspec matches
+  more than one" when a decoy branch such as `refs/heads/refs/sc/K` exists on the
+  host (found while building `serve --store`). Whoever can push to the
+  repository can plant such a decoy, so it is a writer-only denial of service on
+  that key; reads compare exact full ref names and are not affected.
 - **Serve-side persistent pack cache (P36c follow-on).** A bucket-backed
   serve instance re-downloads packs per connection; a content-addressed
   on-disk cache in the serve home would make warm instances cheap without

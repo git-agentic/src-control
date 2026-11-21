@@ -320,10 +320,22 @@ bound.
 the compactor never calls it there. A live pack's size for the merge plan is the
 end of its furthest record in its idx (`offset + 4 + length`, saturating), taken
 while the view parses each live idx. The idx is writer-controlled, so after a
-member body is downloaded a pack far over `small_pack_bytes` is left unmerged and
-reported. Report byte counts on a carrier are those idx sizes (log entries,
+member body is downloaded a pack far over `small_pack_bytes` (twice it) is left
+unmerged and reported; the body is already in RAM by then (up to the 2 GiB value
+cap), so an understating idx costs the compactor a download. Report byte counts
+on a carrier are those idx sizes, summed with saturation (log entries,
 checkpoints, idx files and a pack with no readable idx count as 0, and the
-report says so).
+report says so whenever the run deletes anything). Deletion counts are what the
+run attempted: a key that survives its lease, or that another compactor already
+removed, is still counted.
+
+**Clock and retained records.** The clock is read per sweep attempt, so a key
+first listed after a replan is stamped with that attempt's time, not the time the
+sweep began. A retained log entry or checkpoint is compared, by tag, with the
+tag its own listing showed: a carrier serves a create-only key it has already
+read from its cache, so a mismatch (a writer deleted and re-created the entry)
+means the bytes read are not the value the listing shows, and every candidate
+pack is kept for that run (a rerun, in a new process, reads it afresh).
 
 **Leased deletes.** `Bucket` gains `list_tags` (keys with their tags, one
 listing) and `delete_leased` (delete each `(key, tag)` only if the key still

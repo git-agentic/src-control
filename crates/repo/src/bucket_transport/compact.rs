@@ -79,10 +79,16 @@ pub struct CompactReport {
     pub checkpoint_seq: u64,
     /// The sweep cutoff `K` (0 when no checkpoint is old enough yet).
     pub cutoff: u64,
+    /// The deletion counts below are what the run attempted (what a dry run
+    /// would attempt): a key another writer re-created after the listing
+    /// survives its leased delete, and one another compactor already removed is
+    /// already gone, and both are still counted.
     pub logs_deleted: usize,
     pub checkpoints_deleted: usize,
     /// Pack hashes removed (each is a `.pack` and a `.idx`).
     pub packs_deleted: usize,
+    /// Bytes behind the deletions above, saturating (an `sc+git::` store
+    /// reports pack bodies as their idx declares them, which a writer controls).
     pub bytes_deleted: u64,
     /// Unreferenced packs kept because they are younger than `prune_expire`.
     pub packs_held_back: usize,
@@ -109,18 +115,21 @@ fn hash_of(key: &str) -> Option<&str> {
         .or_else(|| name.strip_suffix(".idx"))
 }
 
+/// Sum that saturates: a size a writer controls (an idx's declared length) can
+/// be `u64::MAX`, and an overflow would panic a debug build on every run.
+fn total(sizes: impl IntoIterator<Item = u64>) -> u64 {
+    sizes.into_iter().fold(0, u64::saturating_add)
+}
+
 /// Bytes of the `.pack` and `.idx` objects behind these packs; a pack in
 /// `declared` (a Git carrier, which lists no sizes) counts that many instead.
 fn pack_bytes(packs: &[(&String, &Vec<ObjectMeta>)], declared: &BTreeMap<String, u64>) -> u64 {
-    packs
-        .iter()
-        .map(|(h, ms)| {
-            declared
-                .get(*h)
-                .copied()
-                .unwrap_or_else(|| ms.iter().map(|m| m.size).sum())
-        })
-        .sum()
+    total(packs.iter().map(|(h, ms)| {
+        declared
+            .get(*h)
+            .copied()
+            .unwrap_or_else(|| total(ms.iter().map(|m| m.size)))
+    }))
 }
 
 /// What one sweep attempt sees in the bucket.
@@ -152,12 +161,12 @@ fn plan_groups(
     let mut groups: Vec<Vec<String>> = Vec::new();
     let (mut cur, mut sum): (Vec<String>, u64) = (Vec::new(), 0);
     for (size, hash) in small {
-        if !cur.is_empty() && sum + size > opts.group_bytes {
+        if !cur.is_empty() && sum.saturating_add(size) > opts.group_bytes {
             groups.push(std::mem::take(&mut cur));
             sum = 0;
         }
         cur.push(hash.clone());
-        sum += size;
+        sum = sum.saturating_add(size);
     }
     groups.push(cur);
     groups.retain(|g| g.len() >= 2);
@@ -195,9 +204,14 @@ impl BucketTransport {
                 .map_or(0, |v| v.manifest.checkpoint_seq);
             self.consolidate(opts, &mut rep)?;
         }
-        // Read the clock after phase 1 so a zero grace sees its own checkpoint.
-        let now = opts.now.unwrap_or_else(SystemTime::now);
-        self.sweep(opts, now, &mut rep)?;
+        self.sweep(opts, &mut rep)?;
+        if self.git_carrier && rep.logs_deleted + rep.checkpoints_deleted + rep.packs_deleted > 0 {
+            rep.notes.push(
+                "Git carrier: byte counts are the pack bodies their idx declares; log entries, \
+                 checkpoints and idx files count as 0, as does a pack with no readable idx"
+                    .into(),
+            );
+        }
         Ok(rep)
     }
 
@@ -451,13 +465,19 @@ impl BucketTransport {
     }
 
     /// Phase 2: delete what is behind the cutoff and what nothing names.
-    fn sweep(&self, opts: &CompactOptions, now: SystemTime, rep: &mut CompactReport) -> Result<()> {
-        // `modified <= old_before` means "at least prune_expire old".
-        let old_before = now
-            .checked_sub(opts.prune_expire)
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        let old = |m: &ObjectMeta| m.modified <= old_before;
+    fn sweep(&self, opts: &CompactOptions, rep: &mut CompactReport) -> Result<()> {
+        // What stopped the last attempt, for the note if they all stop.
+        let mut lost_record = false;
         'attempt: for _ in 0..MAX_ATTEMPTS {
+            // The clock is read per attempt, after phase 1 (so a zero grace sees
+            // its own checkpoint) and again on every replan: a key first listed
+            // in a later attempt is not stamped with the time the sweep began.
+            let now = opts.now.unwrap_or_else(SystemTime::now);
+            // `modified <= old_before` means "at least prune_expire old".
+            let old_before = now
+                .checked_sub(opts.prune_expire)
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            let old = |m: &ObjectMeta| m.modified <= old_before;
             self.refresh()?;
             let (tag, ck_seq, live) = match self.view.borrow().as_ref() {
                 Some(v) => (
@@ -475,8 +495,10 @@ impl BucketTransport {
                 tags,
             }) = self.list_for_sweep(opts, now, rep)?
             else {
+                lost_record = true;
                 continue;
             };
+            lost_record = false;
             let cutoff = ckpts
                 .iter()
                 .filter(|(s, m)| *s <= ck_seq && old(m))
@@ -514,7 +536,7 @@ impl BucketTransport {
             if !aged.is_empty() {
                 // Retained structure may still name them: every kept
                 // checkpoint and every kept log entry (on-chain or not).
-                match self.retained_packs(&ckpts, &logs, cutoff) {
+                match self.retained_packs(&ckpts, &logs, cutoff, &tags) {
                     Ok(named) => {
                         del_packs = aged
                             .into_iter()
@@ -523,7 +545,7 @@ impl BucketTransport {
                     }
                     Err(e) => rep
                         .notes
-                        .push(format!("packs kept, a retained record is unreadable: {e}")),
+                        .push(format!("packs kept, a retained record cannot be used: {e}")),
                 }
             }
 
@@ -537,20 +559,20 @@ impl BucketTransport {
             // Git carrier: pack sizes for the report, from the idx (the listing
             // carries none); a pack with no readable idx counts as 0 bytes.
             let declared = if self.git_carrier {
-                self.declared_sizes(&del_packs, rep)
+                self.declared_sizes(&del_packs)
             } else {
                 BTreeMap::new()
             };
             if opts.dry_run {
                 rep.logs_deleted += del_logs.len();
                 rep.checkpoints_deleted += del_ckpts.len();
-                rep.bytes_deleted += del_logs
-                    .iter()
-                    .chain(del_ckpts.iter())
-                    .map(|m| m.size)
-                    .sum::<u64>();
+                rep.bytes_deleted = rep.bytes_deleted.saturating_add(total(
+                    del_logs.iter().chain(del_ckpts.iter()).map(|m| m.size),
+                ));
                 rep.packs_deleted += del_packs.len();
-                rep.bytes_deleted += pack_bytes(&del_packs, &declared);
+                rep.bytes_deleted = rep
+                    .bytes_deleted
+                    .saturating_add(pack_bytes(&del_packs, &declared));
                 if rep.packs_created > 0 {
                     rep.notes.push(
                         "dry run: the sweep figures describe the bucket as it is now; the merge \
@@ -571,11 +593,9 @@ impl BucketTransport {
                 }
                 rep.logs_deleted += del_logs.len();
                 rep.checkpoints_deleted += del_ckpts.len();
-                rep.bytes_deleted += del_logs
-                    .iter()
-                    .chain(del_ckpts.iter())
-                    .map(|m| m.size)
-                    .sum::<u64>();
+                rep.bytes_deleted = rep.bytes_deleted.saturating_add(total(
+                    del_logs.iter().chain(del_ckpts.iter()).map(|m| m.size),
+                ));
                 let keys: Vec<&str> = del_logs
                     .iter()
                     .chain(del_ckpts.iter())
@@ -602,7 +622,9 @@ impl BucketTransport {
                     return Ok(());
                 }
                 rep.packs_deleted += batch.len();
-                rep.bytes_deleted += pack_bytes(batch, &declared);
+                rep.bytes_deleted = rep
+                    .bytes_deleted
+                    .saturating_add(pack_bytes(batch, &declared));
                 // idx first: a half-deleted pack is then plain debris.
                 for suffix in [".idx", ".pack"] {
                     let keys: Vec<&str> = batch
@@ -616,11 +638,18 @@ impl BucketTransport {
             }
             return Ok(());
         }
-        rep.notes.push(
-            "the manifest kept moving during the sweep: what it had not yet deleted (log entries, \
-             checkpoints, unreferenced packs) was kept, rerun"
-                .into(),
-        );
+        rep.notes.push(if lost_record {
+            format!(
+                "the age record refs/sc/{} kept losing its compare-and-swap to another \
+                 compactor ({MAX_ATTEMPTS} attempts): nothing was deleted, rerun (and run \
+                 compaction from one host)",
+                sightings::KEY
+            )
+        } else {
+            "the manifest kept moving during the sweep: what it had not yet deleted (log \
+             entries, checkpoints, unreferenced packs) was kept, rerun"
+                .into()
+        });
         Ok(())
     }
 
@@ -660,11 +689,7 @@ impl BucketTransport {
     /// Pack body sizes of `packs` as their idx declares them (a Git carrier's
     /// listing carries no sizes), for the report only. A pack whose idx cannot be
     /// read is left out and counts as 0 bytes; the report says so.
-    fn declared_sizes(
-        &self,
-        packs: &[(&String, &Vec<ObjectMeta>)],
-        rep: &mut CompactReport,
-    ) -> BTreeMap<String, u64> {
+    fn declared_sizes(&self, packs: &[(&String, &Vec<ObjectMeta>)]) -> BTreeMap<String, u64> {
         let mut sizes = BTreeMap::new();
         for (hash, _) in packs {
             if let Ok(Fetched::New { bytes, .. }) = self.bucket.get(&idx_key(hash), None) {
@@ -672,11 +697,6 @@ impl BucketTransport {
                     sizes.insert((*hash).clone(), declared_pack_len(&entries));
                 }
             }
-        }
-        let note = "Git carrier: byte counts are the pack bodies their idx declares; log entries, \
-                    checkpoints and idx files count as 0, as does a pack with no readable idx";
-        if !packs.is_empty() && !rep.notes.iter().any(|n| n == note) {
-            rep.notes.push(note.into());
         }
         sizes
     }
@@ -805,19 +825,32 @@ impl BucketTransport {
     /// Pack hashes named by structure the sweep keeps: checkpoints with
     /// `seq >= cutoff` and log entries with `seq > cutoff` (everything when
     /// `cutoff` is 0). Any record that fails to decode aborts: deleting packs
-    /// on a partial picture is never right.
+    /// on a partial picture is never right. On a Git carrier a record whose tag
+    /// differs from the one in this attempt's listing (`tags`) aborts too: a
+    /// carrier serves a create-only key it has already read from its cache, so
+    /// the bytes would be a value the listing no longer shows, and a writer that
+    /// deleted and re-created the entry could be hiding what it names. The packs
+    /// are kept, and a rerun in a new process reads the entry afresh.
     fn retained_packs(
         &self,
         ckpts: &[(u64, ObjectMeta)],
         logs: &[(u64, ObjectMeta)],
         cutoff: u64,
+        tags: &BTreeMap<String, String>,
     ) -> Result<BTreeSet<String>> {
+        let listed = |key: &str, got: &str| match tags.get(key) {
+            Some(want) if want != got => Err(Error::Wal(format!(
+                "{key} changed since the listing it was judged against"
+            ))),
+            _ => Ok(()),
+        };
         let mut named = BTreeSet::new();
         for (seq, m) in ckpts {
             if cutoff == 0 || *seq >= cutoff {
-                let Fetched::New { bytes, .. } = self.bucket.get(&m.key, None)? else {
+                let Fetched::New { bytes, tag } = self.bucket.get(&m.key, None)? else {
                     continue; // deleted since the listing: no longer retained
                 };
+                listed(&m.key, &tag)?;
                 named.extend(
                     Checkpoint::decode(&capped("checkpoint", bytes)?)
                         .map_err(|e| Error::Wal(format!("{}: {e}", m.key)))?
@@ -827,9 +860,10 @@ impl BucketTransport {
         }
         for (seq, m) in logs {
             if cutoff == 0 || *seq > cutoff {
-                let Fetched::New { bytes, .. } = self.bucket.get(&m.key, None)? else {
+                let Fetched::New { bytes, tag } = self.bucket.get(&m.key, None)? else {
                     continue;
                 };
+                listed(&m.key, &tag)?;
                 named.extend(
                     LogEntry::decode(&capped("log entry", bytes)?)
                         .map_err(|e| Error::Wal(format!("{}: {e}", m.key)))?
