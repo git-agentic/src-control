@@ -200,7 +200,7 @@ saw each pack and checkpoint (`refs/sc/compact/sightings`: `<first_seen> <oid>
 <key>` per line, generation-aware by oid), sizes packs from their idx instead of
 downloading them (`list_meta` still downloads every value and compaction never
 calls it here), deletes with leases (`delete_leased`), and reads the manifest
-with no cache before every destructive batch. The first run after an object
+with no cache before every delete call. The first run after an object
 appears never deletes it (with a zero grace, `--allow-short-grace`, a first
 sighting is immediately old). Consequences to know:
 

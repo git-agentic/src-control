@@ -263,6 +263,23 @@ fn the_in_memory_double_honors_the_bucket_contract() {
 }
 
 #[test]
+fn plain_backends_refuse_a_leased_delete_and_compaction_never_asks_for_one() {
+    // The double keeps the trait default, like `DirBucket` and `S3Bucket`.
+    let mem = Arc::new(MemBucket::default());
+    let err = Shared(mem.clone())
+        .delete_leased(&[("packs/a.pack".into(), "x".into())])
+        .unwrap_err();
+    assert!(err.to_string().contains("not supported"), "{err}");
+    // Compaction there deletes through plain `delete`: one leased call, or one
+    // tagged listing, would fail this run.
+    let t = open(&mem);
+    let refs = push_commits(&t, "w", 70);
+    let rep = t.compact(&eager()).unwrap();
+    assert!(rep.packs_deleted > 0 && rep.logs_deleted > 0, "{rep:?}");
+    assert_readable(&mem, &refs);
+}
+
+#[test]
 fn merges_small_packs_and_sweeps_everything_behind_the_checkpoint() {
     let root = scratch("full");
     let t = open(&root);

@@ -90,14 +90,14 @@ pub trait Bucket: Send {
     /// that now holds another value (or is already gone) is left alone and is
     /// not an error; a key that still holds its expected tag but could not be
     /// removed is an error. Several keys go in one call so a backend can batch
-    /// them. This default has no lease to check, so it deletes each key
-    /// unconditionally (what the backends without conditional deletes do); a
-    /// backend that can lease must override it (the Git carrier does).
-    fn delete_leased(&self, items: &[(String, String)]) -> Result<()> {
-        for (key, _) in items {
-            self.delete(key)?;
-        }
-        Ok(())
+    /// them. A backend that cannot check a lease keeps this default, an error:
+    /// a lease is never silently dropped by deleting unconditionally. Only the
+    /// Git carrier overrides it, and compaction asks only a Git carrier for it
+    /// (the other backends are deleted from with [`Bucket::delete`]).
+    fn delete_leased(&self, _items: &[(String, String)]) -> Result<()> {
+        Err(Error::Backend(
+            "leased delete is not supported by this backend".into(),
+        ))
     }
 }
 
@@ -190,10 +190,13 @@ pub fn contract_suite(b: &dyn Bucket) {
     assert_eq!(b.list_meta("packs/").unwrap().len(), 2);
     // a deleted key can be created again
     assert!(b.put_new("packs/ab12.pack", b"again").unwrap());
-    // delete_leased: removes keys holding their expected tag, is idempotent,
-    // touches only its keys. Whether a stale tag survives is up to the backend
-    // (the default cannot lease), so that is checked in each lease-capable
-    // backend's own tests.
+}
+
+/// Conformance checks for a backend that overrides [`Bucket::delete_leased`]
+/// (only the Git carrier does): it removes keys holding their expected tag, is
+/// idempotent, and touches only its keys. Whether a stale tag survives is
+/// checked in that backend's own tests. Panics on violation (test helper).
+pub fn leased_delete_suite(b: &dyn Bucket) {
     assert!(b.put_new("lease/a", b"1").unwrap());
     assert!(b.put_new("lease/b", b"2").unwrap());
     assert!(b.put_new("lease/keep", b"3").unwrap());
@@ -220,6 +223,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let b = DirBucket::open(&root).unwrap();
         contract_suite(&b);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    /// A backend that cannot check a lease must refuse, not delete without one.
+    #[test]
+    fn a_backend_without_leases_refuses_a_leased_delete_and_deletes_nothing() {
+        let root = std::env::temp_dir().join(format!("scl-objio-nolease-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let b = DirBucket::open(&root).unwrap();
+        assert!(b.put_new("k", b"v").unwrap());
+        let Fetched::New { tag, .. } = b.get("k", None).unwrap() else {
+            panic!("k should exist")
+        };
+        let err = b.delete_leased(&[("k".into(), tag)]).unwrap_err();
+        assert!(
+            matches!(&err, Error::Backend(m) if m.contains("not supported")),
+            "{err}"
+        );
+        assert!(b.exists("k").unwrap(), "a refused lease must not delete");
+        assert!(b.list_tags("").is_err(), "no tagged listing either");
         std::fs::remove_dir_all(&root).unwrap();
         assert!(!root.exists());
     }

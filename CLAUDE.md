@@ -234,7 +234,7 @@ transport-adjacent. The rest, imperatively:
   `refs/sc/compact/sightings` (`<secs> <oid> <key>`, generation-aware, strict
   decode: a bad record blocks the run, a time over five minutes ahead of the
   compactor's clock is refused), leased deletes (`Bucket::delete_leased`), and
-  an uncached manifest read before every destructive batch. The first run
+  an uncached manifest read before every delete call. The first run
   deletes nothing it did not already see (zero grace: a first sighting is
   immediately old); run it from one host (clocks). Every git call goes through
   `objio::GitBucket` with a scrubbed environment; CAS is `--force-with-lease`,
@@ -263,7 +263,7 @@ transport-adjacent. The rest, imperatively:
   entry plus a checkpoint) and never deletes what the current chain names. Keep `--prune-expire` well above any push's duration (default
   24h): a writer stalled longer than that between uploading a pack and its
   commit can still lose the pack (the leases follow-on closes it). On every
-  backend the manifest is read uncached before every delete batch (a busy remote
+  backend the manifest is read uncached before every delete call (a busy remote
   can defer cleanup to a rerun); on an `sc+git::` remote every pusher also holds
   delete.
   `--dry-run` writes and deletes nothing but still downloads and decodes every

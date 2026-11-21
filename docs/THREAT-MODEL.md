@@ -778,7 +778,7 @@ The bucket model above applies unchanged, with the Git repository as the bucket 
   object deletable. A malformed record, one naming a key outside `packs/` and `checkpoints/`,
   or one dated more than five minutes ahead of the compactor's clock, blocks the run (it is
   never read as "everything is old"). Deletes are leased to the oid the listing showed, so a key
-  re-created since survives, and the manifest is read uncached before every destructive batch.
+  re-created since survives, and the manifest is read uncached before every delete call.
   Left open: a pusher reusing an aged orphan pack byte for byte can still lose it if the delete
   lands after the manifest check and before its commit (no lease on the manifest), and a push
   that stalls past the grace window loses its pack, as on any backend. A writer can also make the

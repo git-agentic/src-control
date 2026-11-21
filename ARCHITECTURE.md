@@ -1387,7 +1387,7 @@ decision uses it. Pack sizes for the merge plan come from each live idx (`offset
 length`), never from `list_meta`, which would download every value. Deletes are leased
 (`Bucket::delete_leased`: one `git push` of `:refs/sc/K` with a
 `--force-with-lease=refs/sc/K:<oid>` per key, the oid the one listing showed), and the
-manifest is read uncached before every destructive batch. The first run after an object
+manifest is read uncached before every delete call. The first run after an object
 appears never deletes it; run compaction from one host.
 
 A private branch goes to an `sc+git::` remote only under the per-remote opt-in

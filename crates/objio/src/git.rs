@@ -1256,7 +1256,7 @@ impl Bucket for GitBucket {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract_suite;
+    use crate::{contract_suite, leased_delete_suite};
     use std::path::Path;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1371,7 +1371,9 @@ mod tests {
         need_git!();
         let t = Tmp::new("contract");
         let (_, url) = hub(&t);
-        contract_suite(&open(&url));
+        let b = open(&url);
+        contract_suite(&b);
+        leased_delete_suite(&b);
     }
 
     #[test]

@@ -1014,8 +1014,9 @@ fn a_failure_at_every_operation_boundary_on_a_git_carrier_leaves_a_readable_buck
 }
 
 /// The leased analogue of the pack-deletion stop on the plain backends: a push
-/// lands while the first batch of packs is going, and the next batch's manifest
-/// check keeps the rest.
+/// lands once the first batch of packs is gone, and the next batch's manifest
+/// check keeps the rest. (A push landing between a batch's idx and body deletes
+/// is `a_reuse_between_the_idx_delete_and_the_body_delete_keeps_the_body`.)
 #[test]
 fn a_manifest_that_moves_during_leased_pack_deletion_stops_the_deletes() {
     let mem = Arc::new(GitLike::default());
@@ -1023,10 +1024,10 @@ fn a_manifest_that_moves_during_leased_pack_deletion_stops_the_deletes() {
     let fired = Arc::new(AtomicBool::new(false));
     let late = mem.clone();
     let hook: Hook = Box::new(move |op, key, after| {
-        // After the idx files of the first batch went: someone else pushes.
+        // After the bodies of the first batch went: someone else pushes.
         if op == "delete_leased"
             && after
-            && key.starts_with("packs/")
+            && key.ends_with(".pack")
             && !fired.swap(true, Ordering::SeqCst)
         {
             push_commits(&open(&late), "late", 1);
@@ -1257,6 +1258,92 @@ fn record_in(s: &impl Store) -> Sightings {
         panic!("no record")
     };
     Sightings::decode(&bytes, u64::MAX / 2).unwrap()
+}
+
+#[test]
+fn a_key_first_listed_in_a_run_is_stamped_no_earlier_than_its_listing() {
+    let mem = Arc::new(GitLike::default());
+    hand_built(&mem, 12, 10);
+    let pusher = mem.clone();
+    let stalled = Arc::new(AtomicBool::new(false));
+    let listing_from = Arc::new(AtomicU64::new(0));
+    let (once, from) = (stalled.clone(), listing_from.clone());
+    let hook: Hook = Box::new(move |op, _, after| {
+        // The compactor stalls before its listing; a push uploads a pack
+        // meanwhile, and a while passes before the listing is taken.
+        if op == "list_tags" && !after && !once.swap(true, Ordering::SeqCst) {
+            put_orphan(pusher.bucket().as_ref(), "stall-0", |idx| idx);
+            std::thread::sleep(Duration::from_millis(1100));
+            from.store(secs(SystemTime::now()), Ordering::SeqCst);
+        }
+        Ok(())
+    });
+    // The wall clock, no injected `now`.
+    BucketTransport::build(Box::new(Wrapped::new(mem.bucket(), hook)), true)
+        .unwrap()
+        .compact(&CompactOptions::default())
+        .unwrap();
+    assert!(
+        stalled.load(Ordering::SeqCst),
+        "the listing was never taken"
+    );
+    let (_, objects) = commit("stall-0");
+    let (pack, _) = scl_core::pack::build_pack(&objects).unwrap();
+    let hash = hex::encode(blake3::hash(&pack).as_bytes());
+    let stamped = record_in(&mem)
+        .first_seen(&pack_key(&hash))
+        .expect("the pack is tracked");
+    assert!(
+        stamped >= listing_from.load(Ordering::SeqCst),
+        "stamped {stamped}, before the listing that first showed it at {}",
+        listing_from.load(Ordering::SeqCst)
+    );
+}
+
+#[test]
+fn a_reuse_between_the_idx_delete_and_the_body_delete_keeps_the_body() {
+    let mem = Arc::new(GitLike::default());
+    let mut refs = hand_built(&mem, 12, 10);
+    let start = t0();
+    let lone = orphan(&mem, "reuse-0");
+    let keys = [format!("packs/{lone}.idx"), format!("packs/{lone}.pack")];
+    like_carrier(&mem).compact(&at(start)).unwrap(); // sights the orphan
+    let late = mem.clone();
+    let fired = Arc::new(AtomicBool::new(false));
+    let hook: Hook = Box::new(move |op, key, after| {
+        // Right after the idx files went: a push reuses the body that is still
+        // there (its `put_new` leaves the body's oid unchanged), creates the idx
+        // again and commits. The body's lease would still match its old oid.
+        if op == "delete_leased"
+            && after
+            && key.ends_with(".idx")
+            && !fired.swap(true, Ordering::SeqCst)
+        {
+            push_commits(&open(&late), "reuse", 1);
+        }
+        Ok(())
+    });
+    let rep = BucketTransport::build(Box::new(Wrapped::new(mem.bucket(), hook)), true)
+        .unwrap()
+        .compact(&at(start + 2 * DAY))
+        .unwrap();
+    for k in &keys {
+        assert!(
+            mem.bucket().exists(k).unwrap(),
+            "{k} was deleted from under a live chain: {rep:?}"
+        );
+    }
+    assert!(
+        rep.notes
+            .iter()
+            .any(|n| n.contains("moved during pack deletion")),
+        "{rep:?}"
+    );
+    refs.push(("reuse-0".to_string(), commit("reuse-0").0));
+    assert_readable(&mem, &refs);
+    // A rerun, seeing the pack live, leaves it and finishes the rest.
+    like_carrier(&mem).compact(&at(start + 2 * DAY)).unwrap();
+    assert_readable(&mem, &refs);
 }
 
 #[test]

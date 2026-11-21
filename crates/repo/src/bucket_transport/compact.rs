@@ -121,19 +121,38 @@ fn total(sizes: impl IntoIterator<Item = u64>) -> u64 {
     sizes.into_iter().fold(0, u64::saturating_add)
 }
 
-/// Bytes of the `.pack` and `.idx` objects behind these packs; a pack in
-/// `declared` (a Git carrier, which lists no sizes) counts that many instead.
-fn pack_bytes(packs: &[(&String, &Vec<ObjectMeta>)], declared: &BTreeMap<String, u64>) -> u64 {
+/// Bytes of these packs' objects whose key ends with `suffix` (`.idx` or
+/// `.pack`); a pack in `declared` (a Git carrier, which lists no sizes) counts
+/// its declared body length under `.pack` and nothing under `.idx`.
+fn pack_bytes(
+    packs: &[(&String, &Vec<ObjectMeta>)],
+    declared: &BTreeMap<String, u64>,
+    suffix: &str,
+) -> u64 {
     total(packs.iter().map(|(h, ms)| {
-        declared
-            .get(*h)
-            .copied()
-            .unwrap_or_else(|| total(ms.iter().map(|m| m.size)))
+        match declared.get(*h) {
+            Some(d) if suffix == ".pack" => *d,
+            Some(_) => 0,
+            None => total(
+                ms.iter()
+                    .filter(|m| m.key.ends_with(suffix))
+                    .map(|m| m.size),
+            ),
+        }
     }))
 }
 
 /// What one sweep attempt sees in the bucket.
 struct Listing {
+    /// The instant the attempt's ages are judged at (`opts.now` overrides the
+    /// clock). On a Git carrier it is read AFTER the tagged listing returns and
+    /// serves both as the first-seen stamp of every new key and as the age
+    /// cutoff: a key that appeared while this process stalled before listing is
+    /// stamped no earlier than the listing that showed it, never with an older
+    /// time from before the stall. Elsewhere ages come from the bucket's own
+    /// modification times and the instant is read before listing, the
+    /// conservative side.
+    now: SystemTime,
     ckpts: Vec<(u64, ObjectMeta)>,
     logs: Vec<(u64, ObjectMeta)>,
     /// `.pack` and `.idx` objects by pack hash.
@@ -469,15 +488,6 @@ impl BucketTransport {
         // What stopped the last attempt, for the note if they all stop.
         let mut lost_record = false;
         'attempt: for _ in 0..MAX_ATTEMPTS {
-            // The clock is read per attempt, after phase 1 (so a zero grace sees
-            // its own checkpoint) and again on every replan: a key first listed
-            // in a later attempt is not stamped with the time the sweep began.
-            let now = opts.now.unwrap_or_else(SystemTime::now);
-            // `modified <= old_before` means "at least prune_expire old".
-            let old_before = now
-                .checked_sub(opts.prune_expire)
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            let old = |m: &ObjectMeta| m.modified <= old_before;
             self.refresh()?;
             let (tag, ck_seq, live) = match self.view.borrow().as_ref() {
                 Some(v) => (
@@ -489,16 +499,23 @@ impl BucketTransport {
             };
             // A lost race on the age record means someone else updated it: replan.
             let Some(Listing {
+                now,
                 ckpts,
                 logs,
                 by_hash,
                 tags,
-            }) = self.list_for_sweep(opts, now, rep)?
+            }) = self.list_for_sweep(opts, rep)?
             else {
                 lost_record = true;
                 continue;
             };
             lost_record = false;
+            // `modified <= old_before` means "at least prune_expire old". The
+            // instant is the listing's own (see `Listing::now`).
+            let old_before = now
+                .checked_sub(opts.prune_expire)
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            let old = |m: &ObjectMeta| m.modified <= old_before;
             let cutoff = ckpts
                 .iter()
                 .filter(|(s, m)| *s <= ck_seq && old(m))
@@ -570,9 +587,11 @@ impl BucketTransport {
                     del_logs.iter().chain(del_ckpts.iter()).map(|m| m.size),
                 ));
                 rep.packs_deleted += del_packs.len();
-                rep.bytes_deleted = rep
-                    .bytes_deleted
-                    .saturating_add(pack_bytes(&del_packs, &declared));
+                for suffix in [".idx", ".pack"] {
+                    rep.bytes_deleted = rep
+                        .bytes_deleted
+                        .saturating_add(pack_bytes(&del_packs, &declared, suffix));
+                }
                 if rep.packs_created > 0 {
                     rep.notes.push(
                         "dry run: the sweep figures describe the bucket as it is now; the merge \
@@ -605,27 +624,15 @@ impl BucketTransport {
             }
             // A pack nothing names can still be named by a push that lands
             // while we plan, and the delete loop can run long, so the manifest
-            // is looked at before every batch: if it moved before the first, the
-            // plan is stale (replan); later, what is left is kept. A push that
-            // lands meanwhile may have re-used one of these old packs byte for
-            // byte.
+            // is looked at before every delete call, and a batch is two calls
+            // (idx files, then bodies): a writer can reuse a body that is still
+            // there (its `put_new` leaves the oid unchanged), recreate the idx
+            // we just deleted and commit between the two, and the body's lease
+            // would still match. If the manifest moved before the first call the
+            // plan is stale (replan); later, what is left is kept. Idx first: a
+            // half-deleted pack is then plain debris.
             for (i, batch) in del_packs.chunks(PACK_DELETE_BATCH).enumerate() {
-                if !self.manifest_unmoved(&tag)? {
-                    if i == 0 {
-                        continue 'attempt;
-                    }
-                    rep.notes.push(format!(
-                        "the manifest moved during pack deletion: {} unreferenced pack(s) kept, \
-                         rerun",
-                        del_packs.len() - i * PACK_DELETE_BATCH
-                    ));
-                    return Ok(());
-                }
-                rep.packs_deleted += batch.len();
-                rep.bytes_deleted = rep
-                    .bytes_deleted
-                    .saturating_add(pack_bytes(batch, &declared));
-                // idx first: a half-deleted pack is then plain debris.
+                let mut sent = false; // a delete call of this batch has gone out
                 for suffix in [".idx", ".pack"] {
                     let keys: Vec<&str> = batch
                         .iter()
@@ -633,8 +640,29 @@ impl BucketTransport {
                         .map(|m| m.key.as_str())
                         .filter(|k| k.ends_with(suffix))
                         .collect();
+                    if keys.is_empty() {
+                        continue; // lone bodies after an idx-first crash have no idx
+                    }
+                    if !self.manifest_unmoved(&tag)? {
+                        if i == 0 && !sent {
+                            continue 'attempt;
+                        }
+                        rep.notes.push(format!(
+                            "the manifest moved during pack deletion: {} unreferenced pack(s) \
+                             kept, rerun",
+                            del_packs.len() - i * PACK_DELETE_BATCH
+                        ));
+                        return Ok(());
+                    }
                     self.delete_keys(&keys, &tags)?;
+                    sent = true;
+                    // Counted once its delete call went out, so a stop above
+                    // reports only what was attempted.
+                    rep.bytes_deleted = rep
+                        .bytes_deleted
+                        .saturating_add(pack_bytes(batch, &declared, suffix));
                 }
+                rep.packs_deleted += batch.len();
             }
             return Ok(());
         }
@@ -727,10 +755,12 @@ impl BucketTransport {
     fn list_for_sweep(
         &self,
         opts: &CompactOptions,
-        now: SystemTime,
         rep: &mut CompactReport,
     ) -> Result<Option<Listing>> {
         if !self.git_carrier {
+            // Ages here are the bucket's own modification times, so the clock
+            // only sets the cutoff: read before listing, the conservative side.
+            let now = opts.now.unwrap_or_else(SystemTime::now);
             let metas = |prefix: &str| -> Result<Vec<(u64, ObjectMeta)>> {
                 Ok(self
                     .bucket
@@ -746,14 +776,21 @@ impl BucketTransport {
                 }
             }
             return Ok(Some(Listing {
+                now,
                 ckpts: metas("checkpoints/")?,
                 logs: metas("log/")?,
                 by_hash,
                 tags: BTreeMap::new(),
             }));
         }
-        let now_secs = unix_secs(now)?;
         let listed = self.bucket.list_tags("")?;
+        // The clock is read only now, after the listing returned (and again on
+        // every replan): any key in `listed` was on the host before this instant,
+        // so its first-seen stamp cannot predate its own listing even if this
+        // process stalled before it. A stall after the listing only makes a stamp
+        // later, which holds an object back longer.
+        let now = opts.now.unwrap_or_else(SystemTime::now);
+        let now_secs = unix_secs(now)?;
         let (before, record_tag) = self.read_sightings(now_secs)?;
         let seen = before.observe(&listed, now_secs);
         let added = seen.added_since(&before);
@@ -815,6 +852,7 @@ impl BucketTransport {
             tags.insert(key, oid);
         }
         Ok(Some(Listing {
+            now,
             ckpts,
             logs,
             by_hash,

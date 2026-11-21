@@ -329,9 +329,13 @@ report says so whenever the run deletes anything). Deletion counts are what the
 run attempted: a key that survives its lease, or that another compactor already
 removed, is still counted.
 
-**Clock and retained records.** The clock is read per sweep attempt, so a key
-first listed after a replan is stamped with that attempt's time, not the time the
-sweep began. A retained log entry or checkpoint is compared, by tag, with the
+**Clock and retained records.** On a carrier the clock is read per sweep attempt
+and only AFTER the tagged listing returns: that one instant is both the first-seen
+stamp of every new key and the age cutoff. A process that stalls before listing
+therefore cannot stamp a pack that was uploaded during the stall with a time from
+before it (the next run could otherwise delete it while its push is still
+staging), and a key first listed after a replan gets that attempt's time. A
+stall after the listing only makes stamps later. A retained log entry or checkpoint is compared, by tag, with the
 tag its own listing showed: a carrier serves a create-only key it has already
 read from its cache, so a mismatch (a writer deleted and re-created the entry)
 means the bytes read are not the value the listing shows, and every candidate
@@ -339,7 +343,9 @@ pack is kept for that run (a rerun, in a new process, reads it afresh).
 
 **Leased deletes.** `Bucket` gains `list_tags` (keys with their tags, one
 listing) and `delete_leased` (delete each `(key, tag)` only if the key still
-holds that tag; the default has no lease and deletes unconditionally). The Git
+holds that tag; the default is an error, so a lease is never silently dropped by
+deleting without one, and only the Git carrier overrides it: compaction deletes
+from the other backends with plain `delete`). The Git
 carrier pushes the deletions with one `--force-with-lease=refs/sc/K:<oid>` and
 one `:refs/sc/K` refspec per key (never `+`, never `--atomic`, at most 128 refs
 and about 24 KiB of arguments per push). A key that was re-created since the
@@ -347,18 +353,23 @@ listing is at another oid and survives; a key still at its lease after a refusal
 (a hook) is an error. The sweep deletes each key leased to the oid of the one
 listing whose age it judged; nothing lists twice.
 
-**Authoritative manifest check.** Before every destructive batch (the log and
-checkpoint deletes, and each batch of packs: idx files first, then bodies) the
+**Authoritative manifest check.** Before every delete call (the log and
+checkpoint deletes, and for each batch of packs the idx files and then, as a
+separate call with its own check, the bodies) the
 compactor reads the manifest with `get("manifest", None)` and compares the tag.
+The second check matters: a writer can reuse a body that is still there (its
+`put_new` leaves the oid unchanged), create the idx we just deleted again and
+commit between the two calls, and the body's lease would still match.
 A conditional read with the cached tag is not enough: the Git carrier answers
 one from its 2 s freshness window with no network call, and a stale view is the
 one thing the pack deletes cannot tolerate. This applies to every backend, and
 to the log and checkpoint deletes too, which the cutoff alone would have made
 safe: nothing is deleted on a picture the manifest has moved past, so a remote
 that is pushed to continuously can defer cleanup to a rerun (the report says so).
-If the manifest moved before the first batch the plan is stale and is redone;
-later, the rest is kept. Order per batch: age record write (if changed),
-manifest check, deletes.
+If the manifest moved before anything was deleted the plan is stale and is
+redone; later (including between a batch's idx and body deletes), the rest is
+kept and the report says so. Order per call: age record write (if changed),
+manifest check, delete.
 
 **What remains.** The race named under "Residual limit" is narrowed, not closed.
 A pusher that finds an aged orphan pack already present (`put_new` returns
