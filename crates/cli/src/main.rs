@@ -413,13 +413,24 @@ enum Cmd {
         /// --tls-cert (enforced in run_serve, not by clap).
         #[arg(long)]
         tls_key: Option<PathBuf>,
-        /// Serve a bucket WAL remote (`sc+wal://…` or `sc+s3://…`; `sc+git::`
-        /// is not supported yet) instead of this repo's own object store (P36c). `<path>` remains the serve
-        /// home: its `.sc/` still provides access tokens, the TLS identity,
-        /// and scratch space — but all served content lives in the bucket,
-        /// making this instance disposable.
+        /// Serve a bucket WAL remote (`sc+wal://…`, `sc+s3://…` or
+        /// `sc+git::<git-url>`) instead of this repo's own object store (P36c).
+        /// `<path>` remains the serve home: its `.sc/` still provides access
+        /// tokens, the TLS identity, and scratch space — but all served content
+        /// lives in the bucket, making this instance disposable. A `sc+git::`
+        /// store needs git to authenticate without prompting (ssh agent, a key
+        /// without a passphrase, or a credential helper): a daemon cannot answer
+        /// a prompt.
         #[arg(long)]
         store: Option<String>,
+        /// Accept private branches into a `sc+git::` store (`--store` only).
+        /// Without it the server refuses every private-branch object and ref
+        /// before anything reaches the Git host: the host shows the branch
+        /// name, recipient ids and sizes to everyone who can read the
+        /// repository and keeps the ciphertext after any later revoke. The
+        /// opt-in is the operator's, never a client's. (ADR-0060)
+        #[arg(long)]
+        allow_private_branches: bool,
         /// Repo root to serve (the directory containing `.sc/`). Required
         /// unless a `token`/`fingerprint` subcommand is used.
         path: Option<PathBuf>,
@@ -1278,6 +1289,7 @@ fn real_main() -> Result<()> {
             tls_cert,
             tls_key,
             store,
+            allow_private_branches,
             path,
         } => match sub {
             Some(ServeSub::Token { op }) => run_serve_token(op),
@@ -1308,6 +1320,7 @@ fn real_main() -> Result<()> {
                     tls_cert,
                     tls_key,
                     store,
+                    allow_private_branches,
                     path,
                 )
             }
@@ -4245,7 +4258,10 @@ fn runs_default_budget(conn_bytes_given: bool, max_pack_size: Option<u64>) -> bo
 /// (P36c) redirects served content to a bucket WAL remote; `path` remains
 /// the serve home (tokens/TLS identity/scratch) either way. A malformed
 /// `--store` URL is validated up front, before any bind — same fail-fast
-/// idiom as `run_remote`'s `BucketUrl::parse` check.
+/// idiom as `run_remote`'s `BucketUrl::parse` check. A `sc+git::` store
+/// (ADR-0060) refuses private-branch objects unless `--allow-private-branches`
+/// is given, which only that store accepts, and reaps Git caches a killed
+/// earlier server left in the serve home.
 fn run_serve(
     stdio: bool,
     http: Option<String>,
@@ -4259,6 +4275,7 @@ fn run_serve(
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     store: Option<String>,
+    allow_private_branches: bool,
     path: PathBuf,
 ) -> Result<()> {
     let max_pack = max_pack_size.unwrap_or(scl_repo::wire::DEFAULT_MAX_PACK_SIZE);
@@ -4271,8 +4288,23 @@ fn run_serve(
     };
     scl_repo::wire::validate_max_conn_bytes(conn_bytes, max_pack, scl_core::max_object_size())?;
     if let Some(url) = &store {
-        scl_repo::refuse_git_store(url)?;
         scl_repo::BucketUrl::parse(url)?; // fail fast on malformed URLs, before any bind
+    }
+    let git_store = store.as_deref().is_some_and(scl_repo::is_git_bucket_url);
+    if allow_private_branches && !git_store {
+        anyhow::bail!("--allow-private-branches applies only to --store sc+git::<git-url>");
+    }
+    if git_store {
+        // A killed earlier server can have left its Git cache in the serve home.
+        scl_repo::wire::reap_stale_serve_scratch(&path);
+        // Once per daemon start; a `--stdio` session would repeat it to every ssh client.
+        if !allow_private_branches && http.is_some() {
+            eprintln!(
+                "note: serving a Git repository; private-branch objects are refused \
+                 (--allow-private-branches accepts them). git must authenticate without \
+                 prompting (ssh agent, a key without a passphrase, or a credential helper)"
+            );
+        }
     }
     match (stdio, http) {
         (true, None) => {
@@ -4313,6 +4345,7 @@ fn run_serve(
                 max_pack_size: max_pack,
                 ro_drain_cap: scl_repo::wire::RO_DRAIN_CAP,
                 max_conn_bytes: conn_bytes,
+                allow_private_branches,
             };
             let mut stdin = std::io::stdin().lock();
             let mut stdout = std::io::stdout().lock();
@@ -4340,6 +4373,7 @@ fn run_serve(
                 limits.max_pack_size = m;
             }
             limits.max_conn_bytes = conn_bytes;
+            limits.allow_private_branches = allow_private_branches;
             if default_budget && !read_only && !scl_repo::http_transport::addr_is_loopback(&addr) {
                 eprintln!(
                     "warning: writable listener on {addr} runs with the default --max-conn-bytes \

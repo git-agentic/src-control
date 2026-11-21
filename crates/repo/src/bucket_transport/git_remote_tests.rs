@@ -1,6 +1,6 @@
 //! `sc+git::` remote plumbing: URL parsing and the reserved prefix, the
-//! private-branch gate, and the `serve --store` refusal.
-//! Nothing here reaches `GitBucket`'s real I/O except the URL-parse test.
+//! private-branch gate. The serve-side gate has its own tests in
+//! `git_serve_tests.rs`. Nothing here reaches `GitBucket`'s real I/O except the URL-parse test.
 
 use super::*;
 use crate::error::Error;
@@ -160,38 +160,6 @@ fn push_of_a_private_branch_to_a_git_carrier_refuses_before_any_io() {
     assert!(invalid(repo.push("plain")).contains("--allow-private-branches"));
     drop(repo);
     std::fs::remove_dir_all(&d).unwrap();
-}
-
-#[test]
-fn serve_store_refuses_git_carriers_before_parsing() {
-    let url = "sc+git::file:///srv/r.git";
-    assert!(invalid(refuse_git_store(url)).contains("sc serve --store"));
-    // The reserved prefix is refused too, so a near miss never reaches a parser.
-    assert!(refuse_git_store("sc+git:/x").is_err());
-    assert!(refuse_git_store("sc+wal:///tmp/b").is_ok());
-
-    // The wire layer enforces it for both `--stdio` and `--http` serving, and
-    // the client sees why at the handshake.
-    let home = root("serve-store");
-    std::fs::create_dir_all(home.join(".sc")).unwrap();
-    let (client_read, mut server_write) = std::io::pipe().unwrap();
-    let (mut server_read, client_write) = std::io::pipe().unwrap();
-    let home_for_server = home.clone();
-    let srv = std::thread::spawn(move || {
-        crate::wire::serve_bucket_with_policy(
-            url,
-            &home_for_server,
-            &mut server_read,
-            &mut server_write,
-            crate::wire::WirePolicy::default(),
-        )
-    });
-    let Err(err) = crate::stdio_transport::WireClient::handshake(client_read, client_write) else {
-        panic!("the session is refused");
-    };
-    assert!(err.to_string().contains("sc serve --store"), "{err}");
-    srv.join().unwrap().unwrap();
-    std::fs::remove_dir_all(&home).unwrap();
 }
 
 #[test]

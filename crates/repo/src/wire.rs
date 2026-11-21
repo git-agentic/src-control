@@ -838,6 +838,12 @@ pub struct WirePolicy {
     /// means unlimited (embedders and tests; `sc serve` refuses it). Reads
     /// are not budgeted.
     pub max_conn_bytes: u64,
+    /// Consulted only for a `sc+git::` store behind `sc serve --store`
+    /// (ADR-0060): accept private-branch objects and refs. `false` refuses
+    /// them (fail closed), because a Git host exposes the branch name,
+    /// recipient ids and sizes to every reader of the repository. Every other
+    /// store and a local repo ignore it.
+    pub allow_private_branches: bool,
 }
 
 impl Default for WirePolicy {
@@ -847,6 +853,7 @@ impl Default for WirePolicy {
             max_pack_size: DEFAULT_MAX_PACK_SIZE,
             ro_drain_cap: RO_DRAIN_CAP,
             max_conn_bytes: default_max_conn_bytes(DEFAULT_MAX_PACK_SIZE),
+            allow_private_branches: false,
         }
     }
 }
@@ -1117,15 +1124,33 @@ pub fn serve_with_policy(
 /// [`serve_bucket_with_policy`] only needs one match to decide whether to
 /// reply OK or a typed error. `home` is the serve session's HOME directory
 /// (see [`TempServeDir::create_in`]) — the spool dir is created under its
-/// `.sc/tmp/`, not the process-wide temp dir.
-fn open_bucket_serve_transport(store_url: &str, home: &std::path::Path) -> Result<ServeTransport> {
-    crate::bucket_transport::refuse_git_store(store_url)?;
-    let transport = BucketTransport::open(store_url)?;
+/// `.sc/tmp/`, not the process-wide temp dir. A `sc+git::` store keeps its Git
+/// cache under the same `.sc/tmp/` and refuses private-branch objects unless
+/// `policy.allow_private_branches` is set.
+fn open_bucket_serve_transport(
+    store_url: &str,
+    home: &std::path::Path,
+    policy: &WirePolicy,
+) -> Result<ServeTransport> {
+    let transport = BucketTransport::open_for_serve(
+        store_url,
+        &crate::layout::Layout::at(home).tmp_dir(),
+        policy.allow_private_branches,
+    )?;
     let tmp = TempServeDir::create_in(home)?;
     Ok(ServeTransport::Bucket { transport, tmp })
 }
 
-/// Serve a bucket WAL (`sc+wal://`/`sc+s3://`; `sc+git::` is refused) over the same wire protocol
+/// Remove Git cache directories a killed `sc serve --store sc+git::…` process
+/// left under the serve home's `.sc/tmp/`, and return how many were removed. Call
+/// once at startup. Only a directory whose owner process is provably gone is
+/// removed: many `sc serve --stdio` processes can share one home, and a live
+/// session's cache must survive. Unix only; elsewhere it removes nothing.
+pub fn reap_stale_serve_scratch(home: &std::path::Path) -> usize {
+    scl_objio::GitBucket::reap_stale(&crate::layout::Layout::at(home).tmp_dir())
+}
+
+/// Serve a bucket WAL (`sc+wal://`, `sc+s3://` or `sc+git::`) over the same wire protocol
 /// `serve_with_policy` speaks for a local repo (P36c): same handshake, same
 /// `PROTOCOL_VERSION`, same read-only gate and pack-spool caps — every verb
 /// except the pack pair goes through [`Transport`] identically either way.
@@ -1154,7 +1179,7 @@ pub fn serve_bucket_with_policy(
     if !handshake_hello(r, w)? {
         return Ok(());
     }
-    let transport = match open_bucket_serve_transport(store_url, home) {
+    let transport = match open_bucket_serve_transport(store_url, home, &policy) {
         Ok(t) => {
             write_ok(w, &u32_body(PROTOCOL_VERSION))?;
             t
@@ -2413,6 +2438,7 @@ mod tests {
             max_pack_size: 4096,
             ro_drain_cap: RO_DRAIN_CAP,
             max_conn_bytes: 0,
+            allow_private_branches: false,
         };
         serve_with_policy(&root, &mut reader, &mut output, policy).unwrap();
 
@@ -2499,6 +2525,7 @@ mod tests {
             max_pack_size: 0,
             ro_drain_cap: 4096,
             max_conn_bytes: 0,
+            allow_private_branches: false,
         };
         serve_with_policy(&root, &mut reader, &mut output, policy).unwrap();
 
@@ -2587,6 +2614,7 @@ mod tests {
                 max_pack_size,
                 ro_drain_cap: 4096,
                 max_conn_bytes: 0,
+                allow_private_branches: false,
             };
             serve_with_policy(&root, &mut std::io::Cursor::new(input), &mut output, policy)
                 .unwrap();
