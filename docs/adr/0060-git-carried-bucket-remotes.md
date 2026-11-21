@@ -129,7 +129,10 @@ and an `ssh://` host outside the scp-form host charset. `sc+git:` in any letter
 case with a single colon, or any near miss, is a reserved prefix and is refused
 unless it is exactly lowercase `sc+git::<inner>`, so it never falls through to a
 local path or to the mirror bridge. `--git` is an error on an `sc+git::` URL.
-sc's own messages show a remote URL only with its userinfo redacted.
+A stored carrier URL therefore never holds a password or token. sc's refusal and
+error messages redact userinfo; `remote list` and the clone summary print the
+stored URL as for every other remote kind, which can include an ssh user name
+such as `git@`.
 
 Every git call runs with `-c protocol.allow=never` plus `always` for `file`,
 `ssh`, `http` and `https`, and `protocol.ext.allow=never`, `protocol.fd.allow=never`
