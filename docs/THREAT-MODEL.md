@@ -632,7 +632,8 @@ too, not just the src-control-side metadata.
 - **Compaction deletes data, so it is a privileged operation (#216,
   ADR-0057).** `sc remote compact` needs bucket **list and delete** rights in
   addition to the get/put/head permissions a pusher holds (pushes themselves need no list
-  or delete rights). Grant them to a dedicated operator or
+  or delete rights; on an `sc+git::` carrier every pusher holds them, see the carrier
+  section). Grant them to a dedicated operator or
   scheduled-job identity, not to ordinary pushers, read-only clients or the
   `sc serve --store` instances (they never need them: compaction is not a wire
   verb, so a served bucket's clients cannot trigger a delete). It cannot
@@ -766,10 +767,31 @@ The bucket model above applies unchanged, with the Git repository as the bucket 
   permission refusal is never reported as a lost race. The atomic CAS relies on the host checking
   the sent old value under its ref lock: stock `git receive-pack` and sc-forge do (verified);
   another host that does not cannot carry the store safely.
-- **Not built in v1.** `sc remote compact` is refused (committer time is writer-controlled, so it
-  cannot be an age source) and so is `sc serve --store sc+git::` (a daemon cannot answer prompts
+- **Compaction on a carrier has no trusted clock, so it keeps its own (ADR-0057 addendum).**
+  Committer time is writer-controlled and predates publication, so it is never an age.
+  `sc remote compact` instead records when it first saw each pack and checkpoint in
+  `refs/sc/compact/sightings` and ages objects from that (a re-created key is a new generation by
+  oid, so it starts over). The record is writer-trusted like the rest of the store: anyone who can
+  push can backdate it, but that person can already delete refs directly, so it adds no
+  authority. It supplies ages only: the candidates come from the listing minus everything the
+  live chain and the retained checkpoints and log entries name, so a record cannot make a live
+  object deletable. A malformed record, one naming a key outside `packs/` and `checkpoints/`,
+  or one dated more than five minutes ahead of the compactor's clock, blocks the run (it is
+  never read as "everything is old"). Deletes are leased to the oid the listing showed, so a key
+  re-created since survives, and the manifest is read uncached before every delete call.
+  Left open: a pusher reusing an aged orphan pack byte for byte can still lose it if the delete
+  lands after the manifest check and before its commit (no lease on the manifest), and a push
+  that stalls past the grace window loses its pack, as on any backend. A writer can also make the
+  compactor download a pack it did not need to: sizes for the merge plan come from the pack's idx,
+  which the writer controls, so a pack whose idx understates it is downloaded whole (up to the
+  2 GiB value cap, in RAM) before the real length is checked and the pack is left unmerged.
+  A retained log entry or checkpoint whose value changed since the listing (a writer deleted and
+  re-created it) keeps every candidate pack for that run. **Every pusher holds
+  delete** (a push to `refs/sc/*` is a push); unlike S3, delete rights cannot be withheld from
+  them. Run compaction from one host (clocks).
+- **Not built in v1.** `sc serve --store sc+git::` is refused (a daemon cannot answer prompts
   and would bypass the client-side private-branch opt-in).
-- **Scaling.** Every `ls-remote` and push downloads the whole ref advertisement (the pattern given to `ls-remote` filters on the client; a packet trace showed the server sends every ref, protocol v2 `ref-prefix` or not), and a cold read fetches every `log/` and `checkpoints/` entry. With compaction refused, refs grow by at least three per push (a log entry, a pack and its idx), so a long-lived store gets slower to open until compaction or a ref-filtering host exists.
+- **Scaling.** Every `ls-remote` and push downloads the whole ref advertisement (the pattern given to `ls-remote` filters on the client; a packet trace showed the server sends every ref, protocol v2 `ref-prefix` or not), and a cold read fetches every `log/` and `checkpoints/` entry behind the last checkpoint. Refs grow by at least three per push (a log entry, a pack and its idx); `sc remote compact` bounds that by merging small packs and deleting what nothing names, so a long-lived store should be compacted on a schedule. Between runs the advertisement still grows until a ref-filtering host exists.
 - **Local cache.** A temporary bare repository `sc-git-bucket-<pid>-<random>` (mode 0700) holds
   fetched store objects and is removed on exit; a killed process (SIGKILL, or SIGINT) can leave it
   behind, and there is no reaper.

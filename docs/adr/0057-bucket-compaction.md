@@ -274,3 +274,126 @@ The `Bucket` trait gains three methods, implemented by `DirBucket` and
 `crates/repo/src/bucket_transport/compact.rs` (`compact`, `CompactOptions`,
 `CompactReport`); reader restart and the pre-commit pack check in
 `bucket_transport.rs`; `sc remote compact` in `crates/cli`.
+
+## Addendum: compaction on an `sc+git::` remote (P39 follow-on, ADR-0060)
+
+ADR-0060 shipped the Git carrier with compaction refused: a Git host reports
+no trustworthy age for a stored object. The only time it has is a commit's
+committer date, which the writer chooses and which predates publication, so it
+cannot say how long an unreferenced pack has been sitting there. Without
+compaction `refs/sc/*` grows by at least three refs per push, every `ls-remote`
+and push downloads the whole advertisement, and a cold read fetches every
+`log/` and `checkpoints/` entry. This addendum lifts the refusal. The
+algorithm above is unchanged; only the age source, the sizing, and the delete
+primitive differ on a carrier, and the deletion rules around them get stricter.
+
+**Age source: first sightings.** On a carrier the compactor keeps its own
+clock. Bucket key `compact/sightings` (`refs/sc/compact/sightings`) holds one
+line per tracked key, `<first_seen_unix_secs> <oid> <key>\n`, sorted by key,
+where `oid` is the value's tag when the compactor first listed it and
+`first_seen` is the compactor's own clock then. Only `packs/` and
+`checkpoints/` keys are tracked: log entries are deleted by sequence behind the
+cutoff, never by age. An object's age is `now - first_seen`, so the first run
+after an object appears never deletes it (with a zero grace a first sighting is
+immediately old), and a later run at least `--prune-expire` after the first
+sighting may. A listed key whose oid differs from the recorded one is a new
+generation (a key that was deleted and uploaded again; every write is a new
+commit, so the oid always differs) and starts its age over.
+
+The record supplies ages and nothing else. Deletion candidates still come from
+the listing minus everything the live chain and the retained checkpoints and log
+entries name, so a record that calls a live pack ancient deletes nothing live.
+It decodes strictly: plain decimal seconds, a 40-digit lowercase oid, a
+`packs/` or `checkpoints/` key the carrier accepts, keys sorted and unique, no
+other bytes. Anything else is an error that blocks the run before phase 1
+writes anything, and the message names the fix (delete
+`refs/sc/compact/sightings`; every object's age then starts over); a record is
+never read as "everything is old". A first-seen time more than five minutes
+after the compactor's own clock is refused ("compactor clocks disagree"). The
+read cap is the 256 MiB value cap; a write that would pass it is an error, never
+a truncation. The record is written with a compare-and-swap, only when it
+changed, before any delete decision uses it (a lost CAS replans, so two
+compactors converge). A dry run never writes it and reports ages as a lower
+bound.
+
+**Sizes without downloads.** `list_meta` downloads every value on a carrier, so
+the compactor never calls it there. A live pack's size for the merge plan is the
+end of its furthest record in its idx (`offset + 4 + length`, saturating), taken
+while the view parses each live idx. The idx is writer-controlled, so after a
+member body is downloaded a pack far over `small_pack_bytes` (twice it) is left
+unmerged and reported; the body is already in RAM by then (up to the 2 GiB value
+cap), so an understating idx costs the compactor a download. Report byte counts
+on a carrier are those idx sizes, summed with saturation (log entries,
+checkpoints, idx files and a pack with no readable idx count as 0, and the
+report says so whenever the run deletes anything). Deletion counts are what the
+run attempted: a key that survives its lease, or that another compactor already
+removed, is still counted.
+
+**Clock and retained records.** On a carrier the clock is read per sweep attempt
+and only AFTER the tagged listing returns: that one instant is both the first-seen
+stamp of every new key and the age cutoff. A process that stalls before listing
+therefore cannot stamp a pack that was uploaded during the stall with a time from
+before it (the next run could otherwise delete it while its push is still
+staging), and a key first listed after a replan gets that attempt's time. A
+stall after the listing only makes stamps later. A retained log entry or checkpoint is compared, by tag, with the
+tag its own listing showed: a carrier serves a create-only key it has already
+read from its cache, so a mismatch (a writer deleted and re-created the entry)
+means the bytes read are not the value the listing shows, and every candidate
+pack is kept for that run (a rerun, in a new process, reads it afresh).
+
+**Leased deletes.** `Bucket` gains `list_tags` (keys with their tags, one
+listing) and `delete_leased` (delete each `(key, tag)` only if the key still
+holds that tag; the default is an error, so a lease is never silently dropped by
+deleting without one, and only the Git carrier overrides it: compaction deletes
+from the other backends with plain `delete`). The Git
+carrier pushes the deletions with one `--force-with-lease=refs/sc/K:<oid>` and
+one `:refs/sc/K` refspec per key (never `+`, never `--atomic`, at most 128 refs
+and about 24 KiB of arguments per push). A key that was re-created since the
+listing is at another oid and survives; a key still at its lease after a refusal
+(a hook) is an error. The sweep deletes each key leased to the oid of the one
+listing whose age it judged; nothing lists twice.
+
+**Authoritative manifest check.** Before every delete call (the log and
+checkpoint deletes, and for each batch of packs the idx files and then, as a
+separate call with its own check, the bodies) the
+compactor reads the manifest with `get("manifest", None)` and compares the tag.
+The second check matters: a writer can reuse a body that is still there (its
+`put_new` leaves the oid unchanged), create the idx we just deleted again and
+commit between the two calls, and the body's lease would still match.
+A conditional read with the cached tag is not enough: the Git carrier answers
+one from its 2 s freshness window with no network call, and a stale view is the
+one thing the pack deletes cannot tolerate. This applies to every backend, and
+to the log and checkpoint deletes too, which the cutoff alone would have made
+safe: nothing is deleted on a picture the manifest has moved past, so a remote
+that is pushed to continuously can defer cleanup to a rerun (the report says so).
+If the manifest moved before anything was deleted the plan is stale and is
+redone; later (including between a batch's idx and body deletes), the rest is
+kept and the report says so. Order per call: age record write (if changed),
+manifest check, delete.
+
+**What remains.** The race named under "Residual limit" is narrowed, not closed.
+A pusher that finds an aged orphan pack already present (`put_new` returns
+false and leaves the oid unchanged, because the bytes are identical) and commits
+its manifest after the compactor's check but before the delete lands can still
+lose the pack: no lease on the manifest exists to close that. A push also keeps
+its pack only if it commits within the grace window of the compactor first
+seeing the pack. Both are the contract this ADR already states for every
+backend. A crash between the age record write and the deletes leaves every key
+in place with its age recorded, so the next run decides again and finishes the
+job; a crash between an idx delete and its pack delete leaves a lone `.pack`,
+which ages out on its own.
+
+**Operating it.** Run compaction from one host: runs that share the record need
+clocks within far less than the grace window. On a Git host every pusher holds
+delete (a push to `refs/sc/*` is a push), unlike the advice above to keep delete
+rights away from pushers; branch protection does not cover `refs/sc/*`.
+Deleting a ref is not erasure: the host may keep the objects fetchable by id,
+and forks and mirrors keep their own copies; sealed content stays ciphertext, so
+rotation (`sc rewrap --rotate`) is the cutover. Tested over a bare repository
+and sc-forge; not tested against GitHub.
+
+As built: `compact/sightings.rs` (the record), `compact.rs` (`list_for_sweep`,
+`delete_keys`, `manifest_unmoved`), `WalView.pack_sizes`, `Bucket::list_tags`
+and `delete_leased` (`GitBucket` overrides both). Tests:
+`compact/tests/git.rs`, `crates/objio/src/git.rs`, `crates/cli/tests/git_bucket.rs`;
+proof: `demo/run_git_carrier_demo.sh`.

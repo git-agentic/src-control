@@ -13,11 +13,17 @@
 #      with --allow-private-branches; protected paths and secrets need no opt-in.
 #   3. CARRIER: `git ls-remote` lists refs/sc/*; a plain `git clone` of the same
 #      repository fetches none of them and holds no sc objects.
-#   4. KEYLESS: an sc clone sees `hotfix (private, no access)`, no protected
+#   4. COMPACT: `sc remote compact` works on the carrier. A Git host reports no
+#      trustworthy object age, so the first run only records when it first saw
+#      each object (refs/sc/compact/sightings) and deletes nothing; a second run
+#      a grace window later deletes what aged, with leased ref deletions. The
+#      refs/sc/* count is printed before and after, and the clones below prove
+#      the compacted store still reads.
+#   5. KEYLESS: an sc clone sees `hotfix (private, no access)`, no protected
 #      plaintext, no embargoed file, and cannot read the secret value.
-#   5. KEYED: an sc clone with alice's identity reads the protected file, the
+#   6. KEYED: an sc clone with alice's identity reads the protected file, the
 #      secret and the embargoed branch.
-#   6. Zero residue: no leftover `sc-git-bucket-*` temp dirs (TMPDIR is private
+#   7. Zero residue: no leftover `sc-git-bucket-*` temp dirs (TMPDIR is private
 #      to each run, so any leftover is ours) and no .sc/tmp residue.
 #
 # Self-checking: every claim is an assertion; any failure exits non-zero before
@@ -75,7 +81,7 @@ scenario() {
   local url="sc+git::$giturl"
   local a="$WORK/alice-$idx"
   local key="$WORK/alice.key"
-  local out before after n
+  local out before mid after n
 
   echo
   echo "=== [$label] 1: public main goes through the Git bridge; sealed content cannot ==="
@@ -152,7 +158,31 @@ scenario() {
   echo "git ls-remote lists refs/sc/*; plain clone holds main only, no sc objects ✔"
 
   echo
-  echo "=== [$label] 4: KEYLESS — an sc clone sees ciphertext and markers only ==="
+  echo "=== [$label] 4: COMPACT — two runs a grace window apart shrink refs/sc/* ==="
+  cd "$a"
+  before=$(git ls-remote "$giturl" 'refs/sc/*' | wc -l | tr -d ' ')
+  out=$("$SC" remote compact opted --prune-expire 2s --allow-short-grace 2>&1) \
+    || fail "the first compaction run failed (got: $out)"
+  echo "$out" | grep -q "first sighting" \
+    || fail "the first run must record when it first saw each object (got: $out)"
+  echo "$out" | grep -q "deleted 0 log entries, 0 checkpoint(s), 0 pack(s)" \
+    || fail "the first run must delete nothing it never saw before (got: $out)"
+  git ls-remote "$giturl" refs/sc/compact/sightings | grep -q "refs/sc/compact/sightings" \
+    || fail "the age record must be on the Git host"
+  mid=$(git ls-remote "$giturl" 'refs/sc/*' | wc -l | tr -d ' ')
+  sleep 3
+  out=$("$SC" remote compact opted --prune-expire 2s --allow-short-grace 2>&1) \
+    || fail "the second compaction run failed (got: $out)"
+  echo "$out" | grep -q "deleted 0 log entries" \
+    && fail "the second run, past the grace, must delete log entries (got: $out)"
+  after=$(git ls-remote "$giturl" 'refs/sc/*' | wc -l | tr -d ' ')
+  [ "$after" -lt "$mid" ] || fail "the second run must remove refs (before $before, mid $mid, after $after)"
+  git ls-remote "$giturl" refs/sc/manifest | grep -q "refs/sc/manifest" \
+    || fail "compaction must never remove the manifest"
+  echo "refs/sc/*: $before before, $mid after run 1 (nothing deleted, first sightings recorded), $after after run 2 ✔"
+
+  echo
+  echo "=== [$label] 5: KEYLESS — an sc clone sees ciphertext and markers only ==="
   "$SC" clone "$url" "$WORK/keyless-$idx" >/dev/null 2>&1 || fail "keyless sc clone must work"
   cd "$WORK/keyless-$idx"
   "$SC" branch list | grep -q "hotfix (private, no access)" \
@@ -169,7 +199,7 @@ scenario() {
   echo "keyless clone: branch marker, no protected plaintext, secret unreadable ✔"
 
   echo
-  echo "=== [$label] 5: KEYED — alice's clone reads all three ==="
+  echo "=== [$label] 6: KEYED — alice's clone reads all three ==="
   "$SC" clone "$url" "$WORK/keyed-$idx" --allow-private-branches >/dev/null 2>&1 \
     || fail "keyed sc clone must work"
   cd "$WORK/keyed-$idx"
@@ -184,7 +214,7 @@ scenario() {
   echo "keyed clone: protected file decrypts, secret injects, embargoed branch reads ✔"
 
   echo
-  echo "=== [$label] 6: zero residue ==="
+  echo "=== [$label] 7: zero residue ==="
   no_cache_residue
   for r in "$a" "$WORK/keyless-$idx" "$WORK/keyed-$idx"; do
     if [ -d "$r/.sc/tmp" ] && [ -n "$(ls -A "$r/.sc/tmp" 2>/dev/null)" ]; then
@@ -263,6 +293,9 @@ echo "secret and a private branch crossed it losslessly, where the Git bridge"
 echo "refuses sealed content. The private branch needed the per-remote"
 echo "--allow-private-branches opt-in (the refused push uploaded nothing); a plain"
 echo "git clone fetched no refs/sc/* and held no sc objects while public main"
-echo "rode along as an ordinary Git branch; a keyless sc clone saw only the"
-echo "branch marker and ciphertext, a keyed clone read all three. Verified"
-echo "across two independent runs, zero sc-git-bucket-* or .sc/tmp residue."
+echo "rode along as an ordinary Git branch. sc remote compact then shrank"
+echo "refs/sc/* on the host in two runs a grace window apart (the first only"
+echo "recorded first sightings and deleted nothing), and after it a keyless sc"
+echo "clone saw only the branch marker and ciphertext, a keyed clone read all"
+echo "three. Verified across two independent runs, zero sc-git-bucket-* or"
+echo ".sc/tmp residue."

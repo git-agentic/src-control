@@ -8,13 +8,24 @@
 //! ever deleted that the current manifest references, and the manifest itself
 //! is never deleted, so a failure between any two operations leaves a bucket a
 //! cold start reads.
+//!
+//! On a Git carrier (`sc+git::`) the host reports no trustworthy object age, so
+//! the sweep takes ages from the first-sighting record (`sightings`) instead of
+//! the bucket's modification times, sizes packs from their idx instead of
+//! downloading them, and deletes with leases (`Bucket::delete_leased`) so a key
+//! someone re-created after the listing survives (ADR-0057 addendum).
 
-use super::{capped, BucketTransport};
+mod sightings;
+
+use super::{capped, declared_pack_len, BucketTransport};
 use crate::error::{Error, Result};
-use crate::walfmt::{checkpoint_key, log_key, pack_key, Checkpoint, LogEntry, Manifest, MAX_LIST};
-use scl_core::pack::parse_pack_reader;
+use crate::walfmt::{
+    checkpoint_key, idx_key, log_key, pack_key, Checkpoint, LogEntry, Manifest, MAX_LIST,
+};
+use scl_core::pack::{parse_index, parse_pack_reader};
 use scl_core::ObjectId;
 use scl_objio::{Fetched, ObjectMeta};
+use sightings::Sightings;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
@@ -68,10 +79,16 @@ pub struct CompactReport {
     pub checkpoint_seq: u64,
     /// The sweep cutoff `K` (0 when no checkpoint is old enough yet).
     pub cutoff: u64,
+    /// The deletion counts below are what the run attempted (what a dry run
+    /// would attempt): a key another writer re-created after the listing
+    /// survives its leased delete, and one another compactor already removed is
+    /// already gone, and both are still counted.
     pub logs_deleted: usize,
     pub checkpoints_deleted: usize,
     /// Pack hashes removed (each is a `.pack` and a `.idx`).
     pub packs_deleted: usize,
+    /// Bytes behind the deletions above, saturating (an `sc+git::` store
+    /// reports pack bodies as their idx declares them, which a writer controls).
     pub bytes_deleted: u64,
     /// Unreferenced packs kept because they are younger than `prune_expire`.
     pub packs_held_back: usize,
@@ -84,6 +101,13 @@ fn seq_of(key: &str) -> Option<u64> {
     key.rsplit('/').next()?.parse().ok()
 }
 
+/// Whole seconds since the Unix epoch, the resolution of the age record.
+fn unix_secs(t: SystemTime) -> Result<u64> {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|_| Error::InvalidArgument("the clock is before 1970".into()))
+}
+
 /// `packs/<hash>.pack` / `packs/<hash>.idx` -> `<hash>`.
 fn hash_of(key: &str) -> Option<&str> {
     let name = key.strip_prefix("packs/")?;
@@ -91,12 +115,54 @@ fn hash_of(key: &str) -> Option<&str> {
         .or_else(|| name.strip_suffix(".idx"))
 }
 
-/// Bytes of the `.pack` and `.idx` objects behind these packs.
-fn pack_bytes(packs: &[(&String, &Vec<ObjectMeta>)]) -> u64 {
-    packs
-        .iter()
-        .flat_map(|(_, ms)| ms.iter().map(|m| m.size))
-        .sum()
+/// Sum that saturates: a size a writer controls (an idx's declared length) can
+/// be `u64::MAX`, and an overflow would panic a debug build on every run.
+fn total(sizes: impl IntoIterator<Item = u64>) -> u64 {
+    sizes.into_iter().fold(0, u64::saturating_add)
+}
+
+/// Bytes of these packs' objects whose key ends with `suffix` (`.idx` or
+/// `.pack`); a pack in `declared` (a Git carrier, which lists no sizes) counts
+/// its declared body length under `.pack`, only when its `.pack` key is listed
+/// (a lone `.idx` deletes no body), and nothing under `.idx`.
+fn pack_bytes(
+    packs: &[(&String, &Vec<ObjectMeta>)],
+    declared: &BTreeMap<String, u64>,
+    suffix: &str,
+) -> u64 {
+    total(packs.iter().map(|(h, ms)| {
+        let has_body = || ms.iter().any(|m| m.key.ends_with(".pack"));
+        match declared.get(*h) {
+            Some(d) if suffix == ".pack" && has_body() => *d,
+            Some(_) => 0,
+            None => total(
+                ms.iter()
+                    .filter(|m| m.key.ends_with(suffix))
+                    .map(|m| m.size),
+            ),
+        }
+    }))
+}
+
+/// What one sweep attempt sees in the bucket.
+struct Listing {
+    /// The instant the attempt's ages are judged at (`opts.now` overrides the
+    /// clock). On a Git carrier it is read AFTER the tagged listing returns and
+    /// serves both as the first-seen stamp of every new key and as the age
+    /// cutoff: a key that appeared while this process stalled before listing is
+    /// stamped no earlier than the listing that showed it, never with an older
+    /// time from before the stall. Elsewhere ages come from the bucket's own
+    /// modification times and the instant is read before listing, the
+    /// conservative side.
+    now: SystemTime,
+    ckpts: Vec<(u64, ObjectMeta)>,
+    logs: Vec<(u64, ObjectMeta)>,
+    /// `.pack` and `.idx` objects by pack hash.
+    by_hash: BTreeMap<String, Vec<ObjectMeta>>,
+    /// Git carrier only: the tag each listed key held in this very listing, the
+    /// lease its delete is conditional on (the oid whose age was judged is the
+    /// oid deleted; nothing lists twice).
+    tags: BTreeMap<String, String>,
 }
 
 /// Greedy size-tiered grouping: smallest candidates first, a group closes when
@@ -116,12 +182,12 @@ fn plan_groups(
     let mut groups: Vec<Vec<String>> = Vec::new();
     let (mut cur, mut sum): (Vec<String>, u64) = (Vec::new(), 0);
     for (size, hash) in small {
-        if !cur.is_empty() && sum + size > opts.group_bytes {
+        if !cur.is_empty() && sum.saturating_add(size) > opts.group_bytes {
             groups.push(std::mem::take(&mut cur));
             sum = 0;
         }
         cur.push(hash.clone());
-        sum += size;
+        sum = sum.saturating_add(size);
     }
     groups.push(cur);
     groups.retain(|g| g.len() >= 2);
@@ -131,16 +197,20 @@ fn plan_groups(
 impl BucketTransport {
     /// Compact this bucket remote (ADR-0057): merge small packs, then delete
     /// log entries, checkpoints and packs no reader or writer can still need.
-    /// Safe to run while others push and fetch; run one at a time (concurrent
-    /// runs stay correct but waste work). Needs bucket list and delete rights.
+    /// Safe to run while others push and fetch; run one at a time, from one
+    /// host (concurrent runs stay correct but waste work, and on a Git carrier
+    /// runs that share the age record need clocks within far less than the grace
+    /// window). Needs bucket list and delete rights (on a Git repository, push
+    /// access).
     pub fn compact(&self, opts: &CompactOptions) -> Result<CompactReport> {
-        if self.git_carrier {
-            return Err(super::git_compact_refusal());
-        }
         let mut rep = CompactReport {
             dry_run: opts.dry_run,
             ..CompactReport::default()
         };
+        if self.git_carrier {
+            // An unusable age record stops the run before phase 1 writes anything.
+            self.read_sightings(unix_secs(opts.now.unwrap_or_else(SystemTime::now))?)?;
+        }
         self.refresh()?;
         if self.view.borrow().is_none() {
             // No manifest yet: nothing to merge, but a first push that died after
@@ -155,9 +225,14 @@ impl BucketTransport {
                 .map_or(0, |v| v.manifest.checkpoint_seq);
             self.consolidate(opts, &mut rep)?;
         }
-        // Read the clock after phase 1 so a zero grace sees its own checkpoint.
-        let now = opts.now.unwrap_or_else(SystemTime::now);
-        self.sweep(opts, now, &mut rep)?;
+        self.sweep(opts, &mut rep)?;
+        if self.git_carrier && rep.logs_deleted + rep.checkpoints_deleted + rep.packs_deleted > 0 {
+            rep.notes.push(
+                "Git carrier: byte counts are the pack bodies their idx declares; log entries, \
+                 checkpoints and idx files count as 0, as does a pack with no readable idx"
+                    .into(),
+            );
+        }
         Ok(rep)
     }
 
@@ -179,13 +254,23 @@ impl BucketTransport {
                     .collect();
                 (live, v.refs.len())
             };
-            let sizes: BTreeMap<String, u64> = self
-                .bucket
-                .list_meta("packs/")?
-                .into_iter()
-                .filter(|m| m.key.ends_with(".pack"))
-                .filter_map(|m| hash_of(&m.key).map(|h| (h.to_string(), m.size)))
-                .collect();
+            // A Git carrier's `list_meta` downloads every value, so its sizes
+            // come from the idx files the view already parsed (a hint: the idx is
+            // writer-controlled, which the body check below backs up).
+            let sizes: BTreeMap<String, u64> = if self.git_carrier {
+                self.view
+                    .borrow()
+                    .as_ref()
+                    .map(|v| v.pack_sizes.clone())
+                    .unwrap_or_default()
+            } else {
+                self.bucket
+                    .list_meta("packs/")?
+                    .into_iter()
+                    .filter(|m| m.key.ends_with(".pack"))
+                    .filter_map(|m| hash_of(&m.key).map(|h| (h.to_string(), m.size)))
+                    .collect()
+            };
             let groups = plan_groups(&live, &sizes, opts);
             if groups.is_empty() {
                 if live.len() > MAX_LIST {
@@ -227,6 +312,17 @@ impl BucketTransport {
                         missing_on = tag;
                         continue 'attempt;
                     };
+                    // The idx that sized this pack is the writer's word: a pack
+                    // far over what it declared is not merged (nor decoded).
+                    if self.git_carrier
+                        && bytes.len() as u64 > opts.small_pack_bytes.saturating_mul(2)
+                    {
+                        rep.notes.push(format!(
+                            "pack {hash} is {} bytes, far over what its idx declares: left unmerged",
+                            bytes.len()
+                        ));
+                        continue;
+                    }
                     parse_pack_reader(std::io::Cursor::new(&bytes[..]), |id, obj| {
                         let enc = obj.encode();
                         decoded += enc.len() as u64;
@@ -390,13 +486,10 @@ impl BucketTransport {
     }
 
     /// Phase 2: delete what is behind the cutoff and what nothing names.
-    fn sweep(&self, opts: &CompactOptions, now: SystemTime, rep: &mut CompactReport) -> Result<()> {
-        // `modified <= old_before` means "at least prune_expire old".
-        let old_before = now
-            .checked_sub(opts.prune_expire)
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        let old = |m: &ObjectMeta| m.modified <= old_before;
-        for _ in 0..MAX_ATTEMPTS {
+    fn sweep(&self, opts: &CompactOptions, rep: &mut CompactReport) -> Result<()> {
+        // What stopped the last attempt, for the note if they all stop.
+        let mut lost_record = false;
+        'attempt: for _ in 0..MAX_ATTEMPTS {
             self.refresh()?;
             let (tag, ck_seq, live) = match self.view.borrow().as_ref() {
                 Some(v) => (
@@ -406,18 +499,25 @@ impl BucketTransport {
                 ),
                 None => (None, 0, BTreeSet::new()),
             };
-            let ckpts: Vec<(u64, ObjectMeta)> = self
-                .bucket
-                .list_meta("checkpoints/")?
-                .into_iter()
-                .filter_map(|m| seq_of(&m.key).map(|s| (s, m)))
-                .collect();
-            let logs: Vec<(u64, ObjectMeta)> = self
-                .bucket
-                .list_meta("log/")?
-                .into_iter()
-                .filter_map(|m| seq_of(&m.key).map(|s| (s, m)))
-                .collect();
+            // A lost race on the age record means someone else updated it: replan.
+            let Some(Listing {
+                now,
+                ckpts,
+                logs,
+                by_hash,
+                tags,
+            }) = self.list_for_sweep(opts, rep)?
+            else {
+                lost_record = true;
+                continue;
+            };
+            lost_record = false;
+            // `modified <= old_before` means "at least prune_expire old". The
+            // instant is the listing's own (see `Listing::now`).
+            let old_before = now
+                .checked_sub(opts.prune_expire)
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            let old = |m: &ObjectMeta| m.modified <= old_before;
             let cutoff = ckpts
                 .iter()
                 .filter(|(s, m)| *s <= ck_seq && old(m))
@@ -442,14 +542,9 @@ impl BucketTransport {
                 .map(|(_, m)| m)
                 .collect();
 
-            // Pack objects by hash; a hash is a candidate if the live chain
-            // does not name it and every one of its objects is old enough.
-            let mut by_hash: BTreeMap<String, Vec<ObjectMeta>> = BTreeMap::new();
-            for m in self.bucket.list_meta("packs/")? {
-                if let Some(h) = hash_of(&m.key) {
-                    by_hash.entry(h.to_string()).or_default().push(m);
-                }
-            }
+            // A hash is a candidate if the live chain does not name it and every
+            // one of its objects (a lone `.pack` after an idx-first crash is
+            // one) is old enough.
             let unnamed: Vec<(&String, &Vec<ObjectMeta>)> =
                 by_hash.iter().filter(|(h, _)| !live.contains(*h)).collect();
             let (aged, young): (Vec<_>, Vec<_>) =
@@ -460,7 +555,7 @@ impl BucketTransport {
             if !aged.is_empty() {
                 // Retained structure may still name them: every kept
                 // checkpoint and every kept log entry (on-chain or not).
-                match self.retained_packs(&ckpts, &logs, cutoff) {
+                match self.retained_packs(&ckpts, &logs, cutoff, &tags) {
                     Ok(named) => {
                         del_packs = aged
                             .into_iter()
@@ -469,29 +564,36 @@ impl BucketTransport {
                     }
                     Err(e) => rep
                         .notes
-                        .push(format!("packs kept, a retained record is unreadable: {e}")),
+                        .push(format!("packs kept, a retained record cannot be used: {e}")),
                 }
             }
 
-            // Log entries and checkpoints behind the cutoff are safe whatever
-            // the manifest does meanwhile: the cutoff only ever grows, so they
-            // stay unreachable. Counters add up across replans.
+            // Log entries and checkpoints behind the cutoff would stay
+            // unreachable whatever the manifest does meanwhile (the cutoff only
+            // ever grows), but nothing is deleted on a picture the manifest has
+            // moved past, so they too wait for the uncached manifest check below
+            // (a busy remote can defer their cleanup to a rerun). Counters add up
+            // across replans.
             rep.cutoff = rep.cutoff.max(cutoff);
-            rep.logs_deleted += del_logs.len();
-            rep.checkpoints_deleted += del_ckpts.len();
-            rep.bytes_deleted += del_logs
-                .iter()
-                .chain(del_ckpts.iter())
-                .map(|m| m.size)
-                .sum::<u64>();
-            if !opts.dry_run {
-                for m in del_logs.iter().chain(del_ckpts.iter()) {
-                    self.bucket.delete(&m.key)?;
-                }
-            }
-            rep.packs_deleted += del_packs.len();
-            rep.bytes_deleted += pack_bytes(&del_packs);
+            // Git carrier: pack sizes for the report, from the idx (the listing
+            // carries none); a pack with no readable idx counts as 0 bytes.
+            let declared = if self.git_carrier {
+                self.declared_sizes(&del_packs)
+            } else {
+                BTreeMap::new()
+            };
             if opts.dry_run {
+                rep.logs_deleted += del_logs.len();
+                rep.checkpoints_deleted += del_ckpts.len();
+                rep.bytes_deleted = rep.bytes_deleted.saturating_add(total(
+                    del_logs.iter().chain(del_ckpts.iter()).map(|m| m.size),
+                ));
+                rep.packs_deleted += del_packs.len();
+                for suffix in [".idx", ".pack"] {
+                    rep.bytes_deleted = rep
+                        .bytes_deleted
+                        .saturating_add(pack_bytes(&del_packs, &declared, suffix));
+                }
                 if rep.packs_created > 0 {
                     rep.notes.push(
                         "dry run: the sweep figures describe the bucket as it is now; the merge \
@@ -502,67 +604,293 @@ impl BucketTransport {
                 }
                 return Ok(());
             }
-            // A pack nothing names can still be named by a push that lands
-            // while we plan: if the manifest moved, replan the pack set
-            // (nothing is deleted against a stale picture).
-            let unmoved = matches!(
-                (&tag, self.bucket.get("manifest", tag.as_deref())?),
-                (Some(_), Fetched::Unchanged) | (None, Fetched::Absent)
-            );
-            if !unmoved {
-                rep.packs_deleted -= del_packs.len();
-                rep.bytes_deleted -= pack_bytes(&del_packs);
-                continue;
+            // The manifest is read without any cache before anything is deleted
+            // (a Git carrier answers a conditional read from its freshness
+            // window without asking the host): a push that landed since this
+            // attempt read the view may name what it would delete.
+            if !(del_logs.is_empty() && del_ckpts.is_empty()) {
+                if !self.manifest_unmoved(&tag)? {
+                    continue;
+                }
+                rep.logs_deleted += del_logs.len();
+                rep.checkpoints_deleted += del_ckpts.len();
+                rep.bytes_deleted = rep.bytes_deleted.saturating_add(total(
+                    del_logs.iter().chain(del_ckpts.iter()).map(|m| m.size),
+                ));
+                let keys: Vec<&str> = del_logs
+                    .iter()
+                    .chain(del_ckpts.iter())
+                    .map(|m| m.key.as_str())
+                    .collect();
+                self.delete_keys(&keys, &tags)?;
             }
-            // The delete loop can run long (one request per object), so look at
-            // the manifest again between batches: a push that lands meanwhile
-            // may have re-used one of these old packs byte for byte.
+            // A pack nothing names can still be named by a push that lands
+            // while we plan, and the delete loop can run long, so the manifest
+            // is looked at before every delete call, and a batch is two calls
+            // (idx files, then bodies): a writer can reuse a body that is still
+            // there (its `put_new` leaves the oid unchanged), recreate the idx
+            // we just deleted and commit between the two, and the body's lease
+            // would still match. If the manifest moved before the first call the
+            // plan is stale (replan); later, what is left is kept. Idx first: a
+            // half-deleted pack is then plain debris.
             for (i, batch) in del_packs.chunks(PACK_DELETE_BATCH).enumerate() {
-                if i > 0
-                    && !matches!(
-                        (&tag, self.bucket.get("manifest", tag.as_deref())?),
-                        (Some(_), Fetched::Unchanged) | (None, Fetched::Absent)
-                    )
-                {
-                    let left = del_packs.len() - i * PACK_DELETE_BATCH;
-                    rep.packs_deleted -= left;
-                    rep.bytes_deleted -= pack_bytes(&del_packs[i * PACK_DELETE_BATCH..]);
-                    rep.notes.push(format!(
-                        "the manifest moved during pack deletion: {left} unreferenced pack(s) \
-                         kept, rerun"
-                    ));
-                    return Ok(());
+                let mut sent = false; // a delete call of this batch has gone out
+                for suffix in [".idx", ".pack"] {
+                    let keys: Vec<&str> = batch
+                        .iter()
+                        .flat_map(|(_, ms)| ms.iter())
+                        .map(|m| m.key.as_str())
+                        .filter(|k| k.ends_with(suffix))
+                        .collect();
+                    if keys.is_empty() {
+                        continue; // lone bodies after an idx-first crash have no idx
+                    }
+                    if !self.manifest_unmoved(&tag)? {
+                        if i == 0 && !sent {
+                            continue 'attempt;
+                        }
+                        rep.notes.push(format!(
+                            "the manifest moved during pack deletion: {} unreferenced pack(s) \
+                             kept, rerun",
+                            del_packs.len() - i * PACK_DELETE_BATCH
+                        ));
+                        return Ok(());
+                    }
+                    self.delete_keys(&keys, &tags)?;
+                    sent = true;
+                    // Counted once its delete call went out, so a stop above
+                    // reports only what was attempted.
+                    rep.bytes_deleted = rep
+                        .bytes_deleted
+                        .saturating_add(pack_bytes(batch, &declared, suffix));
                 }
-                for (hash, _) in batch {
-                    // idx first: a half-deleted pack is then plain debris.
-                    self.bucket.delete(&format!("packs/{hash}.idx"))?;
-                    self.bucket.delete(&pack_key(hash))?;
-                }
+                rep.packs_deleted += batch.len();
             }
             return Ok(());
         }
-        rep.notes.push(
-            "the manifest kept moving during the sweep: unreferenced packs were kept, rerun".into(),
-        );
+        rep.notes.push(if lost_record {
+            format!(
+                "the age record refs/sc/{} kept losing its compare-and-swap to another \
+                 compactor ({MAX_ATTEMPTS} attempts): nothing was deleted, rerun (and run \
+                 compaction from one host)",
+                sightings::KEY
+            )
+        } else {
+            "the manifest kept moving during the sweep: what it had not yet deleted (log \
+             entries, checkpoints, unreferenced packs) was kept, rerun"
+                .into()
+        });
         Ok(())
+    }
+
+    /// Whether the manifest is still the one `tag` names (`None`: still absent),
+    /// read with no cache so the answer comes from the bucket itself.
+    fn manifest_unmoved(&self, tag: &Option<String>) -> Result<bool> {
+        Ok(match (tag, self.bucket.get("manifest", None)?) {
+            (Some(t), Fetched::New { tag: now, .. }) => *t == now,
+            (None, Fetched::Absent) => true,
+            _ => false,
+        })
+    }
+
+    /// Delete `keys`. On a Git carrier each goes with the lease its listing
+    /// gave it (`tags`), so a key that was re-created since survives; elsewhere
+    /// it is a plain delete. A key with no lease is an error, never an
+    /// unleased delete.
+    fn delete_keys(&self, keys: &[&str], tags: &BTreeMap<String, String>) -> Result<()> {
+        if !self.git_carrier {
+            for key in keys {
+                self.bucket.delete(key)?;
+            }
+            return Ok(());
+        }
+        let items = keys
+            .iter()
+            .map(|k| match tags.get(*k) {
+                Some(t) => Ok((k.to_string(), t.clone())),
+                None => Err(Error::Wal(format!(
+                    "no lease for {k}: refusing to delete it"
+                ))),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(self.bucket.delete_leased(&items)?)
+    }
+
+    /// Pack body sizes of `packs` as their idx declares them (a Git carrier's
+    /// listing carries no sizes), for the report only. A pack whose idx cannot be
+    /// read is left out and counts as 0 bytes; the report says so.
+    fn declared_sizes(&self, packs: &[(&String, &Vec<ObjectMeta>)]) -> BTreeMap<String, u64> {
+        let mut sizes = BTreeMap::new();
+        for (hash, _) in packs {
+            if let Ok(Fetched::New { bytes, .. }) = self.bucket.get(&idx_key(hash), None) {
+                if let Ok(entries) = parse_index(&bytes) {
+                    sizes.insert((*hash).clone(), declared_pack_len(&entries));
+                }
+            }
+        }
+        sizes
+    }
+
+    /// The age record as the bucket holds it, with the tag a compare-and-swap
+    /// write must lead with (`None`: no record yet). A record that does not
+    /// decode is an error, never "everything is old".
+    fn read_sightings(&self, now_secs: u64) -> Result<(Sightings, Option<String>)> {
+        match self.bucket.get(sightings::KEY, None)? {
+            Fetched::Absent => Ok((Sightings::default(), None)),
+            Fetched::New { bytes, tag } => Ok((
+                Sightings::decode(&capped("age record", bytes)?, now_secs)?,
+                Some(tag),
+            )),
+            Fetched::Unchanged => Err(Error::Wal(
+                "age record: an unconditional read answered Unchanged".into(),
+            )),
+        }
+    }
+
+    /// What this attempt sees in the bucket. On a Git carrier it is one listing
+    /// with each key's tag (no value is downloaded), aged by the first-sighting
+    /// record: the record is brought up to this listing and written back (when
+    /// it changed, and not for a dry run) BEFORE any decision uses it, so a run
+    /// at least the grace window after a key was first seen is the earliest that
+    /// can delete it. `None` means the record's compare-and-swap lost to another
+    /// compactor: replan.
+    fn list_for_sweep(
+        &self,
+        opts: &CompactOptions,
+        rep: &mut CompactReport,
+    ) -> Result<Option<Listing>> {
+        if !self.git_carrier {
+            // Ages here are the bucket's own modification times, so the clock
+            // only sets the cutoff: read before listing, the conservative side.
+            let now = opts.now.unwrap_or_else(SystemTime::now);
+            let metas = |prefix: &str| -> Result<Vec<(u64, ObjectMeta)>> {
+                Ok(self
+                    .bucket
+                    .list_meta(prefix)?
+                    .into_iter()
+                    .filter_map(|m| seq_of(&m.key).map(|s| (s, m)))
+                    .collect())
+            };
+            let mut by_hash: BTreeMap<String, Vec<ObjectMeta>> = BTreeMap::new();
+            for m in self.bucket.list_meta("packs/")? {
+                if let Some(h) = hash_of(&m.key) {
+                    by_hash.entry(h.to_string()).or_default().push(m);
+                }
+            }
+            return Ok(Some(Listing {
+                now,
+                ckpts: metas("checkpoints/")?,
+                logs: metas("log/")?,
+                by_hash,
+                tags: BTreeMap::new(),
+            }));
+        }
+        let listed = self.bucket.list_tags("")?;
+        // The clock is read only now, after the listing returned (and again on
+        // every replan): any key in `listed` was on the host before this instant,
+        // so its first-seen stamp cannot predate its own listing even if this
+        // process stalled before it. A stall after the listing only makes a stamp
+        // later, which holds an object back longer.
+        let now = opts.now.unwrap_or_else(SystemTime::now);
+        let now_secs = unix_secs(now)?;
+        let (before, record_tag) = self.read_sightings(now_secs)?;
+        let seen = before.observe(&listed, now_secs);
+        let added = seen.added_since(&before);
+        if seen != before {
+            if opts.dry_run {
+                if added > 0 {
+                    rep.notes.push(format!(
+                        "dry run: {added} object(s) not seen before would be recorded by a real \
+                         run; ages here are a lower bound"
+                    ));
+                }
+            } else if self
+                .bucket
+                .put_if_tag(sightings::KEY, &seen.encode()?, record_tag.as_deref())?
+                .is_none()
+            {
+                return Ok(None);
+            } else if added > 0 {
+                let note = format!(
+                    "Git carrier: first sighting of {added} object(s) recorded at \
+                     refs/sc/{}; an object is deleted only by a run at least the grace window \
+                     after that",
+                    sightings::KEY
+                );
+                if !rep.notes.contains(&note) {
+                    rep.notes.push(note);
+                }
+            }
+        }
+        let aged = |key: &str| {
+            SystemTime::UNIX_EPOCH + Duration::from_secs(seen.first_seen(key).unwrap_or(now_secs))
+        };
+        let (mut ckpts, mut logs) = (Vec::new(), Vec::new());
+        let mut by_hash: BTreeMap<String, Vec<ObjectMeta>> = BTreeMap::new();
+        let mut tags = BTreeMap::new();
+        for (key, oid) in listed {
+            let meta = |modified| ObjectMeta {
+                key: key.clone(),
+                size: 0,
+                modified,
+            };
+            if key.starts_with("checkpoints/") {
+                if let Some(s) = seq_of(&key) {
+                    ckpts.push((s, meta(aged(&key))));
+                }
+            } else if key.starts_with("log/") {
+                // Never aged: log entries go by sequence behind the cutoff.
+                if let Some(s) = seq_of(&key) {
+                    logs.push((s, meta(now)));
+                }
+            } else if let Some(h) = hash_of(&key) {
+                by_hash
+                    .entry(h.to_string())
+                    .or_default()
+                    .push(meta(aged(&key)));
+            } else {
+                continue;
+            }
+            tags.insert(key, oid);
+        }
+        Ok(Some(Listing {
+            now,
+            ckpts,
+            logs,
+            by_hash,
+            tags,
+        }))
     }
 
     /// Pack hashes named by structure the sweep keeps: checkpoints with
     /// `seq >= cutoff` and log entries with `seq > cutoff` (everything when
     /// `cutoff` is 0). Any record that fails to decode aborts: deleting packs
-    /// on a partial picture is never right.
+    /// on a partial picture is never right. On a Git carrier a record whose tag
+    /// differs from the one in this attempt's listing (`tags`) aborts too: a
+    /// carrier serves a create-only key it has already read from its cache, so
+    /// the bytes would be a value the listing no longer shows, and a writer that
+    /// deleted and re-created the entry could be hiding what it names. The packs
+    /// are kept, and a rerun in a new process reads the entry afresh.
     fn retained_packs(
         &self,
         ckpts: &[(u64, ObjectMeta)],
         logs: &[(u64, ObjectMeta)],
         cutoff: u64,
+        tags: &BTreeMap<String, String>,
     ) -> Result<BTreeSet<String>> {
+        let listed = |key: &str, got: &str| match tags.get(key) {
+            Some(want) if want != got => Err(Error::Wal(format!(
+                "{key} changed since the listing it was judged against"
+            ))),
+            _ => Ok(()),
+        };
         let mut named = BTreeSet::new();
         for (seq, m) in ckpts {
             if cutoff == 0 || *seq >= cutoff {
-                let Fetched::New { bytes, .. } = self.bucket.get(&m.key, None)? else {
+                let Fetched::New { bytes, tag } = self.bucket.get(&m.key, None)? else {
                     continue; // deleted since the listing: no longer retained
                 };
+                listed(&m.key, &tag)?;
                 named.extend(
                     Checkpoint::decode(&capped("checkpoint", bytes)?)
                         .map_err(|e| Error::Wal(format!("{}: {e}", m.key)))?
@@ -572,9 +900,10 @@ impl BucketTransport {
         }
         for (seq, m) in logs {
             if cutoff == 0 || *seq > cutoff {
-                let Fetched::New { bytes, .. } = self.bucket.get(&m.key, None)? else {
+                let Fetched::New { bytes, tag } = self.bucket.get(&m.key, None)? else {
                     continue;
                 };
+                listed(&m.key, &tag)?;
                 named.extend(
                     LogEntry::decode(&capped("log entry", bytes)?)
                         .map_err(|e| Error::Wal(format!("{}: {e}", m.key)))?

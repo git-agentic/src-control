@@ -915,16 +915,20 @@ enum RemoteOp {
     },
     /// List configured remotes.
     List,
-    /// Compact a bucket remote (`sc+wal://`, `sc+s3://`; not `sc+git::` yet): merge small packs,
+    /// Compact a bucket remote (`sc+wal://`, `sc+s3://`, `sc+git::`): merge small packs,
     /// then delete log entries, checkpoints and packs no reader or writer can
-    /// still need (ADR-0057). Needs bucket list and delete rights.
+    /// still need (ADR-0057). Needs bucket list and delete rights (on a Git
+    /// repository, push access). Run it from one host.
     Compact {
         name: String,
         /// Plan and report; write and delete nothing.
         #[arg(long)]
         dry_run: bool,
         /// Delete only what has been unreferenced for at least this long
-        /// (e.g. 24h, 7d). Keep it well above any push's duration.
+        /// (e.g. 24h, 7d). Keep it well above any push's duration. On an
+        /// `sc+git::` remote the age is counted from this command's first
+        /// sighting of an object, so the first run deletes nothing it did not
+        /// already see (with a zero grace, a first sighting is immediately old).
         #[arg(long, default_value = "24h")]
         prune_expire: String,
         /// Allow a --prune-expire under 1h. Only safe while nothing pushes to
@@ -4584,7 +4588,6 @@ fn run_remote(op: RemoteOp) -> Result<()> {
                 .find(|(n, _)| *n == name)
                 .map(|(_, u)| u)
                 .ok_or_else(|| anyhow::anyhow!("no such remote: {name}"))?;
-            scl_repo::refuse_git_compact(&url)?;
             if !scl_repo::is_bucket_url(&url) {
                 anyhow::bail!("remote '{name}' is not a bucket remote ({url}); nothing to compact");
             }

@@ -703,9 +703,11 @@ across every phase.
   sc-forge verified; real GitHub untested); a plain `git clone` never fetches
   `refs/sc/*`, and the same repository can also mirror public branches through a
   `--git` remote. A private-branch push needs the per-remote opt-in
-  `--allow-private-branches`; `sc remote compact` and `sc serve --store` refuse
-  `sc+git::` in v1; sc-forge accepts the `refs/sc/` prefix. No format, wire or
-  crypto change. Proven by `demo/run_git_carrier_demo.sh`. (ADR-0060.)
+  `--allow-private-branches`; `sc remote compact` works on `sc+git::` (a
+  first-sighting age record, leased deletes; ADR-0057 addendum) while
+  `sc serve --store` refuses it in v1; sc-forge accepts the `refs/sc/` prefix. No
+  format, wire or crypto change. Proven by `demo/run_git_carrier_demo.sh`.
+  (ADR-0060.)
 
 ## Active
 
@@ -1016,27 +1018,41 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
   issues a `has_object` round trip per object over S3; batching those probes
   into one `refresh()` plus local index lookups (instead of one S3 round
   trip per object) is deferred.
-- **`sc+git::` follow-ons (P39, ADR-0060).** Deferred rather than built: (1)
-  `sc remote compact` on an `sc+git::` remote, which needs an age source the
-  compactor controls (a Git repository gives only writer-controlled committer
-  time, so `list_meta` reports observation time and v1 refuses the command);
-  (2) `sc serve --store sc+git::...` (a daemon cannot answer ssh or credential
-  prompts, and it would sit between clients and the private-branch opt-in); (3)
-  rollback and rewind of `refs/sc/manifest` by anyone with push access, tracked
-  under P34 follow-on (6) and ADR-0059 follow-on (2), now reachable by more
-  people; (4) validation against real GitHub (per-ref and per-push limits,
-  rulesets, hosts that refuse unknown ref namespaces), untested so far; (5)
-  batched deletes (one `git push` for many `:refs/sc/K`) and a batched
-  `has_objects`, since a Git host costs a round trip per probe or delete; (6)
-  `list_meta` downloads every listed value to read its size; (7) scaling: every
-  `ls-remote` and push downloads the whole ref advertisement (the host does not
-  filter it by prefix server-side, a packet trace showed the full list) and a
-  cold read fetches every `log/` and `checkpoints/` entry, and with compaction
-  refused (1) refs grow by at least three per push, so a long-lived store slows
-  down until compaction or a ref-filtering host exists; (8) SHA-256 Git
-  repositories (v1 pins its cache to SHA-1 and handles SHA-1 ids only); (9) a
-  download budget for fetches into the temp cache (`git fetch` has no input-size
-  limit, so an oversized value is written before the read caps refuse it).
+- **`sc+git::` follow-ons (P39, ADR-0060).** Built: (1) `sc remote compact` on
+  an `sc+git::` remote (ADR-0057 addendum). A Git repository gives only
+  writer-controlled committer time, so the compactor keeps its own age source: a
+  first-sighting record at `refs/sc/compact/sightings`, generation-aware by oid,
+  with leased deletes and an uncached manifest check before every destructive
+  batch; (5a) batched deletes (`Bucket::delete_leased`, one `git push` per chunk
+  of refs); (6) compaction no longer calls `list_meta` on a carrier (pack sizes
+  come from the idx; `list_meta` itself still downloads every listed value); (7)
+  in part: compaction folds small packs and deletes what nothing names, which
+  bounds the ref growth of at least three per push and the log/checkpoint
+  entries a cold read fetches, but between runs every `ls-remote` and push still
+  downloads the whole ref advertisement (the host does not filter it by prefix
+  server-side, a packet trace showed the full list). Still deferred: (2)
+  `sc serve --store sc+git::...` (a daemon cannot answer ssh or credential
+  prompts, and it would sit between clients and the private-branch opt-in); (4)
+  validation against real GitHub (per-ref and per-push limits, rulesets, hosts
+  that refuse unknown ref namespaces), untested so far; (9) a download budget for
+  fetches into the temp cache (`git fetch` has no input-size limit, so an
+  oversized value is written before the read caps refuse it). Declined, with
+  reasons: (3) rollback and rewind of `refs/sc/manifest` by anyone with push
+  access is the cross-cutting signed-ref effort already tracked under P34
+  follow-on (6) and ADR-0059 follow-on (2), now reachable by more people; a
+  client-side "highest manifest seq seen" floor was reviewed and judged a false
+  control; (5b) a batched `has_objects`: the 2 s
+  freshness window already limits the per-object manifest probe to one network
+  call per 2 s; (8) SHA-256 Git repositories (v1 pins its cache to SHA-1): GitHub
+  does not support them and sc-forge is SHA-1, so the value is low and the cost
+  moderate (the cache's object format would have to be detected before the first
+  fetch); (S2, from review) the ssh user name that `remote list` prints is not a
+  credential, and `http(s)` userinfo is refused at validation. Known issue,
+  recorded and not fixed: a push to `refs/sc/K` fails with "dst refspec matches
+  more than one" when a decoy branch such as `refs/heads/refs/sc/K` exists on the
+  host (found while building `serve --store`). Whoever can push to the
+  repository can plant such a decoy, so it is a writer-only denial of service on
+  that key; reads compare exact full ref names and are not affected.
 - **Serve-side persistent pack cache (P36c follow-on).** A bucket-backed
   serve instance re-downloads packs per connection; a content-addressed
   on-disk cache in the serve home would make warm instances cheap without

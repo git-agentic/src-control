@@ -142,9 +142,10 @@ stores the same bucket inside any (SHA-1) Git repository as `refs/sc/*`, so priv
 branches, protected paths and secrets travel through a Git host that a plain
 `git clone` never sees into (ADR-0060). Pushing a private branch there needs
 `--allow-private-branches` (its name and recipient ids become readable by
-everyone who can read the repository); compaction and `serve --store` are not
-supported on it yet. Proven by `demo/run_git_carrier_demo.sh`; not tested
-against GitHub itself.
+everyone who can read the repository). `sc remote compact` works on it (run it
+from one host; the first run only records when it first saw each object);
+`serve --store` is not supported on it yet. Proven by
+`demo/run_git_carrier_demo.sh`; not tested against GitHub itself.
 
 ## How Phase 1 works
 

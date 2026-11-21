@@ -431,9 +431,9 @@ cargo run --bin sc -- remote add <name> sc+git::<git-url> [--allow-private-branc
                                               # `git ls-remote` lists them; the same repo can also
                                               # hold a `--git` mirror of public branches. Anyone
                                               # with push to the repo holds bucket put + delete;
-                                              # deleting a ref is not erasure. `remote compact`
-                                              # and `serve --store` refuse it in v1; clone
-                                              # --filter refused as for any bucket. Untested
+                                              # deleting a ref is not erasure. `serve --store`
+                                              # refuses it in v1; `remote compact` works (below);
+                                              # clone --filter refused as for any bucket. Untested
                                               # against real GitHub
 cargo run --bin sc -- remote compact <name> [--dry-run] [--prune-expire 24h] [--allow-short-grace]
                                               # bucket remotes only (#216, ADR-0057): merge small
@@ -451,7 +451,18 @@ cargo run --bin sc -- remote compact <name> [--dry-run] [--prune-expire 24h] [--
                                               # or fetches running). On a versioned S3
                                               # bucket deletes only add delete markers (add a
                                               # noncurrent-version lifecycle rule). Relieves the
-                                              # 65536-pack checkpoint cap (not the ref cap)
+                                              # 65536-pack checkpoint cap (not the ref cap).
+                                              # On `sc+git::` (ADR-0057 addendum) a Git host has no
+                                              # trustworthy object age, so the age is counted from
+                                              # the compactor's first sighting of each pack and
+                                              # checkpoint (refs/sc/compact/sightings): the first
+                                              # run deletes nothing it did not already see, a later
+                                              # one at least --prune-expire on may (with a zero
+                                              # grace a first sighting is immediately old). Run it
+                                              # from ONE host (clocks); a malformed record blocks
+                                              # the run (delete that ref to start over). Every
+                                              # pusher holds delete there; deleting a ref is not
+                                              # erasure
 cargo run --bin sc -- serve --http <addr> <home> --store sc+wal://<dir>|sc+s3://<bucket>/<prefix>
                                               # serve a bucket remote over sc+http(s):// (P36c):
                                               # all content lives in the bucket (instance is
@@ -463,7 +474,10 @@ bash demo/run_git_carrier_demo.sh             # sc+git:: proof (P39): a bare Git
                                               # `git clone` sees no refs/sc, keyless clone sees
                                               # `(private, no access)` and no plaintext, keyed
                                               # clone reads all, public main also mirrored as a
-                                              # normal Git branch; second leg against sc-forge;
+                                              # normal Git branch; `remote compact` twice a grace
+                                              # window apart shrinks refs/sc/* (the first run
+                                              # deletes nothing) and the clones after it still
+                                              # read; second leg against sc-forge;
                                               # no sc-git-bucket-* temp leftovers
 bash demo/run_http_remote_demo.sh             # sc-native HTTP transport proof (P26): real
                                               # loopback TCP (no shim, unlike ssh://), clone +

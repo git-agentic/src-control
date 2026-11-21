@@ -76,6 +76,29 @@ pub trait Bucket: Send {
     fn exists(&self, key: &str) -> Result<bool>;
     /// Remove `key`. Idempotent: an absent key is success.
     fn delete(&self, key: &str) -> Result<()>;
+    /// Keys starting with the raw string `prefix`, each with the tag
+    /// [`Bucket::get`] reports for its current value, sorted by key, from one
+    /// listing and no value downloads. A backend that cannot list tags cheaply
+    /// keeps this default error: compaction asks only a Git carrier for it,
+    /// where the tag is the ref's object id and the listing already holds it.
+    fn list_tags(&self, _prefix: &str) -> Result<Vec<(String, String)>> {
+        Err(Error::Backend(
+            "this backend cannot list keys with their tags".into(),
+        ))
+    }
+    /// Remove each `(key, expected_tag)` whose key still holds that tag. A key
+    /// that now holds another value (or is already gone) is left alone and is
+    /// not an error; a key that still holds its expected tag but could not be
+    /// removed is an error. Several keys go in one call so a backend can batch
+    /// them. A backend that cannot check a lease keeps this default, an error:
+    /// a lease is never silently dropped by deleting unconditionally. Only the
+    /// Git carrier overrides it, and compaction asks only a Git carrier for it
+    /// (the other backends are deleted from with [`Bucket::delete`]).
+    fn delete_leased(&self, _items: &[(String, String)]) -> Result<()> {
+        Err(Error::Backend(
+            "leased delete is not supported by this backend".into(),
+        ))
+    }
 }
 
 /// Reject traversal and absolute keys before any backend touches them.
@@ -169,6 +192,27 @@ pub fn contract_suite(b: &dyn Bucket) {
     assert!(b.put_new("packs/ab12.pack", b"again").unwrap());
 }
 
+/// Conformance checks for a backend that overrides [`Bucket::delete_leased`]
+/// (only the Git carrier does): it removes keys holding their expected tag, is
+/// idempotent, and touches only its keys. Whether a stale tag survives is
+/// checked in that backend's own tests. Panics on violation (test helper).
+pub fn leased_delete_suite(b: &dyn Bucket) {
+    assert!(b.put_new("lease/a", b"1").unwrap());
+    assert!(b.put_new("lease/b", b"2").unwrap());
+    assert!(b.put_new("lease/keep", b"3").unwrap());
+    let tag = |k: &str| match b.get(k, None).unwrap() {
+        Fetched::New { tag, .. } => tag,
+        _ => panic!("{k} should exist"),
+    };
+    let (ta, tb) = (tag("lease/a"), tag("lease/b"));
+    b.delete_leased(&[("lease/a".into(), ta.clone()), ("lease/b".into(), tb)])
+        .unwrap();
+    assert_eq!(b.list("lease/").unwrap(), vec!["lease/keep".to_string()]);
+    b.delete_leased(&[("lease/a".into(), ta)]).unwrap();
+    b.delete_leased(&[]).unwrap();
+    assert_eq!(b.list("lease/").unwrap(), vec!["lease/keep".to_string()]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +223,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let b = DirBucket::open(&root).unwrap();
         contract_suite(&b);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    /// A backend that cannot check a lease must refuse, not delete without one.
+    #[test]
+    fn a_backend_without_leases_refuses_a_leased_delete_and_deletes_nothing() {
+        let root = std::env::temp_dir().join(format!("scl-objio-nolease-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let b = DirBucket::open(&root).unwrap();
+        assert!(b.put_new("k", b"v").unwrap());
+        let Fetched::New { tag, .. } = b.get("k", None).unwrap() else {
+            panic!("k should exist")
+        };
+        let err = b.delete_leased(&[("k".into(), tag)]).unwrap_err();
+        assert!(
+            matches!(&err, Error::Backend(m) if m.contains("not supported")),
+            "{err}"
+        );
+        assert!(b.exists("k").unwrap(), "a refused lease must not delete");
+        assert!(b.list_tags("").is_err(), "no tagged listing either");
         std::fs::remove_dir_all(&root).unwrap();
         assert!(!root.exists());
     }

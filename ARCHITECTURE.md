@@ -1372,17 +1372,30 @@ length. Git is the system binary (`SC_GIT` overrides) with a scrubbed environmen
 transport allowlist (`https`, `http`, `ssh`, `file`; `ext`, `fd` and `git` forced off), a
 URL allowlist and no userinfo on `http(s)` URLs (credentials go through git's credential
 helper); a private bare repo in `sc-git-bucket-<pid>-<random>` caches fetched
-objects and is removed on `Drop`. v1 scaling limit: every `ls-remote` and push downloads the
+objects and is removed on `Drop`. Scaling: every `ls-remote` and push downloads the
 whole ref advertisement (the host does not filter it server-side), and a cold read fetches
-every `log/` and `checkpoints/` entry; with compaction refused, refs grow by at least three
-per push.
+every `log/` and `checkpoints/` entry behind the last checkpoint; refs grow by at least three
+per push until `sc remote compact` runs.
+
+`sc remote compact` works on a carrier (ADR-0057 addendum). A Git host reports no
+trustworthy object age (committer time is writer-controlled), so the compactor keeps its
+own: a first-sighting record at `refs/sc/compact/sightings`, one `<first_seen> <oid> <key>`
+line per `packs/` and `checkpoints/` key, aged on the compactor's clock and
+generation-aware by oid (a key deleted and uploaded again starts over). The record supplies
+ages only, decodes strictly (a bad record blocks the run) and is written before any delete
+decision uses it. Pack sizes for the merge plan come from each live idx (`offset + 4 +
+length`), never from `list_meta`, which would download every value. Deletes are leased
+(`Bucket::delete_leased`: one `git push` of `:refs/sc/K` with a
+`--force-with-lease=refs/sc/K:<oid>` per key, the oid the one listing showed), and the
+manifest is read uncached before every delete call. The first run after an object
+appears never deletes it; run compaction from one host.
 
 A private branch goes to an `sc+git::` remote only under the per-remote opt-in
 `--allow-private-branches` (`sc remote set <name> --allow-private-branches` for an existing
 remote), since its name, recipient ids and sizes become readable by
-every reader of the repository and the ciphertext cannot be taken back. `sc remote
-compact` (no trustworthy age for a stored pack) and `sc serve --store` (a daemon cannot
-answer prompts, and it would bypass the opt-in) refuse an `sc+git::` store in v1.
+every reader of the repository and the ciphertext cannot be taken back.
+`sc serve --store` (a daemon cannot answer prompts, and it would bypass the opt-in)
+refuses an `sc+git::` store in v1.
 sc-forge accepts exactly the `refs/sc/` prefix (ADR-0058 addendum). The dependency rule
 is amended: `objio` may spawn the system `git`, and only `gitio::bridge` and objio's
 git backend spawn it; `gix` stays in `gitio`. Proven by `crates/cli/tests/git_bucket.rs`,

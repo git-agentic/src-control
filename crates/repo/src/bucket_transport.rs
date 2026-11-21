@@ -42,6 +42,11 @@ struct WalView {
     /// is a pure copy: it never needs to re-walk the log or re-derive the
     /// pack list, just snapshot this field into the new checkpoint object.
     packs: Vec<String>,
+    /// pack hash -> the pack body length its idx declares ([`declared_pack_len`]),
+    /// parsed per idx (not from `index`, where the last pack wins an id). A
+    /// planning hint only: it lets compaction size packs on a Git carrier
+    /// without downloading them, and the idx is writer-controlled.
+    pack_sizes: BTreeMap<String, u64>,
 }
 
 /// A [`Transport`] whose object graph and refs live entirely in an
@@ -93,8 +98,9 @@ pub struct BucketTransport {
     /// Tag of the manifest the in-progress `refresh_once` is building from, so
     /// a failed attempt can say which manifest it failed on.
     attempt_tag: RefCell<Option<String>>,
-    /// Opened from an `sc+git::` URL: compaction is refused here, not only in
-    /// the CLI (a Git host gives it no trustworthy pack age, ADR-0060).
+    /// Opened from an `sc+git::` URL: a Git host reports no trustworthy object
+    /// age, so compaction keeps its own record of when it first saw each object
+    /// (`compact/sightings`) and deletes with leases (ADR-0057 addendum).
     git_carrier: bool,
 }
 
@@ -140,6 +146,24 @@ fn capped_to(what: &str, bytes: Vec<u8>, max: usize) -> Result<Vec<u8>> {
         )));
     }
     Ok(bytes)
+}
+
+/// Bytes of pack body an idx describes: the end of its furthest record, which
+/// starts at `offset` with a 4-byte length prefix (`scl_core::pack`), or the
+/// 8-byte header of an empty pack. The idx is writer-controlled, so this is a
+/// hint for planning, never a bound: arithmetic that overflows saturates, so a
+/// hostile idx can only make a pack look large (never a merge candidate).
+fn declared_pack_len(entries: &[IndexEntry]) -> u64 {
+    entries
+        .iter()
+        .map(|e| {
+            e.offset
+                .checked_add(4)
+                .and_then(|end| end.checked_add(e.length))
+                .unwrap_or(u64::MAX)
+        })
+        .max()
+        .unwrap_or(8)
 }
 
 /// Fold a checkpoint once the log tail exceeds this many entries past the
@@ -217,24 +241,6 @@ pub fn refuse_git_store(url: &str) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-/// `sc remote compact` on an `sc+git::` remote is refused (deferred): the
-/// compactor has no trustworthy age source for refs in a Git repository, so
-/// it could not tell a stale pack from one an in-flight push just uploaded.
-pub fn refuse_git_compact(url: &str) -> Result<()> {
-    if is_git_bucket_url(url) {
-        return Err(git_compact_refusal());
-    }
-    Ok(())
-}
-
-fn git_compact_refusal() -> Error {
-    Error::InvalidArgument(
-        "sc remote compact does not support sc+git:: remotes yet (deferred): a Git \
-         repository gives the compactor no trustworthy age for stored packs"
-            .into(),
-    )
 }
 
 /// A parsed `sc+wal://<dir>`, `sc+s3://<bucket>/<prefix…>` or
@@ -332,6 +338,12 @@ impl BucketTransport {
     /// Fails only if the initial `refresh` (a conditional GET of the
     /// manifest plus a walk of its parent chain) errors — an entirely empty
     /// bucket is a valid, successfully-opened remote with no refs yet.
+    ///
+    /// A Git carrier must be opened with [`BucketTransport::open`] and an
+    /// `sc+git::` URL, not through here: this constructor cannot tell the
+    /// bucket is one, so `compact` takes the plain-backend path (bucket
+    /// modification times and unleased deletes), which a Git host cannot make
+    /// safe. It stays public for tests and for callers with their own backend.
     pub fn from_bucket(bucket: Box<dyn Bucket>) -> Result<BucketTransport> {
         Self::build(bucket, false)
     }
@@ -493,12 +505,15 @@ impl BucketTransport {
                 // Index build: over the FULL cumulative pack list (checkpoint
                 // packs + tail packs), fetching each idx exactly as today.
                 let mut index = BTreeMap::new();
+                let mut pack_sizes = BTreeMap::new();
                 for hash in &packs {
                     let Fetched::New { bytes, .. } = self.bucket.get(&idx_key(hash), None)? else {
                         return Err(self.gone(format!("pack {hash} on chain but idx absent")));
                     };
                     let bytes = capped("pack idx", bytes)?;
-                    for IndexEntry { id, offset, length } in parse_index(&bytes)? {
+                    let entries = parse_index(&bytes)?;
+                    pack_sizes.insert(hash.clone(), declared_pack_len(&entries));
+                    for IndexEntry { id, offset, length } in entries {
                         index.insert(id, (hash.clone(), offset, length));
                     }
                 }
@@ -513,6 +528,7 @@ impl BucketTransport {
                     refs,
                     index,
                     packs,
+                    pack_sizes,
                 });
                 Ok(())
             }
@@ -2378,6 +2394,7 @@ mod tests {
             refs,
             index: BTreeMap::new(),
             packs: Vec::new(),
+            pack_sizes: BTreeMap::new(),
         });
 
         // The triggering push's own commit already landed (that's what put
