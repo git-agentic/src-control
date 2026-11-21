@@ -261,8 +261,10 @@ transport-adjacent. The rest, imperatively:
   refspecs stop git's abbreviation rules from letting a branch or tag stand in
   for the key). Every fetch runs under a watchdog (`fetch.unpackLimit=1`, the
   growth of `objects/pack` polled from 2 ms backing off to 50 ms): killed over the
-  budget (the key's value cap plus 0.1% and 1 MiB, 2 GiB for a family) or after
-  120 s with no progress, what it added removed. The bound is disk per fetch, not
+  budget (the key's value cap plus 0.1% and 1 MiB, 2 GiB for a family; a family
+  over its budget is discarded and read one fetch per key, remembered per
+  instance, so a big store can still compact) or after 120 s with no progress,
+  what it added removed. The bound is disk per fetch, not
   RAM inside `index-pack`, not the total cache, and not the refs a family fetch
   writes. Only serve mode on unix bounds disk against a hostile HTTP host: it runs
   git in its own process group and kills the group through the system `kill`,

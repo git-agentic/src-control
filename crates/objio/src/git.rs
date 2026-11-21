@@ -217,6 +217,9 @@ enum Pushed {
 struct Tuning {
     /// Replaces the computed download budget of every fetch (tests only).
     budget: Option<u64>,
+    /// Replaces the budget of a family or batched fetch only, so a test can make a
+    /// family "too big" while every single key stays within its own cap.
+    family_budget: Option<u64>,
     /// A fetch that neither grows `objects/pack` nor exits for this long is killed.
     idle: Duration,
     /// Fixed polling interval; `None` polls after 2 ms and backs off to 50 ms
@@ -232,6 +235,7 @@ impl Default for Tuning {
     fn default() -> Self {
         Tuning {
             budget: None,
+            family_budget: None,
             idle: IDLE,
             poll: None,
             #[cfg(unix)]
@@ -278,6 +282,9 @@ impl Readers {
 struct Watch {
     budget: u64,
     what: String,
+    /// Set when the fetch ended by passing `budget` (as opposed to any other
+    /// failure), so a caller can tell an oversized family from a broken one.
+    over: std::cell::Cell<bool>,
 }
 
 /// A bucket stored as `refs/sc/*` in a Git repository reachable at `url`.
@@ -290,6 +297,9 @@ pub struct GitBucket {
     /// Chunk size used for writes (tests shrink it).
     chunk: usize,
     state: Mutex<HashMap<String, Known>>,
+    /// Key families (by directory) whose one-fetch read passed the family
+    /// budget: this instance reads their keys one fetch each from then on.
+    oversized: Mutex<std::collections::HashSet<&'static str>>,
     tune: Tuning,
     /// Serve mode: the lock on `<cache>/.owner.lock`, held for the bucket's whole
     /// life. It is how [`GitBucket::reap_stale`] tells a live cache from one a
@@ -515,6 +525,7 @@ fn drain(r: &mut impl Read, cap: usize) -> (Vec<u8>, bool) {
 }
 
 fn over_budget(watch: &Watch) -> Error {
+    watch.over.set(true);
     Error::Backend(format!(
         "git fetch downloaded more than {} bytes ({}); it was stopped and its download \
          discarded (hostile or corrupt remote)",
@@ -677,6 +688,15 @@ impl GitBucket {
         Self::open_full(url, git, CHUNK, Some(parent), true)
     }
 
+    /// Test hook for other crates: lower the download budget of a whole-family
+    /// fetch to `bytes`, so a store counts as "over the family budget" without
+    /// planting gigabytes. Reads then degrade to one fetch per key, as for a
+    /// really oversized family. Not for production use.
+    #[doc(hidden)]
+    pub fn cap_family_fetches_at(&mut self, bytes: u64) {
+        self.tune.family_budget = Some(bytes);
+    }
+
     fn open_with(url: &str, git: String, chunk: usize) -> Result<GitBucket> {
         Self::open_full(url, git, chunk, None, false)
     }
@@ -712,6 +732,7 @@ impl GitBucket {
             cache,
             chunk: chunk.max(1),
             state: Mutex::new(HashMap::new()),
+            oversized: Mutex::new(std::collections::HashSet::new()),
             tune: Tuning::default(),
             owner,
             #[cfg(unix)]
@@ -1132,10 +1153,16 @@ impl GitBucket {
     /// The download budget is [`FAMILY_BUDGET`]; a fetch of exactly one key
     /// goes through [`Self::fetch_one`] and gets that key's own, tighter one.
     fn fetch(&self, refspecs: &[String], family: bool) -> Result<Out> {
-        let what = "the 2 GiB budget of a family or batched fetch; a legitimate store whose \
-                    log, checkpoint or idx entries together exceed it needs compaction"
-            .to_string();
-        self.fetch_watched(refspecs, family, FAMILY_BUDGET, what)
+        self.fetch_family(refspecs, family).0
+    }
+
+    /// [`Self::fetch`], plus whether the fetch ended by passing its budget. A
+    /// family over its budget is not an error to [`Self::get_family`]: it falls
+    /// back to one fetch per key.
+    fn fetch_family(&self, refspecs: &[String], family: bool) -> (Result<Out>, bool) {
+        let what = "the 2 GiB budget of a family or batched fetch".to_string();
+        let budget = self.tune.family_budget.unwrap_or(FAMILY_BUDGET);
+        self.fetch_flagged(refspecs, family, budget, what)
     }
 
     /// Fetch exactly `refs/sc/<key>` in one call, which both reads the ref and
@@ -1147,16 +1174,17 @@ impl GitBucket {
         let mut specs = vec![format!("+{full}:{full}")];
         specs.extend(exact_only(&full));
         let what = format!("the value cap of {key:?}");
-        self.fetch_watched(&specs, false, single_budget(key), what)
+        self.fetch_flagged(&specs, false, single_budget(key), what)
+            .0
     }
 
-    fn fetch_watched(
+    fn fetch_flagged(
         &self,
         refspecs: &[String],
         family: bool,
         budget: u64,
         what: String,
-    ) -> Result<Out> {
+    ) -> (Result<Out>, bool) {
         let mut a = vec![
             "fetch",
             "--no-tags",
@@ -1172,8 +1200,10 @@ impl GitBucket {
         let watch = Watch {
             budget: self.tune.budget.unwrap_or(budget),
             what,
+            over: std::cell::Cell::new(false),
         };
-        self.run_watched(&a, SMALL_CAP, &watch)
+        let out = self.run_watched(&a, SMALL_CAP, &watch);
+        (out, watch.over.get())
     }
 
     /// Push `oid` to `refs/sc/<key>` (or delete it when `oid` is `None`) under
@@ -1393,7 +1423,30 @@ impl GitBucket {
         fam: &Family,
     ) -> Result<Fetched> {
         let pat = fam.glob();
-        let out = self.fetch(&[format!("+{pat}:{pat}")], true)?;
+        let out = match self.fetch_family(&[format!("+{pat}:{pat}")], true) {
+            (Ok(out), _) => out,
+            // The family is over its download budget (the fetch is already killed
+            // and discarded). A store can legitimately be that big before it is
+            // compacted, and compaction itself has to read it, so degrade instead
+            // of failing: each key is its own fetch with its own value cap, and
+            // so are the rest of this family's keys for this instance.
+            (Err(_), true) => {
+                let first = self
+                    .oversized
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(fam.dir);
+                if first {
+                    eprintln!(
+                        "sc: the {} entries of this Git store exceed the family download \
+                         budget; reading them one by one (compacting the store shrinks them)",
+                        fam.dir
+                    );
+                }
+                return self.get_single(st, key, cached);
+            }
+            (Err(e), false) => return Err(e),
+        };
         if !out.success {
             // A shallow glob fetch that matches nothing fails too: an empty
             // family is absence, anything else is a real failure.
@@ -1442,6 +1495,56 @@ impl GitBucket {
                 self.answer(key, &oid, cached)
             }
         }
+    }
+
+    /// Read one key with a fetch of exactly that ref (see [`Self::fetch_one`]).
+    /// This is the path of every key outside a family and of the keys of a
+    /// family that passed its budget.
+    fn get_single(
+        &self,
+        st: &mut HashMap<String, Known>,
+        key: &str,
+        cached_tag: Option<&str>,
+    ) -> Result<Fetched> {
+        // One fetch both reads the ref and tells whether it changed: a v2 host
+        // filters its advertisement to this ref, where `ls-remote` followed by
+        // `fetch` cost two calls (and the whole advertisement on a v0 host).
+        let full = format!("{NS}{key}");
+        let out = self.fetch_one(key)?;
+        if !out.success {
+            // The fetch fails for an absent ref and for a real error alike;
+            // only the exact full refname decides (patterns tail-match).
+            return match self.remote_ref(key)? {
+                None => {
+                    st.remove(key);
+                    Ok(Fetched::Absent)
+                }
+                Some(_) => Err(self.fail("fetch", &out)),
+            };
+        }
+        // The ref must point directly at a commit: no peeling of tag objects.
+        let Some((_, oid, ty)) = self
+            .local_refs(&full)?
+            .into_iter()
+            .find(|(k, _, _)| k == key)
+        else {
+            return Err(corrupt("fetched ref is missing"));
+        };
+        if ty != "commit" {
+            return Err(corrupt("ref does not point at a commit"));
+        }
+        if cached_tag == Some(oid.as_str()) {
+            // Refresh only a cache entry for this very value; an entry for an
+            // older value would otherwise look fresh. A cold hit stays uncached.
+            match st.get_mut(key) {
+                Some(k) if k.oid == oid => k.at = Instant::now(),
+                _ => {
+                    st.remove(key);
+                }
+            }
+            return Ok(Fetched::Unchanged);
+        }
+        self.finish_read(st, key, &oid, cached_tag)
     }
 
     fn answer(&self, key: &str, oid: &str, cached: Option<&str>) -> Result<Fetched> {
@@ -1643,47 +1746,16 @@ impl Bucket for GitBucket {
             }
         }
         if let Some(fam) = family_of(key) {
-            return self.get_family(&mut st, key, cached_tag, fam);
-        }
-        // One fetch both reads the ref and tells whether it changed: a v2 host
-        // filters its advertisement to this ref, where `ls-remote` followed by
-        // `fetch` cost two calls (and the whole advertisement on a v0 host).
-        let full = format!("{NS}{key}");
-        let out = self.fetch_one(key)?;
-        if !out.success {
-            // The fetch fails for an absent ref and for a real error alike;
-            // only the exact full refname decides (patterns tail-match).
-            return match self.remote_ref(key)? {
-                None => {
-                    st.remove(key);
-                    Ok(Fetched::Absent)
-                }
-                Some(_) => Err(self.fail("fetch", &out)),
-            };
-        }
-        // The ref must point directly at a commit: no peeling of tag objects.
-        let Some((_, oid, ty)) = self
-            .local_refs(&full)?
-            .into_iter()
-            .find(|(k, _, _)| k == key)
-        else {
-            return Err(corrupt("fetched ref is missing"));
-        };
-        if ty != "commit" {
-            return Err(corrupt("ref does not point at a commit"));
-        }
-        if cached_tag == Some(oid.as_str()) {
-            // Refresh only a cache entry for this very value; an entry for an
-            // older value would otherwise look fresh. A cold hit stays uncached.
-            match st.get_mut(key) {
-                Some(k) if k.oid == oid => k.at = Instant::now(),
-                _ => {
-                    st.remove(key);
-                }
+            let too_big = self
+                .oversized
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(fam.dir);
+            if !too_big {
+                return self.get_family(&mut st, key, cached_tag, fam);
             }
-            return Ok(Fetched::Unchanged);
         }
-        self.finish_read(&mut st, key, &oid, cached_tag)
+        self.get_single(&mut st, key, cached_tag)
     }
 
     fn put_new(&self, key: &str, bytes: &[u8]) -> Result<bool> {
@@ -3613,20 +3685,72 @@ mod tests {
         wait_gone(helper);
     }
 
-    /// The family budget is a cliff for a legitimate store; the error says so.
+    /// A store whose `log/`, `checkpoints/` or `packs/*.idx` family passes the
+    /// family budget must stay readable, or it could never be compacted. The
+    /// family fetch is discarded, the requested key is read with a fetch of its
+    /// own (with its own value cap), and the instance remembers: the family's
+    /// other keys go straight to single fetches, with no new family attempt. Each
+    /// family is judged on its own.
+    #[cfg(unix)]
     #[test]
-    fn a_family_fetch_over_budget_names_the_cap_and_compaction() {
+    fn an_oversized_family_degrades_to_one_fetch_per_key() {
         need_git!();
-        let t = Tmp::new("family");
+        let t = Tmp::new("bigfamily");
+        let (_, url) = hub(&t);
+        let w = open(&url);
+        let keys = ["log/1", "log/2", "log/3", "packs/a.idx", "packs/b.idx"];
+        for k in keys {
+            assert!(w.put_new(k, k.as_bytes()).unwrap());
+        }
+        // `family` for a glob refspec, `single` for an exact one.
+        let calls = t.0.join("calls.log");
+        let body = format!(
+            "case \" $* \" in *\" fetch \"*) case \"$*\" in *'*'*) echo family >> {0};; *) echo single >> {0};; esac;; esac",
+            calls.display()
+        );
+        let sh = shim(&t, "fam.sh", &body);
+        let mut r = open_git(&url, &sh);
+        r.tune.family_budget = Some(1);
+        let count = |what: &str| {
+            std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| *l == what)
+                .count()
+        };
+        let read = |k: &str| match r.get(k, None).unwrap() {
+            Fetched::New { bytes, .. } => bytes,
+            _ => panic!("{k} must read"),
+        };
+        assert_eq!(read("log/1"), b"log/1");
+        assert_eq!((count("family"), count("single")), (1, 1));
+        assert_eq!(read("log/2"), b"log/2");
+        assert_eq!(read("log/3"), b"log/3");
+        assert_eq!(
+            (count("family"), count("single")),
+            (1, 3),
+            "later keys of an oversized family must not retry the family fetch"
+        );
+        // The idx family is judged on its own: one attempt, then single fetches.
+        assert_eq!(read("packs/a.idx"), b"packs/a.idx");
+        assert_eq!(read("packs/b.idx"), b"packs/b.idx");
+        assert_eq!((count("family"), count("single")), (2, 5));
+        // An absent key of an oversized family is absent, not an error.
+        assert!(matches!(r.get("log/9", None).unwrap(), Fetched::Absent));
+    }
+
+    /// Degrading to single fetches does not lift the per-key cap: a hostile value
+    /// in an oversized family is still refused at its own cap.
+    #[test]
+    fn a_hostile_value_in_an_oversized_family_still_fails_its_own_cap() {
+        need_git!();
+        let t = Tmp::new("bigfamily-hostile");
         let (hubdir, url) = hub(&t);
         plant_big(&hubdir, "log/1", 3 << 20, false);
         let mut b = open(&url);
-        b.tune.budget = Some(256 << 10);
+        b.tune.budget = Some(256 << 10); // every fetch, family or single
         let e = get_err(&b, "log/1");
-        assert!(
-            e.contains("2 GiB budget of a family") && e.contains("needs compaction"),
-            "{e}"
-        );
+        assert!(e.contains("value cap of \"log/1\""), "{e}");
     }
 
     #[test]

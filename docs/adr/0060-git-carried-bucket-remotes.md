@@ -202,9 +202,17 @@ under a watchdog:
   fetches are watched: `ls-remote` and push run unwatched. Over HTTP,
   `http.lowSpeedLimit`/`lowSpeedTime` bound them; over ssh the operator should set
   `ServerAliveInterval` (and `ServerAliveCountMax`) for the daemon's ssh user.
-  The 2 GiB family budget is a cliff for a legitimate store: one whose `log/`,
-  `checkpoints/` or idx entries together exceed it before compaction fails its
-  cold read with an error that says so.
+  The 2 GiB family budget is not a cliff for a legitimate store. A store whose
+  `log/`, `checkpoints/` or `packs/*.idx` entries together exceed it would
+  otherwise be unreadable, and so could never be compacted. When a family fetch
+  passes its budget it is killed and discarded as usual, and the requested key is
+  then read with a fetch of its own, under that key's own value cap. The instance
+  remembers that the family is too big (one note on stderr) and reads that
+  family's other keys by single fetches straight away, with no further 2 GiB
+  attempts; each family is judged on its own. The cost is one git round trip per
+  key of that family in a cold read, until compaction has shrunk it. Any other
+  failure of a family fetch is an error as before, and a hostile value in an
+  oversized family still fails its own cap.
 - A fetch that finished between two polls is caught by a check after it exits.
   After git exits the watchdog keeps measuring `objects/pack` for the one deadline
   both pipes share, because a helper that outlived git can still be writing, and

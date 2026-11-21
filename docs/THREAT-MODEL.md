@@ -782,9 +782,12 @@ The bucket model above applies unchanged, with the Git repository as the bucket 
     what the caches keep.
   - Refs a family fetch writes are not measured. A hostile host can advertise a great many refs;
     only the 120 s no-progress deadline bounds that.
-  - The 2 GiB family budget is a cliff for a legitimate store whose `log/`, `checkpoints/` or
-    idx entries together exceed it before compaction: its cold read fails, with an error that
-    says why.
+  - A family fetch (`log/`, `checkpoints/`, `packs/*.idx`) over the 2 GiB budget is killed and
+    discarded, then the reader falls back to one fetch per key, each under its own value cap
+    (256 MiB, or 2 GiB for a `.pack`), and remembers it for that instance, so a legitimate
+    store that has grown past the family budget stays readable and can compact itself. A
+    hostile host can force that slower path (one git round trip per key) by serving a big
+    family; it cannot lift any per-key cap by doing so.
   - Only serve mode on unix is disk-bounded against a hostile HTTP host, and only while git
     runs. There git runs in its own process group and the whole group is killed while git is
     unreaped (through the system `kill`; without one the watchdog warns once and kills git
