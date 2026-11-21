@@ -262,9 +262,10 @@ transport-adjacent. The rest, imperatively:
   not hold. It advances the manifest only through the normal CAS (one no-op
   entry plus a checkpoint) and never deletes what the current chain names. Keep `--prune-expire` well above any push's duration (default
   24h): a writer stalled longer than that between uploading a pack and its
-  commit can still lose the pack (the leases follow-on closes it). On an
-  `sc+git::` remote the manifest is read uncached before every delete batch
-  (every backend) and every pusher holds delete.
+  commit can still lose the pack (the leases follow-on closes it). On every
+  backend the manifest is read uncached before every delete batch (a busy remote
+  can defer cleanup to a rerun); on an `sc+git::` remote every pusher also holds
+  delete.
   `--dry-run` writes and deletes nothing but still downloads and decodes every
   candidate pack, so on S3 its download egress and read requests match a real run (the uploads,
   CAS and deletes it skips are the rest).

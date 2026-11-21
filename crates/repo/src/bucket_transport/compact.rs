@@ -527,9 +527,12 @@ impl BucketTransport {
                 }
             }
 
-            // Log entries and checkpoints behind the cutoff are safe whatever
-            // the manifest does meanwhile: the cutoff only ever grows, so they
-            // stay unreachable. Counters add up across replans.
+            // Log entries and checkpoints behind the cutoff would stay
+            // unreachable whatever the manifest does meanwhile (the cutoff only
+            // ever grows), but nothing is deleted on a picture the manifest has
+            // moved past, so they too wait for the uncached manifest check below
+            // (a busy remote can defer their cleanup to a rerun). Counters add up
+            // across replans.
             rep.cutoff = rep.cutoff.max(cutoff);
             // Git carrier: pack sizes for the report, from the idx (the listing
             // carries none); a pack with no readable idx counts as 0 bytes.
@@ -614,7 +617,9 @@ impl BucketTransport {
             return Ok(());
         }
         rep.notes.push(
-            "the manifest kept moving during the sweep: unreferenced packs were kept, rerun".into(),
+            "the manifest kept moving during the sweep: what it had not yet deleted (log entries, \
+             checkpoints, unreferenced packs) was kept, rerun"
+                .into(),
         );
         Ok(())
     }

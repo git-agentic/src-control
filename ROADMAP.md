@@ -1041,7 +1041,7 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
   access is the cross-cutting signed-ref effort already tracked under P34
   follow-on (6) and ADR-0059 follow-on (2), now reachable by more people; a
   client-side "highest manifest seq seen" floor was reviewed and judged a false
-  control (a fresh clone has no floor); (5b) a batched `has_objects`: the 2 s
+  control; (5b) a batched `has_objects`: the 2 s
   freshness window already limits the per-object manifest probe to one network
   call per 2 s; (8) SHA-256 Git repositories (v1 pins its cache to SHA-1): GitHub
   does not support them and sc-forge is SHA-1, so the value is low and the cost

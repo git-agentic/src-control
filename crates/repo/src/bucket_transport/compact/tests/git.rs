@@ -831,6 +831,10 @@ fn a_failure_between_the_record_and_each_delete_call_leaves_a_readable_store_a_r
     // idx files of the aged packs, then their bodies. Fail before each one.
     for fail_at in 0..3usize {
         let hub = template.copy(&format!("git-crash-{fail_at}"));
+        // A pack that appears only now, so the crashing run has something new
+        // to record: the record must already hold it when the crash comes.
+        let fresh = orphan(&hub, "crash-orphan");
+        let fresh_keys = [format!("packs/{fresh}.idx"), format!("packs/{fresh}.pack")];
         let calls = Arc::new(AtomicUsize::new(0));
         let hook: Hook = Box::new(move |op, _, after| {
             if op == "delete_leased" && !after && calls.fetch_add(1, Ordering::SeqCst) == fail_at {
@@ -844,26 +848,41 @@ fn a_failure_between_the_record_and_each_delete_call_leaves_a_readable_store_a_r
             .unwrap_err()
             .to_string();
         assert!(err.contains("injected crash"), "{err}");
+        // The record was written before the first delete was tried: it already
+        // holds the new pack, first seen at this run's time (and not before).
+        let rec = hub.record().unwrap();
+        for k in &fresh_keys {
+            assert_eq!(rec.first_seen(k), Some(secs(start + 2 * DAY)), "{k}");
+        }
         // What the crash left is a bucket a cold start reads.
         assert_readable(&hub, &refs);
         match fail_at {
             0 => {
                 assert_eq!(hub.count("refs/sc/log/"), 13);
-                assert_eq!(hub.count("refs/sc/packs/"), 2 * 13);
+                assert_eq!(hub.count("refs/sc/packs/"), 2 * 14);
             }
             1 => {
                 assert_eq!(hub.count("refs/sc/log/"), 0);
-                assert_eq!(hub.count("refs/sc/packs/"), 2 * 13);
+                assert_eq!(hub.count("refs/sc/packs/"), 2 * 14);
             }
             _ => {
                 // idx files gone, bodies left: plain debris, aged on its own next run
-                assert_eq!(hub.count(".idx"), 1);
-                assert_eq!(hub.count(".pack"), 13);
+                assert_eq!(hub.count(".idx"), 2);
+                assert_eq!(hub.count(".pack"), 14);
             }
         }
-        // A healthy rerun finishes the job.
+        // A healthy rerun finishes the job. The new pack is not old enough yet,
+        // so it survives that run, and everything else unreferenced is gone.
         hub.carrier().compact(&at(start + 2 * DAY)).unwrap();
-        tight(&hub);
+        for k in &fresh_keys {
+            assert!(
+                hub.bucket().exists(k).unwrap(),
+                "{k} was deleted before it aged"
+            );
+        }
+        assert_eq!(hub.refs().len(), 5 + fresh_keys.len(), "{:?}", hub.refs());
+        assert_eq!(hub.count("refs/sc/log/"), 0);
+        assert_eq!(hub.count("refs/sc/checkpoints/"), 1);
     }
 }
 

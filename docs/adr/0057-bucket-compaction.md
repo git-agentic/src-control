@@ -340,10 +340,13 @@ checkpoint deletes, and each batch of packs: idx files first, then bodies) the
 compactor reads the manifest with `get("manifest", None)` and compares the tag.
 A conditional read with the cached tag is not enough: the Git carrier answers
 one from its 2 s freshness window with no network call, and a stale view is the
-one thing the pack deletes cannot tolerate. This applies to every backend. If the
-manifest moved before the first batch the plan is stale and is redone; later,
-the rest is kept and the report says so. Order per batch: age record write (if
-changed), manifest check, deletes.
+one thing the pack deletes cannot tolerate. This applies to every backend, and
+to the log and checkpoint deletes too, which the cutoff alone would have made
+safe: nothing is deleted on a picture the manifest has moved past, so a remote
+that is pushed to continuously can defer cleanup to a rerun (the report says so).
+If the manifest moved before the first batch the plan is stale and is redone;
+later, the rest is kept. Order per batch: age record write (if changed),
+manifest check, deletes.
 
 **What remains.** The race named under "Residual limit" is narrowed, not closed.
 A pusher that finds an aged orphan pack already present (`put_new` returns
