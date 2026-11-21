@@ -1346,7 +1346,8 @@ fn a_malformed_service_keeps_the_fixed_error_order() {
 /// A parentless commit shaped like an `sc+git::` bucket value: fixed identity and date, a tree of
 /// regular blobs `c0000`, `c0001`, ..., and a `sc-bucket new <nonce>` message. Built in `store`
 /// with plain git (an isolated index), so the object exists locally for the push.
-fn bucket_value(c: &Client, store: &Path, nonce: &str, chunks: &[&str]) -> String {
+fn bucket_value(c: &Client, store: &Path, chunks: &[&str]) -> String {
+    let nonce = scl_crypto::random_hex(8);
     let idx = c.dir.join(format!("idx-{nonce}"));
     let idx = idx.to_str().unwrap();
     let env = [
@@ -1442,9 +1443,9 @@ fn seed_main(c: &Client, url: &str, auth: &str) {
 fn refs_sc_create_cas_update_fetch_and_delete_round_trip_through_the_real_receive_path() {
     let (_s, c, url, auth, store) = store_world("sc-rt");
     let m = "refs/sc/manifest";
-    let v1 = bucket_value(&c, &store, "n1", &["one\n", "uno\n"]);
-    let v2 = bucket_value(&c, &store, "n2", &["two\n"]);
-    let v3 = bucket_value(&c, &store, "n3", &["three\n"]);
+    let v1 = bucket_value(&c, &store, &["one\n", "uno\n"]);
+    let v2 = bucket_value(&c, &store, &["two\n"]);
+    let v3 = bucket_value(&c, &store, &["three\n"]);
     // create: an empty lease means "must not exist"
     let (ok, t) = cas_push(&c, &store, &auth, &url, m, "", &v1);
     assert!(ok, "create: {t}");
@@ -1462,7 +1463,7 @@ fn refs_sc_create_cas_update_fetch_and_delete_round_trip_through_the_real_receiv
     assert!(!ok, "stale lease must be refused: {t}");
     assert_eq!(remote_ref(&c, &store, &auth, &url, m), Some(v2.clone()));
     // a second key with a path-like name next to the first
-    let log = bucket_value(&c, &store, "n4", &["entry\n"]);
+    let log = bucket_value(&c, &store, &["entry\n"]);
     let k = "refs/sc/log/00000000000000000001";
     let (ok, t) = cas_push(&c, &store, &auth, &url, k, "", &log);
     assert!(ok, "{t}");
@@ -1550,9 +1551,9 @@ fn refs_sc_cas_is_enforced_by_the_server_under_the_ref_lock() {
     let (s, c, url, auth, store) = store_world("sc-srv");
     let m = "refs/sc/manifest";
     let z = "0".repeat(40);
-    let v1 = bucket_value(&c, &store, "n1", &["one\n"]);
-    let v2 = bucket_value(&c, &store, "n2", &["two\n"]);
-    let v3 = bucket_value(&c, &store, "n3", &["three\n"]);
+    let v1 = bucket_value(&c, &store, &["one\n"]);
+    let v2 = bucket_value(&c, &store, &["two\n"]);
+    let v3 = bucket_value(&c, &store, &["three\n"]);
     for (expect, oid) in [("", &v1), (v1.as_str(), &v2)] {
         let (ok, t) = cas_push(&c, &store, &auth, &url, m, expect, oid);
         assert!(ok, "{t}");
@@ -1580,12 +1581,12 @@ fn refs_sc_cas_is_enforced_by_the_server_under_the_ref_lock() {
 fn racing_refs_sc_cas_pushes_have_exactly_one_winner() {
     let (_s, c, url, auth, store) = store_world("sc-race");
     let m = "refs/sc/manifest";
-    let mut cur = bucket_value(&c, &store, "r0", &["zero\n"]);
+    let mut cur = bucket_value(&c, &store, &["zero\n"]);
     let (ok, t) = cas_push(&c, &store, &auth, &url, m, "", &cur);
     assert!(ok, "{t}");
     for round in 0..6 {
-        let a = bucket_value(&c, &store, &format!("r{round}a"), &["a\n"]);
-        let b = bucket_value(&c, &store, &format!("r{round}b"), &["b\n"]);
+        let a = bucket_value(&c, &store, &["a\n"]);
+        let b = bucket_value(&c, &store, &["b\n"]);
         let (ra, rb) = std::thread::scope(|sc| {
             let ta = sc.spawn(|| cas_push(&c, &store, &auth, &url, m, &cur, &a));
             let tb = sc.spawn(|| cas_push(&c, &store, &auth, &url, m, &cur, &b));
@@ -1630,9 +1631,9 @@ fn maintenance_keeps_the_live_refs_sc_values() {
     );
     let m = "refs/sc/manifest";
     let k = "refs/sc/packs/00ff.pack";
-    let old = bucket_value(&c, &store, "m1", &["old\n"]);
-    let live = bucket_value(&c, &store, "m2", &["live\n", "live2\n"]);
-    let pack = bucket_value(&c, &store, "m3", &["packbytes\n"]);
+    let old = bucket_value(&c, &store, &["old\n"]);
+    let live = bucket_value(&c, &store, &["live\n", "live2\n"]);
+    let pack = bucket_value(&c, &store, &["packbytes\n"]);
     for (r, expect, oid) in [(m, "", &old), (m, old.as_str(), &live), (k, "", &pack)] {
         let (ok, t) = cas_push(&c, &store, &auth, &url, r, expect, oid);
         assert!(ok, "{t}");
