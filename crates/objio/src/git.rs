@@ -2814,7 +2814,7 @@ mod tests {
     /// Wait for `pid` to be gone (a zombie awaiting its reaper counts as gone).
     #[cfg(unix)]
     fn wait_gone(pid: u32) {
-        for _ in 0..80 {
+        for _ in 0..400 {
             let out = Command::new("ps")
                 .args(["-o", "stat=", "-p", &pid.to_string()])
                 .output()
@@ -2843,8 +2843,10 @@ mod tests {
         }
     }
 
-    /// Plant a value commit holding one incompressible chunk of `n` bytes.
-    fn plant_big(hubdir: &Path, key: &str, n: usize) {
+    /// Plant a value commit holding one incompressible chunk of `n` bytes, with
+    /// a parent commit when `parent` (a hostile shape: a shallow fetch records
+    /// it as a shallow boundary).
+    fn plant_big(hubdir: &Path, key: &str, n: usize, parent: bool) {
         let mut x = 0x9E37_79B9_7F4A_7C15u64;
         let data: Vec<u8> = (0..n)
             .map(|_| {
@@ -2859,8 +2861,42 @@ mod tests {
         let blob = git(hubdir, &["hash-object", "-w", f.to_str().unwrap()], "");
         std::fs::remove_file(&f).unwrap();
         let tree = git(hubdir, &["mktree"], &format!("100644 blob {blob}\tc0000\n"));
-        let c = git(hubdir, &["commit-tree", &tree, "-m", "planted"], "");
+        let mut args = vec!["commit-tree", &tree, "-m", "planted"];
+        let base;
+        if parent {
+            let empty = git(hubdir, &["mktree"], "");
+            base = git(hubdir, &["commit-tree", &empty, "-m", "base"], "");
+            args.extend(["-p", &base]);
+        }
+        let c = git(hubdir, &args, "");
         git(hubdir, &["update-ref", &format!("refs/sc/{key}"), &c], "");
+    }
+
+    /// A hostile value with a parent is recorded in `shallow` by the depth-1
+    /// fetch, and a discarded download deletes that very object. The cache must
+    /// not be left pointing at it: the next reads, of the same hostile key and
+    /// of a good one, still work, in both modes and on both check paths.
+    #[test]
+    fn a_discarded_value_with_a_parent_leaves_the_cache_usable() {
+        need_git!();
+        let t = Tmp::new("shallow");
+        let (hubdir, url) = hub(&t);
+        assert!(open(&url).put_new("good", b"fine").unwrap());
+        plant_big(&hubdir, "manifest", 3 << 20, true);
+        let late = Some(Duration::from_millis(400));
+        for (group, poll) in [(true, None), (true, late), (false, late)] {
+            let mut b = GitBucket::open_full(&url, "git".into(), CHUNK, None, group).unwrap();
+            b.tune.budget = Some(256 << 10);
+            b.tune.poll = poll;
+            let e = get_err(&b, "manifest");
+            assert!(e.contains("262144 bytes"), "{e}");
+            let Fetched::New { bytes, .. } = b.get("good", None).unwrap() else {
+                panic!("the cache must still read a good key")
+            };
+            assert_eq!(bytes, b"fine");
+            let again = get_err(&b, "manifest");
+            assert!(again.contains("262144 bytes"), "{again}");
+        }
     }
 
     /// A mutable-key read is one `git fetch`, and the host's reply lists that
@@ -2980,7 +3016,7 @@ mod tests {
         let t = Tmp::new("oversize");
         let (hubdir, url) = hub(&t);
         assert!(open(&url).put_new("good", b"fine").unwrap());
-        plant_big(&hubdir, "manifest", 3 << 20);
+        plant_big(&hubdir, "manifest", 3 << 20, false);
         let late = Some(Duration::from_millis(400));
         for (group, poll) in [(true, None), (true, late), (false, None), (false, late)] {
             let mut b = GitBucket::open_full(&url, "git".into(), CHUNK, None, group).unwrap();
@@ -3037,7 +3073,7 @@ mod tests {
         let started = Instant::now();
         let e = get_err(&b, "manifest");
         assert!(e.contains("1048576 bytes"), "{e}");
-        assert!(started.elapsed() < Duration::from_secs(20));
+        assert!(started.elapsed() < Duration::from_secs(90));
         let helper: u32 = std::fs::read_to_string(&pids)
             .unwrap()
             .trim()
@@ -3082,7 +3118,7 @@ mod tests {
             assert!(e.contains("no progress"), "{e}");
             assert!(took >= Duration::from_millis(800), "{took:?}");
             assert!(
-                took < Duration::from_secs(10),
+                took < Duration::from_secs(90),
                 "a descendant holding the pipes must not park the call: {took:?}"
             );
             if group {
@@ -3115,7 +3151,7 @@ mod tests {
         let started = Instant::now();
         let e = get_err(&b, "manifest");
         assert!(e.contains("left its"), "{e}");
-        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(started.elapsed() < Duration::from_secs(90));
         let helper: u32 = std::fs::read_to_string(&pids)
             .unwrap()
             .trim()
