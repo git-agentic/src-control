@@ -50,6 +50,11 @@ const SMALL_CAP: usize = 1 << 20;
 const NS: &str = "refs/sc/";
 /// Refspecs per `fetch` call in `list_meta` (keeps the command line short).
 const FETCH_BATCH: usize = 256;
+/// Most refs one leased delete push carries, and the most command-line bytes it
+/// may use (a lease plus a refspec per key; Windows caps a command line near
+/// 32 KiB, so the budget stays well under it).
+const DELETE_BATCH: usize = 128;
+const DELETE_ARG_BUDGET: usize = 24 << 10;
 
 /// `-c` overrides on every git call: transport allowlist, no hooks, no signing,
 /// no background maintenance, bounded stalls.
@@ -1167,6 +1172,84 @@ impl Bucket for GitBucket {
             },
         }
     }
+
+    fn list_tags(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        check_prefix(prefix)?;
+        self.remote_list(prefix)
+    }
+
+    /// One `git push --porcelain` per chunk, a `--force-with-lease=refs/sc/K:<oid>`
+    /// and a `:refs/sc/K` refspec per key (never `+`, never `--atomic`): the
+    /// host checks each lease under that ref's lock, so a key someone re-created
+    /// since the caller's listing survives. A refused push is settled by
+    /// re-reading every ref of the chunk: gone or at another value is fine, still
+    /// at its lease means the host refused it (hook, permissions) and is an error.
+    fn delete_leased(&self, items: &[(String, String)]) -> Result<()> {
+        for (key, tag) in items {
+            check_key(key)?;
+            if !is_tag(tag) {
+                return Err(Error::Backend(format!(
+                    "lease for {key:?} is not a full object id"
+                )));
+            }
+        }
+        let mut rest = items;
+        while !rest.is_empty() {
+            let mut n = 0;
+            let mut bytes = 0;
+            while let Some((key, _)) = rest.get(n) {
+                let cost = 2 * (NS.len() + key.len()) + 64;
+                if n > 0 && (n >= DELETE_BATCH || bytes + cost > DELETE_ARG_BUDGET) {
+                    break;
+                }
+                bytes += cost;
+                n += 1;
+            }
+            let (chunk, tail) = rest.split_at(n);
+            rest = tail;
+            {
+                let mut st = self.lock();
+                for (key, _) in chunk {
+                    st.remove(key);
+                }
+            }
+            let leases: Vec<String> = chunk
+                .iter()
+                .map(|(k, t)| format!("--force-with-lease={NS}{k}:{t}"))
+                .collect();
+            let specs: Vec<String> = chunk.iter().map(|(k, _)| format!(":{NS}{k}")).collect();
+            let mut a = vec!["push", "--porcelain", "--no-verify"];
+            a.extend(leases.iter().map(String::as_str));
+            a.extend(["--end-of-options", &self.url]);
+            a.extend(specs.iter().map(String::as_str));
+            let out = self.run(&a, None, &[], SMALL_CAP)?;
+            if out.success {
+                continue;
+            }
+            let first = out
+                .stdout
+                .split(|b| *b == b'\n')
+                .find(|l| l.first() == Some(&b'!'))
+                .map(|l| self.scrub(&String::from_utf8_lossy(l)))
+                .unwrap_or_default();
+            let refusal = format!(
+                "git push failed (exit {}): {} {}",
+                out.code.map_or("signal".to_string(), |c| c.to_string()),
+                out.stderr,
+                first
+            );
+            // Cannot re-read (network): report the push failure itself.
+            let now: HashMap<String, String> = self
+                .remote_list("")
+                .map_err(|_| Error::Backend(refusal.clone()))?
+                .into_iter()
+                .collect();
+            if chunk.iter().any(|(k, t)| now.get(k) == Some(t)) {
+                return Err(Error::Backend(refusal));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1275,7 +1358,6 @@ mod tests {
         GitBucket::open_with(url, git.to_string(), CHUNK).unwrap()
     }
 
-    #[cfg(unix)]
     fn tag_of(b: &GitBucket, key: &str) -> String {
         let Fetched::New { tag, .. } = b.get(key, None).unwrap() else {
             panic!("expected New")
@@ -2105,5 +2187,188 @@ mod tests {
         assert_eq!(measured[0].2, measured[1].2);
         assert!(measured[1].1 <= 6, "{measured:?}");
         assert!(measured[1].2 <= 4, "{measured:?}");
+    }
+
+    /// Keys of a listing, in order.
+    fn names(v: &[(String, String)]) -> Vec<&str> {
+        v.iter().map(|(k, _)| k.as_str()).collect()
+    }
+
+    #[test]
+    fn list_tags_reports_the_tag_get_reports_without_downloading() {
+        need_git!();
+        let t = Tmp::new("tags-list");
+        let (_, url) = hub(&t);
+        let b = open(&url);
+        for k in ["log/1", "logger/x", "manifest", "packs/a.pack"] {
+            b.put_new(k, k.as_bytes()).unwrap();
+        }
+        let r = open(&url); // fresh cache: nothing is downloaded to list
+        let tags = r.list_tags("log").unwrap();
+        assert_eq!(names(&tags), ["log/1", "logger/x"]);
+        for (k, tag) in &r.list_tags("").unwrap() {
+            assert_eq!(*tag, tag_of(&b, k), "{k}");
+        }
+        assert!(r.lock().is_empty(), "a listing must not fetch values");
+        assert!(matches!(r.list_tags("a b"), Err(Error::BadKey(_))));
+        // a CAS moves the tag the listing reports
+        let old = tag_of(&b, "manifest");
+        let new = b
+            .put_if_tag("manifest", b"v2", Some(&old))
+            .unwrap()
+            .unwrap();
+        let tags = r.list_tags("manifest").unwrap();
+        assert_eq!(tags, vec![("manifest".to_string(), new)]);
+    }
+
+    #[test]
+    fn delete_leased_removes_only_keys_still_at_their_lease() {
+        need_git!();
+        let t = Tmp::new("leased");
+        let (hubdir, url) = hub(&t);
+        let b = open(&url);
+        for k in ["keep", "log/1", "log/2", "log/3"] {
+            assert!(b.put_new(k, k.as_bytes()).unwrap());
+        }
+        let listed = b.list_tags("").unwrap();
+        // After the listing someone else replaces log/2 and re-creates log/3.
+        let other = open(&url);
+        let lease = |k: &str| listed.iter().find(|(n, _)| n == k).unwrap().1.clone();
+        let new2 = other
+            .put_if_tag("log/2", b"theirs", Some(&lease("log/2")))
+            .unwrap()
+            .unwrap();
+        other.delete("log/3").unwrap();
+        assert!(other.put_new("log/3", b"recreated").unwrap());
+        let new3 = tag_of(&other, "log/3");
+        // A key that was never there, with a plausible lease, is not an error.
+        let mut items: Vec<(String, String)> = listed
+            .iter()
+            .filter(|(k, _)| k.starts_with("log/"))
+            .cloned()
+            .collect();
+        items.push(("log/9".into(), "1".repeat(40)));
+        b.delete_leased(&items).unwrap();
+
+        let now = open(&url).list_tags("").unwrap();
+        assert_eq!(
+            now,
+            vec![
+                ("keep".to_string(), lease("keep")),
+                ("log/2".to_string(), new2),
+                ("log/3".to_string(), new3),
+            ]
+        );
+        let Fetched::New { bytes, .. } = open(&url).get("log/3", None).unwrap() else {
+            panic!()
+        };
+        assert_eq!(bytes, b"recreated");
+        assert!(!git(&hubdir, &["for-each-ref", "refs/sc/log/1"], "").contains("log/1"));
+        // Replaying the same call is idempotent.
+        b.delete_leased(&items).unwrap();
+        assert_eq!(b.list("").unwrap(), vec!["keep", "log/2", "log/3"]);
+        b.delete_leased(&[]).unwrap();
+    }
+
+    #[test]
+    fn delete_leased_refuses_a_bad_key_or_lease_before_any_push() {
+        need_git!();
+        let t = Tmp::new("leased-bad");
+        let (_, url) = hub(&t);
+        let b = open(&url);
+        b.put_new("log/1", b"x").unwrap();
+        let good = tag_of(&b, "log/1");
+        for lease in ["", "zz", "A".repeat(40).as_str(), "0".repeat(41).as_str()] {
+            let r = b.delete_leased(&[("log/1".into(), lease.into())]);
+            assert!(matches!(r, Err(Error::Backend(_))), "{lease:?}");
+        }
+        for key in ["a..b", "a b", "", "x.lock", "/a", "log/*"] {
+            let r = b.delete_leased(&[(key.into(), good.clone())]);
+            assert!(matches!(r, Err(Error::BadKey(_))), "{key:?}");
+        }
+        // One bad item anywhere refuses the whole call: nothing was deleted.
+        let r = b.delete_leased(&[("log/1".into(), good.clone()), ("a..b".into(), good)]);
+        assert!(r.is_err());
+        assert_eq!(b.list("").unwrap(), vec!["log/1"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_leased_reports_a_ref_the_host_refuses_and_still_removes_the_rest() {
+        use std::os::unix::fs::PermissionsExt;
+        need_git!();
+        let t = Tmp::new("leased-hook");
+        let (hubdir, url) = hub(&t);
+        let b = open(&url);
+        for k in ["log/1", "log/2", "log/3"] {
+            b.put_new(k, k.as_bytes()).unwrap();
+        }
+        let items = b.list_tags("log/").unwrap();
+        // An `update` hook judges each ref on its own: it refuses log/2 only.
+        let hook = hubdir.join("hooks/update");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\ncase \"$1\" in refs/sc/log/2) echo 'keep log two' >&2; exit 1;; esac\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let e = b.delete_leased(&items).unwrap_err().to_string();
+        assert!(e.contains("keep log two"), "{e}");
+        // Not mistaken for a lost race: log/2 is still at its lease, the others went.
+        assert_eq!(names(&open(&url).list_tags("").unwrap()), ["log/2"]);
+        // Once the host allows it, the same call finishes the job.
+        std::fs::remove_file(&hook).unwrap();
+        b.delete_leased(&items).unwrap();
+        assert!(b.list("").unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_leased_batches_with_one_lease_per_ref_and_never_plus_or_atomic() {
+        need_git!();
+        let t = Tmp::new("leased-batch");
+        let (hubdir, url) = hub(&t);
+        plant(&hubdir, "seed", false, &[("100644", "blob", "c0000")]);
+        let c = git(&hubdir, &["rev-parse", "refs/sc/seed"], "");
+        const N: usize = 300;
+        let cmds: String = (0..N)
+            .map(|i| format!("create refs/sc/log/{i:04} {c}\n"))
+            .collect();
+        git(&hubdir, &["update-ref", "--stdin"], &cmds);
+        let log = t.0.join("pushes.log");
+        let sh = shim(
+            &t,
+            "pushes.sh",
+            &format!(
+                "for x in \"$@\"; do if [ \"$x\" = push ]; then echo \"$*\" >> {}; break; fi; done",
+                log.display()
+            ),
+        );
+        let b = open_git(&url, &sh);
+        let items: Vec<(String, String)> = b
+            .list_tags("log/")
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| (k, c.clone()))
+            .collect();
+        assert_eq!(items.len(), N);
+        b.delete_leased(&items).unwrap();
+        assert!(b.list("log/").unwrap().is_empty());
+        let text = std::fs::read_to_string(&log).unwrap();
+        let pushes: Vec<&str> = text.lines().collect();
+        assert!(pushes.len() >= N.div_ceil(DELETE_BATCH), "{}", pushes.len());
+        let mut leases = 0;
+        for p in &pushes {
+            assert!(p.len() < 32 * 1024, "command line of {} bytes", p.len());
+            assert!(!p.contains("--atomic"), "{p}");
+            for tok in p.split(' ') {
+                assert!(!tok.starts_with('+'), "plus refspec: {tok}");
+                if let Some(l) = tok.strip_prefix("--force-with-lease=refs/sc/log/") {
+                    assert!(l.ends_with(&format!(":{c}")), "{tok}");
+                    leases += 1;
+                }
+            }
+        }
+        assert_eq!(leases, N, "one lease per ref");
     }
 }

@@ -76,6 +76,29 @@ pub trait Bucket: Send {
     fn exists(&self, key: &str) -> Result<bool>;
     /// Remove `key`. Idempotent: an absent key is success.
     fn delete(&self, key: &str) -> Result<()>;
+    /// Keys starting with the raw string `prefix`, each with the tag
+    /// [`Bucket::get`] reports for its current value, sorted by key, from one
+    /// listing and no value downloads. A backend that cannot list tags cheaply
+    /// keeps this default error: compaction asks only a Git carrier for it,
+    /// where the tag is the ref's object id and the listing already holds it.
+    fn list_tags(&self, _prefix: &str) -> Result<Vec<(String, String)>> {
+        Err(Error::Backend(
+            "this backend cannot list keys with their tags".into(),
+        ))
+    }
+    /// Remove each `(key, expected_tag)` whose key still holds that tag. A key
+    /// that now holds another value (or is already gone) is left alone and is
+    /// not an error; a key that still holds its expected tag but could not be
+    /// removed is an error. Several keys go in one call so a backend can batch
+    /// them. This default has no lease to check, so it deletes each key
+    /// unconditionally (what the backends without conditional deletes do); a
+    /// backend that can lease must override it (the Git carrier does).
+    fn delete_leased(&self, items: &[(String, String)]) -> Result<()> {
+        for (key, _) in items {
+            self.delete(key)?;
+        }
+        Ok(())
+    }
 }
 
 /// Reject traversal and absolute keys before any backend touches them.
@@ -167,6 +190,24 @@ pub fn contract_suite(b: &dyn Bucket) {
     assert_eq!(b.list_meta("packs/").unwrap().len(), 2);
     // a deleted key can be created again
     assert!(b.put_new("packs/ab12.pack", b"again").unwrap());
+    // delete_leased: removes keys holding their expected tag, is idempotent,
+    // touches only its keys. Whether a stale tag survives is up to the backend
+    // (the default cannot lease), so that is checked in each lease-capable
+    // backend's own tests.
+    assert!(b.put_new("lease/a", b"1").unwrap());
+    assert!(b.put_new("lease/b", b"2").unwrap());
+    assert!(b.put_new("lease/keep", b"3").unwrap());
+    let tag = |k: &str| match b.get(k, None).unwrap() {
+        Fetched::New { tag, .. } => tag,
+        _ => panic!("{k} should exist"),
+    };
+    let (ta, tb) = (tag("lease/a"), tag("lease/b"));
+    b.delete_leased(&[("lease/a".into(), ta.clone()), ("lease/b".into(), tb)])
+        .unwrap();
+    assert_eq!(b.list("lease/").unwrap(), vec!["lease/keep".to_string()]);
+    b.delete_leased(&[("lease/a".into(), ta)]).unwrap();
+    b.delete_leased(&[]).unwrap();
+    assert_eq!(b.list("lease/").unwrap(), vec!["lease/keep".to_string()]);
 }
 
 #[cfg(test)]
