@@ -162,15 +162,28 @@ fn serve_allow_private_branches_needs_a_git_store() {
 /// Spawn `sc serve --http 127.0.0.1:0 --store <store> <home> <extra…>`; returns
 /// the child and its announced `host:port` (as `http_remote.rs` does).
 fn spawn_serve(home: &Path, store: &str, extra: &[&str]) -> (std::process::Child, String) {
+    spawn_serve_in(None, home.as_os_str(), store, extra)
+}
+
+/// [`spawn_serve`] with the serve home given as supplied (`.` is a relative
+/// home) and an optional working directory for the server.
+fn spawn_serve_in(
+    cwd: Option<&Path>,
+    home: &std::ffi::OsStr,
+    store: &str,
+    extra: &[&str],
+) -> (std::process::Child, String) {
     use std::io::BufRead;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_sc"))
-        .args(["serve", "--http", "127.0.0.1:0", "--store", store])
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sc"));
+    cmd.args(["serve", "--http", "127.0.0.1:0", "--store", store])
         .args(extra)
         .arg(home)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn sc serve");
+        .stderr(std::process::Stdio::piped());
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    let mut child = cmd.spawn().expect("spawn sc serve");
     let mut line = String::new();
     std::io::BufReader::new(child.stdout.take().unwrap())
         .read_line(&mut line)
@@ -276,6 +289,43 @@ fn serve_store_sc_git_gates_private_branches_until_the_operator_opts_in() {
     for d in [&root, &keys] {
         std::fs::remove_dir_all(d).unwrap();
     }
+}
+
+/// The serve home is used as supplied, so `.` (with the server's working
+/// directory set to it) must work: git runs with the cache as its working
+/// directory, and a relative cache path used to be resolved from inside it.
+#[test]
+fn serve_store_sc_git_works_with_a_relative_serve_home() {
+    let root = tmp("serve-rel");
+    let hub = root.join("hub.git");
+    assert!(Command::new("git")
+        .args(["init", "--bare", "-q", hub.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    let store = format!("sc+git::file://{}", hub.display());
+    let home = root.join("home");
+    init_repo(&home);
+    let a = root.join("a");
+    init_repo(&a);
+    std::fs::write(a.join("README.md"), "public\n").unwrap();
+    ok(sc(&a, &["commit", "-m", "base"]));
+
+    let (mut srv, addr) = spawn_serve_in(Some(&home), std::ffi::OsStr::new("."), &store, &[]);
+    let url = format!("sc+http://{addr}/x");
+    ok(sc(&a, &["remote", "add", "origin", &url]));
+    ok(sc(&a, &["push", "origin"]));
+    assert!(refs_on_carrier(&hub).contains("refs/sc/manifest"));
+    let clone = root.join("clone");
+    ok(sc(&root, &["clone", &url, clone.to_str().unwrap()]));
+    assert_eq!(
+        std::fs::read_to_string(clone.join("README.md")).unwrap(),
+        "public\n"
+    );
+    wait_until_empty(&home.join(".sc").join("tmp"));
+    srv.kill().unwrap();
+    srv.wait().unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 /// A starting `sc serve --store sc+git::` removes the Git caches a killed

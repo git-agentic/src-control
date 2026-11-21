@@ -62,6 +62,9 @@ const DELETE_ARG_BUDGET: usize = 24 << 10;
 const IDLE: Duration = Duration::from_secs(120);
 /// Download budget of a fetch of a whole key family or a batch of keys.
 const FAMILY_BUDGET: u64 = MAX_VALUE;
+/// How long a terminated fetch is watched for a surviving helper (pipes still
+/// open, pack directory still changing) before its download is discarded anyway.
+const SETTLE: Duration = Duration::from_secs(5);
 
 /// `-c` overrides on every git call: transport allowlist, no hooks, no signing,
 /// no background maintenance, bounded stalls. `protocol.version=2` makes a
@@ -234,6 +237,40 @@ impl Default for Tuning {
             #[cfg(unix)]
             kill: "kill",
         }
+    }
+}
+
+/// The two detached pipe readers of a watched git and what they have delivered.
+struct Readers {
+    out: mpsc::Receiver<(Vec<u8>, bool)>,
+    err: mpsc::Receiver<Vec<u8>>,
+    got_out: Option<(Vec<u8>, bool)>,
+    got_err: Option<Vec<u8>>,
+}
+
+impl Readers {
+    /// Collect what the readers deliver until `deadline`; the error names the
+    /// first pipe still open then. A reader that died counts as done and empty.
+    fn wait(&mut self, deadline: Instant) -> std::result::Result<(), &'static str> {
+        if self.got_out.is_none() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.out.recv_timeout(left) {
+                Ok(v) => self.got_out = Some(v),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.got_out = Some(Default::default())
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => return Err("stdout"),
+            }
+        }
+        if self.got_err.is_none() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.err.recv_timeout(left) {
+                Ok(v) => self.got_err = Some(v),
+                Err(mpsc::RecvTimeoutError::Disconnected) => self.got_err = Some(Vec::new()),
+                Err(mpsc::RecvTimeoutError::Timeout) => return Err("stderr"),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -637,13 +674,20 @@ impl GitBucket {
         Self::validate_url(url)?;
         #[cfg(not(unix))]
         let _ = group; // process groups are unix-only; the watchdog kills the child alone
+                       // The cache path must be absolute: git runs with the cache as its working
+                       // directory and `GIT_DIR` set to the same path, and a relative one (a serve
+                       // home given as `.`, a relative `TMPDIR`) would be resolved from inside it.
         let (cache, owner) = match parent {
             Some(p) => {
-                std::fs::create_dir_all(p)?;
-                let (cache, owner) = new_owned_cache_dir_in(p)?;
+                let p = std::path::absolute(p)?;
+                std::fs::create_dir_all(&p)?;
+                let (cache, owner) = new_owned_cache_dir_in(&p)?;
                 (cache, Some(owner))
             }
-            None => (new_cache_dir_in(&std::env::temp_dir())?, None),
+            None => (
+                new_cache_dir_in(&std::path::absolute(std::env::temp_dir())?)?,
+                None,
+            ),
         };
         let b = GitBucket {
             url: url.to_string(),
@@ -843,24 +887,33 @@ impl GitBucket {
                 pause = (pause * 2).min(Duration::from_millis(50));
             }
         };
+        let mut readers = Readers {
+            out: orx,
+            err: erx,
+            got_out: None,
+            got_err: None,
+        };
+        // Every breach ends in `terminate_and_discard`: the budget during the
+        // run, the budget at the final check, no progress, a pipe that stays open.
         let Some(status) = status else {
-            // Signal before reaping, while the group id is still ours.
-            self.stop(&mut child);
-            let _ = child.wait();
-            self.discard_download(&pack_dir, &before);
+            self.terminate_and_discard(&mut child, &mut readers, &pack_dir, &before);
             return Err(breach.expect("only a breach leaves the loop without a status"));
         };
         if dir_bytes(&pack_dir).saturating_sub(base) > watch.budget {
-            self.discard_download(&pack_dir, &before);
+            self.terminate_and_discard(&mut child, &mut readers, &pack_dir, &before);
             return Err(over_budget(watch));
         }
         // One deadline for both pipes. A helper that outlives git and holds one
-        // open is still in git's process group in serve mode, so the group is
-        // signalled before the error returns (the group is non-empty, so its id
-        // cannot have been reused).
-        let deadline = Instant::now() + self.tune.idle;
-        let (stdout, over) = self.receive(&mut child, &orx, deadline, "stdout")?;
-        let stderr = self.receive(&mut child, &erx, deadline, "stderr")?;
+        // open is still in git's process group in serve mode.
+        if let Err(what) = readers.wait(Instant::now() + self.tune.idle) {
+            self.terminate_and_discard(&mut child, &mut readers, &pack_dir, &before);
+            return Err(Error::Backend(format!(
+                "git exited but left its {what} open for {:?} (a helper outlived it)",
+                self.tune.idle
+            )));
+        }
+        let (stdout, over) = readers.got_out.take().unwrap_or_default();
+        let stderr = readers.got_err.take().unwrap_or_default();
         if over {
             return Err(Error::Backend(format!(
                 "git output exceeded {max_out} bytes (hostile or corrupt remote)"
@@ -874,29 +927,40 @@ impl GitBucket {
         })
     }
 
-    /// Wait for a pipe reader's result until `deadline`. Past it, a helper that
-    /// outlived git holds the pipe: stop the group (serve mode) and fail.
-    fn receive<T>(
+    /// The one end of every breach. Stop git (its whole group in serve mode),
+    /// reap it, then keep watching until the pipes have closed and the pack
+    /// directory has stopped changing, or a short settle deadline passes (a
+    /// helper outside the group, in CLI mode, may still be writing), and only
+    /// then discard what the fetch added. Discarding first would let a surviving
+    /// helper write into the directory after it was cleaned.
+    fn terminate_and_discard(
         &self,
         child: &mut Child,
-        rx: &mpsc::Receiver<T>,
-        deadline: Instant,
-        what: &str,
-    ) -> Result<T> {
-        let left = deadline.saturating_duration_since(Instant::now());
-        rx.recv_timeout(left).map_err(|_| {
-            self.stop(child);
-            Error::Backend(format!(
-                "git exited but left its {what} open for {:?} (a helper outlived it)",
-                self.tune.idle
-            ))
-        })
+        readers: &mut Readers,
+        pack_dir: &Path,
+        before: &HashMap<OsString, u64>,
+    ) {
+        // Signal before reaping, while the group id is still ours. After a clean
+        // exit the leader is already reaped, so this relies on the group still
+        // having a member (a helper holding a pipe, or one still writing).
+        self.stop(child);
+        let _ = child.wait();
+        let settle = Instant::now() + self.tune.idle.min(SETTLE);
+        let mut last = dir_bytes(pack_dir);
+        loop {
+            std::thread::sleep(Duration::from_millis(20));
+            let closed = readers.wait(Instant::now()).is_ok();
+            let now = dir_bytes(pack_dir);
+            if (closed && now == last) || Instant::now() >= settle {
+                break;
+            }
+            last = now;
+        }
+        self.discard_download(pack_dir, before);
     }
 
-    /// Kill a watched git. Called before the child is reaped, so its group id
-    /// cannot have been reused (after a clean exit only [`Self::receive`] calls
-    /// it, and only while a helper still holds a pipe, so the group is not
-    /// empty). In serve mode the child leads its own process
+    /// Kill a watched git. Called before the child is reaped where it can be,
+    /// so its group id cannot have been reused. In serve mode the child leads its own process
     /// group and the whole group is signalled, so `ssh` and `git-remote-*`
     /// die with it; the system `kill` keeps this std-only, with no `unsafe`, and
     /// serve mode on unix therefore needs a `kill` on the PATH. Without one only
@@ -3198,8 +3262,10 @@ mod tests {
             let t = Tmp::new("silent");
             let (_, url) = hub(&t);
             let pids = t.0.join("pids");
+            // A little data first (under the budget), so the breach has
+            // something to discard.
             let body = format!(
-                "case \" $* \" in *\" fetch \"*) sleep 600 & echo $! > {}; wait;; esac",
+                "case \" $* \" in *\" fetch \"*) head -c 1000 /dev/zero > \"$GIT_DIR/objects/pack/tmp_pack_idle\"; sleep 600 & echo $! > {}; wait;; esac",
                 pids.display()
             );
             let sh = shim(&t, "silent.sh", &body);
@@ -3208,6 +3274,10 @@ mod tests {
             let started = Instant::now();
             let e = get_err(&b, "manifest");
             let took = started.elapsed();
+            assert!(
+                dir_files(&b.cache.join("objects").join("pack")).is_empty(),
+                "the no-progress breach must discard what the fetch added"
+            );
             let helper: u32 = std::fs::read_to_string(&pids)
                 .unwrap()
                 .trim()
@@ -3242,8 +3312,9 @@ mod tests {
             let t = Tmp::new("held");
             let (_, url) = hub(&t);
             let pids = t.0.join("pids");
+            // The fetch "downloads" something small and exits cleanly.
             let body = format!(
-                "case \" $* \" in *\" fetch \"*) sleep 600 & echo $! > {}; exit 0;; esac",
+                "case \" $* \" in *\" fetch \"*) head -c 1000 /dev/zero > \"$GIT_DIR/objects/pack/tmp_pack_held\"; sleep 600 & echo $! > {}; exit 0;; esac",
                 pids.display()
             );
             let sh = shim(&t, "held.sh", &body);
@@ -3253,6 +3324,10 @@ mod tests {
             let e = get_err(&b, "manifest");
             assert!(e.contains("left its"), "{e}");
             assert!(started.elapsed() < Duration::from_secs(90));
+            assert!(
+                dir_files(&b.cache.join("objects").join("pack")).is_empty(),
+                "the pipe-timeout breach must discard what the fetch added"
+            );
             let helper: u32 = std::fs::read_to_string(&pids)
                 .unwrap()
                 .trim()
@@ -3263,6 +3338,80 @@ mod tests {
             }
             wait_gone(helper);
         }
+    }
+
+    /// git exits cleanly with its download over budget while a helper is still
+    /// alive (here holding the pipes): the final check must stop the helper
+    /// (serve mode) and discard the download, like every other breach. `poll`
+    /// is fixed longer than the shim runs, so git has already exited at the
+    /// second look.
+    #[cfg(unix)]
+    #[test]
+    fn a_clean_exit_over_budget_still_stops_a_helper_and_discards() {
+        need_git!();
+        for group in [true, false] {
+            let t = Tmp::new("finalover");
+            let (_, url) = hub(&t);
+            let pids = t.0.join("pids");
+            let body = format!(
+                "case \" $* \" in *\" fetch \"*) sleep 0.4; head -c 2000000 /dev/zero > \"$GIT_DIR/objects/pack/pack-fake.pack\"; sleep 600 & echo $! > {}; exit 0;; esac",
+                pids.display()
+            );
+            let sh = shim(&t, "finalover.sh", &body);
+            let mut b = GitBucket::open_full(&url, sh, CHUNK, None, group).unwrap();
+            b.tune.budget = Some(64 << 10);
+            b.tune.poll = Some(Duration::from_millis(1500));
+            b.tune.idle = Duration::from_secs(3);
+            let e = get_err(&b, "manifest");
+            assert!(e.contains("65536 bytes"), "{e}");
+            assert!(
+                dir_files(&b.cache.join("objects").join("pack")).is_empty(),
+                "the over-budget download must be discarded"
+            );
+            let helper: u32 = std::fs::read_to_string(&pids)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            if !group {
+                kill_pid(helper);
+            }
+            wait_gone(helper);
+        }
+    }
+
+    /// A relative serve home (`.`) must work: git runs with the cache as its
+    /// working directory, so a relative cache path would be resolved from inside
+    /// the cache. The path is relative to the current directory without
+    /// changing it, by climbing out to the root and down again.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_cache_parent_works() {
+        need_git!();
+        let t = Tmp::new("relative");
+        let (_, url) = hub(&t);
+        let cwd = std::env::current_dir().unwrap();
+        let up = "../".repeat(cwd.components().count() - 1);
+        let target = t.0.join("home").join(".sc").join("tmp");
+        let rel = PathBuf::from(format!(
+            "{up}{}",
+            target.strip_prefix("/").unwrap().display()
+        ));
+        assert!(rel.is_relative());
+        let b = GitBucket::open_in(&url, &rel).unwrap();
+        assert!(b.cache.is_absolute(), "{:?}", b.cache);
+        assert!(b.put_new("k", b"v").unwrap());
+        let Fetched::New { bytes, .. } = b.get("k", None).unwrap() else {
+            panic!("the value just written must read back")
+        };
+        assert_eq!(bytes, b"v");
+        // and a non-create-only key goes through the fetch path too
+        let tag = b.put_if_tag("manifest", b"m", None).unwrap().unwrap();
+        std::thread::sleep(FRESH + Duration::from_millis(100));
+        assert!(matches!(
+            b.get("manifest", Some(&tag)).unwrap(),
+            Fetched::Unchanged
+        ));
     }
 
     /// Both pipes share one deadline after git exits. Here stdout is held for
