@@ -856,7 +856,9 @@ The bucket model above applies unchanged, with the Git repository as the bucket 
   session's cache on the same home is never removed and pid reuse, pid-1 containers and several pid
   namespaces on one host do not matter; it is an advisory lock on one host, unreliable over NFS and
   similar, as for `DirBucket`.
-- Not tested against real GitHub. The "not independently audited, do not commit production
+- Validated against a private GitHub repository (ADR-0060): custom refs, lease CAS,
+  the filtered fetch and compaction behave as on sc-forge; GitHub's size limits, rulesets
+  on custom refs and CAS across its replicas were not exercised. The "not independently audited, do not commit production
   secrets" warning at the top of this document applies unchanged.
 
 ## By-id object reads (`GetObjects`, `sc cat`) — ADR-0047

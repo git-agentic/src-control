@@ -433,8 +433,8 @@ cargo run --bin sc -- remote add <name> sc+git::<git-url> [--allow-private-branc
                                               # with push to the repo holds bucket put + delete;
                                               # deleting a ref is not erasure. `remote compact`
                                               # and `serve --store` work (below);
-                                              # clone --filter refused as for any bucket. Untested
-                                              # against real GitHub
+                                              # clone --filter refused as for any bucket. Works on
+                                              # GitHub (slow: one HTTPS round trip per git call)
 cargo run --bin sc -- remote compact <name> [--dry-run] [--prune-expire 24h] [--allow-short-grace]
                                               # bucket remotes only (#216, ADR-0057): merge small
                                               # packs behind one manifest CAS, then delete log

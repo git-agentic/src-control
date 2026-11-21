@@ -700,7 +700,7 @@ across every phase.
   no `+` refspec, rejections classified by re-reading the ref, 2 s freshness
   window, create-only caching and family-batched fetches). Private branches,
   protected paths and secrets travel through a Git host (a local bare repo and
-  sc-forge verified; real GitHub untested); a plain `git clone` never fetches
+  sc-forge and a private GitHub repository verified); a plain `git clone` never fetches
   `refs/sc/*`, and the same repository can also mirror public branches through a
   `--git` remote. A private-branch push needs the per-remote opt-in
   `--allow-private-branches`; `sc remote compact` works on `sc+git::` (a
@@ -1036,9 +1036,12 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
   `--allow-private-branches` (the daemon needs non-interactive git auth); (9) a
   download budget: every fetch into the cache runs under a watchdog that kills
   git over its budget (disk bytes per fetch; not RAM inside `index-pack`, not the
-  total cache). Still deferred: (4) validation against real GitHub (per-ref and
-  per-push limits, rulesets, hosts that refuse unknown ref namespaces), untested
-  so far; (10) a group-leading supervisor for the serve-mode watchdog: run git
+  total cache). (4) validated against a private GitHub repository on 2026-11-21 (custom
+  refs, lease CAS with one winner of two racing pushers, filtered fetch,
+  compaction 18 → 5 refs); still unexercised there: per-push and per-blob limits,
+  rulesets on custom refs, and CAS across GitHub replicas beyond one race. Still
+  deferred: (11) fewer round trips per push (a first small push to GitHub took
+  56 s, one HTTPS round trip per git call); (10) a group-leading supervisor for the serve-mode watchdog: run git
   under a std-only `sh` leader (`sh -c 'git "$@"; echo $? > <status file>; read
   _' sh <args>`, stdin piped from sc) so the process group id stays pinned after
   git exits, and the watchdog can group-kill a helper that outlives git (the
