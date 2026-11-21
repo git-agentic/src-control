@@ -1119,12 +1119,13 @@ pub fn serve_with_policy(
 /// (see [`TempServeDir::create_in`]) — the spool dir is created under its
 /// `.sc/tmp/`, not the process-wide temp dir.
 fn open_bucket_serve_transport(store_url: &str, home: &std::path::Path) -> Result<ServeTransport> {
+    crate::bucket_transport::refuse_git_store(store_url)?;
     let transport = BucketTransport::open(store_url)?;
     let tmp = TempServeDir::create_in(home)?;
     Ok(ServeTransport::Bucket { transport, tmp })
 }
 
-/// Serve a bucket WAL (`sc+wal://`/`sc+s3://`) over the same wire protocol
+/// Serve a bucket WAL (`sc+wal://`/`sc+s3://`; `sc+git::` is refused) over the same wire protocol
 /// `serve_with_policy` speaks for a local repo (P36c): same handshake, same
 /// `PROTOCOL_VERSION`, same read-only gate and pack-spool caps — every verb
 /// except the pack pair goes through [`Transport`] identically either way.

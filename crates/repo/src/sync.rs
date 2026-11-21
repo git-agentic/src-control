@@ -143,9 +143,30 @@ impl Repo {
     /// under `refs/remotes/`, so it is validated like a branch name to keep a
     /// hostile name (e.g. `../heads`) from escaping into `refs/heads/`.
     pub fn remote_add(&self, name: &str, url: &str) -> Result<()> {
+        self.remote_add_opts(name, url, false)
+    }
+
+    /// [`Repo::remote_add`] that also records the private-branch opt-in for an
+    /// `sc+git::` remote (see [`check_private_push_allowed`]) in the same
+    /// config write.
+    pub fn remote_add_opts(
+        &self,
+        name: &str,
+        url: &str,
+        allow_private_branches: bool,
+    ) -> Result<()> {
         validate_branch_name(name)?;
         let mut cfg = RemoteConfig::load(&self.layout)?;
         cfg.add(name, url)?;
+        cfg.set_allow_private_branches(name, allow_private_branches)?;
+        cfg.save(&self.layout)
+    }
+
+    /// Record the private-branch opt-in on an existing remote (`sc clone
+    /// --allow-private-branches` sets it on the new `origin`).
+    pub fn remote_allow_private_branches(&self, name: &str) -> Result<()> {
+        let mut cfg = RemoteConfig::load(&self.layout)?;
+        cfg.set_allow_private_branches(name, true)?;
         cfg.save(&self.layout)
     }
 
@@ -653,6 +674,17 @@ impl Repo {
         let url = cfg
             .url(remote)
             .ok_or_else(|| Error::NoSuchRemote(remote.to_string()))?;
+        // Before any bucket I/O: a private branch only goes to a Git-hosted
+        // store when the remote opted in (ADR-0060).
+        if crate::bucket_transport::is_git_bucket_url(url) {
+            if let Some((branch, _, _)) = self.head_private()? {
+                crate::bucket_transport::check_private_push_allowed(
+                    url,
+                    cfg.allow_private_branches(remote),
+                    &branch,
+                )?;
+            }
+        }
         let transport = open_transport(url)?;
         let branch = refs::current_branch(&self.layout)?;
         let local_tip = self.head_tip()?.ok_or(Error::Unborn)?;

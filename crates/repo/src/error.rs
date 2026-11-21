@@ -205,10 +205,20 @@ pub enum Error {
     /// P36a: the bucket WAL is untrusted input; decode/consistency failures
     /// are their own variant so callers can distinguish "bucket corrupt or
     /// newer-format" from transport errors.
-    #[error("bucket wal: {0}")]
+    #[error("bucket wal: {}", scl_core::sanitize_display_line(.0))]
     Wal(String),
-    #[error("bucket: {0}")]
-    ObjIo(#[from] scl_objio::Error),
+    /// Bucket backend errors carry text from the store or the Git host (a
+    /// `sc+git::` hook message, a server's reply), so the display is escaped
+    /// and the inner error is deliberately not a `source`, which anyhow would
+    /// print raw under "Caused by".
+    #[error("bucket: {}", scl_core::sanitize_display_line(&.0.to_string()))]
+    ObjIo(scl_objio::Error),
+}
+
+impl From<scl_objio::Error> for Error {
+    fn from(e: scl_objio::Error) -> Self {
+        Error::ObjIo(e)
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -257,5 +267,31 @@ mod tests {
             assert!(shown.contains("boom\\x1b]0;pwn\\x07\\x1b[2J"), "{shown:?}");
         }
         assert!(matches!(Error::Remote(raw.into()), Error::Remote(m) if m == raw));
+    }
+}
+
+#[cfg(test)]
+mod bucket_error_display_tests {
+    use super::*;
+
+    /// Text a Git host or bucket controls (a hook message, an error body) must
+    /// not reach the terminal with its escape bytes, in the message or in an
+    /// anyhow "Caused by" chain (no `source`, so there is none).
+    #[test]
+    fn bucket_errors_escape_control_bytes_and_have_no_raw_source() {
+        let evil = "\x1b[2J\x1b]0;pwned\x07remote: declined";
+        for e in [
+            Error::from(scl_objio::Error::Backend(evil.to_string())),
+            Error::from(scl_objio::Error::BadKey(evil.to_string())),
+            Error::Wal(evil.to_string()),
+        ] {
+            let shown = e.to_string();
+            assert!(
+                !shown.contains('\x1b') && !shown.contains('\x07'),
+                "{shown:?}"
+            );
+            assert!(shown.contains("declined"));
+            assert!(std::error::Error::source(&e).is_none());
+        }
     }
 }
