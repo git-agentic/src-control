@@ -975,6 +975,7 @@ fn new_cache_dir() -> Result<PathBuf> {
             &nonce_seed(attempt)[..16]
         );
         let p = std::env::temp_dir().join(name);
+        #[cfg_attr(not(unix), allow(unused_mut))] // `mut` only for the unix mode
         let mut b = std::fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
@@ -1269,10 +1270,12 @@ mod tests {
         p.to_str().unwrap().to_string()
     }
 
+    #[cfg(unix)]
     fn open_git(url: &str, git: &str) -> GitBucket {
         GitBucket::open_with(url, git.to_string(), CHUNK).unwrap()
     }
 
+    #[cfg(unix)]
     fn tag_of(b: &GitBucket, key: &str) -> String {
         let Fetched::New { tag, .. } = b.get(key, None).unwrap() else {
             panic!("expected New")
