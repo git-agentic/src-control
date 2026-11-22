@@ -3288,7 +3288,7 @@ mod tests {
             t,
             "calls.sh",
             &format!(
-                "{SUBCOMMAND}; case \"$s\" in push) echo \"push $*\" >> {l};; fetch|ls-remote) echo \"$s\" >> {l};; esac",
+                "{SUBCOMMAND}; case \"$s\" in push) echo \"push $*\" >> {l};; fetch) echo \"$s\" >> {l};; ls-remote) echo \"ls-remote $*\" >> {l};; esac",
                 l = log.display()
             ),
         )
@@ -3334,7 +3334,8 @@ mod tests {
         need_git!();
         let t = Tmp::new("batch-hook");
         let (hubdir, url) = hub(&t);
-        let b = open(&url);
+        let log = t.0.join("calls.log");
+        let b = open_git(&url, &call_log_shim(&t, &log));
         // An `update` hook judges each ref on its own: it refuses log/2 only.
         let hook = hubdir.join("hooks/update");
         std::fs::write(
@@ -3346,6 +3347,15 @@ mod tests {
         let items = [("log/1", "one"), ("log/2", "two"), ("log/3", "three")];
         let e = batch(&b, &items).unwrap_err().to_string();
         assert!(e.contains("keep log two"), "{e}");
+        // the push exits non-zero but its per-ref lines say log/1 and log/3
+        // landed, so only log/2 is re-read
+        let reads = logged(&log, "ls-remote");
+        assert_eq!(reads.len(), 1, "{reads:?}");
+        assert!(reads[0].contains("refs/sc/log/2"), "{reads:?}");
+        assert!(
+            !reads[0].contains("refs/sc/log/1") && !reads[0].contains("refs/sc/log/3"),
+            "{reads:?}"
+        );
         // not mistaken for a lost race, and the other keys landed
         assert_eq!(
             names(&open(&url).list_tags("").unwrap()),
@@ -3493,7 +3503,11 @@ mod tests {
         assert!(batch(&b, &[("log/1", "x"), ("bad key", "y")]).is_err());
         assert!(batch(&b, &[("log/1", "x"), ("log/2/../3", "y")]).is_err());
         assert!(batch(&b, &[("log/1", "x"), ("log/1", "y")]).is_err());
+        // acceptable to the shared key check, not to a refspec
+        assert!(batch(&b, &[("log/1", "x"), ("log/a..b", "y")]).is_err());
+        assert!(batch(&b, &[("log/1", "x"), ("log/a:b", "y")]).is_err());
         assert!(b.exists_batch(&["log/1", "a b"]).is_err());
+        assert!(b.exists_batch(&["log/1", "log/*"]).is_err());
         assert!(
             std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
             "no network call for an empty or invalid batch"

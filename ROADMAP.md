@@ -1036,12 +1036,24 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
   `--allow-private-branches` (the daemon needs non-interactive git auth); (9) a
   download budget: every fetch into the cache runs under a watchdog that kills
   git over its budget (disk bytes per fetch; not RAM inside `index-pack`, not the
-  total cache). (4) validated against a private GitHub repository on 2026-11-21 (custom
+  total cache); (11) fewer round trips per push: `Bucket::put_new_batch` and
+  `exists_batch` (one `git push` per chunk of at most 64 MiB of values, one
+  create-only lease per ref, never `+` or `--atomic`; one `ls-remote` per chunk
+  of exact refs) carry the pack and idx and the pre-commit presence check, the
+  view after a won manifest CAS is built from the manifest just written instead
+  of read back, and `has_object` trusts a 2 s memo of an empty remote instead of
+  probing once per object. Measured with a logging `SC_GIT` shim against a local
+  bare repository, one small commit through `sc push`: a first push 19 network
+  git calls → 10, a second push 11 → 8 (the open-time manifest read included;
+  the three probes of an empty remote, at open, in `list_refs` and in
+  `update_ref`, remain because only `has_object` may use the memo). Not in scope:
+  `ref_guard::check_ref_move` still downloads the old tip's pack to compare kinds
+  on every push after the first (bandwidth, not round trips; the idx carries no
+  kind). (4) validated against a private GitHub repository on 2026-11-21 (custom
   refs, lease CAS with one winner of two racing pushers, filtered fetch,
   compaction 18 → 5 refs); still unexercised there: per-push and per-blob limits,
   rulesets on custom refs, and CAS across GitHub replicas beyond one race. Still
-  deferred: (11) fewer round trips per push (a first small push to GitHub took
-  56 s, one HTTPS round trip per git call); (10) a group-leading supervisor for the serve-mode watchdog: run git
+  deferred: (10) a group-leading supervisor for the serve-mode watchdog: run git
   under a std-only `sh` leader (`sh -c 'git "$@"; echo $? > <status file>; read
   _' sh <args>`, stdin piped from sc) so the process group id stays pinned after
   git exits, and the watchdog can group-kill a helper that outlives git (the
@@ -1057,12 +1069,16 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
   does not support them and sc-forge is SHA-1, so the value is low and the cost
   moderate (the cache's object format would have to be detected before the first
   fetch); (S2, from review) the ssh user name that `remote list` prints is not a
-  credential, and `http(s)` userinfo is refused at validation. Known issue,
-  recorded and not fixed: a push to `refs/sc/K` fails with "dst refspec matches
+  credential, and `http(s)` userinfo is refused at validation. Declined: a push to `refs/sc/K` fails with "dst refspec matches
   more than one" when a decoy branch such as `refs/heads/refs/sc/K` exists on the
-  host (found while building `serve --store`). Whoever can push to the
-  repository can plant such a decoy, so it is a writer-only denial of service on
-  that key; reads compare exact full ref names and are not affected.
+  host (found while building `serve --store`; a create goes to the decoy and is
+  lease-rejected). Git has no option to turn off the push destination's DWIM
+  lookup, so a fix would mean avoiding refspecs for these keys altogether. Writers
+  who can push branches can also push `refs/sc/*` on hosts where custom refs are
+  not separately protected (verified for sc-forge, unverified for GitHub
+  rulesets), and a writer can already delete or overwrite any bucket ref, so the
+  decoy adds no capability; reads compare exact full ref names (`exact_only`) and
+  are not affected.
 - **Serve-side persistent pack cache (P36c follow-on).** A bucket-backed
   serve instance re-downloads packs per connection; a content-addressed
   on-disk cache in the serve home would make warm instances cheap without
