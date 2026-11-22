@@ -462,9 +462,9 @@ every transport path.
 - Each cold read or push costs git round trips. The freshness window and family
   batching bound them, but a Git host is slower than S3. The per-object probe is
   free on an empty remote (the transport remembers it for 2 s). On a non-empty
-  `sc+git::` remote the freshness window answers the per-object probes without a
-  call; on S3 and `sc+wal://` each probe outside that window is one manifest
-  read. If push stays slow on large histories, the next step is a batched
+  `sc+git::` remote the freshness window answers the per-object probes, and git
+  reads the manifest again only once the cached tag is older than 2 s; S3 and
+  `sc+wal://` have no such window and read the manifest on every probe. If push stays slow on large histories, the next step is a batched
   `has_objects`.
 - sc-forge repositories keep a deleted or replaced value fetchable by id until
   the gc prune stage runs.
