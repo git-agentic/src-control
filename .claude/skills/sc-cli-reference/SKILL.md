@@ -481,7 +481,9 @@ cargo run --bin sc -- serve --http <addr> <home> --store sc+git::<git-url> [--al
                                               # lock is free (unix, one host, not NFS). Every
                                               # fetch runs under a download watchdog (disk per
                                               # fetch; 120 s no-progress deadline); serve mode
-                                              # needs a `kill` on the PATH to kill git's group
+                                              # runs git under a /bin/sh group leader and kills
+                                              # its group when the fetch ends (a `kill` on the
+                                              # PATH is only a backup)
 bash demo/run_git_carrier_demo.sh             # sc+git:: proof (P39): a bare Git repo as the host;
                                               # protected path + secret + private branch pushed
                                               # (private branch refused without the opt-in), plain

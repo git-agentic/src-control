@@ -1376,9 +1376,9 @@ objects and is removed on `Drop`. A mutable key (the manifest) is read with one 
 of exactly `refs/sc/K` under protocol v2, so a v2 host lists that ref alone, and every fetch
 runs under a watchdog that kills git past its download budget (disk bytes per fetch: a
 key's value cap, 2 GiB for a family) or after 120 s without progress (only serve mode on
-unix kills git's whole process group, through the system `kill`, and only while git is
-unreaped; elsewhere, and for any helper that outlives git's exit, the helpers that write the
-pack may keep writing). Scaling: `ls-remote` and push download the whole ref advertisement,
+unix runs git under a `/bin/sh` group leader and kills the whole process group when the
+fetch ends, helpers that outlive git included; elsewhere the helpers that write the pack may
+keep writing, and a helper that leaves the group with `setsid` escapes). Scaling: `ls-remote` and push download the whole ref advertisement,
 and a cold read fetches every `log/` and `checkpoints/` entry behind the last checkpoint;
 refs grow by at least three per push until `sc remote compact` runs.
 

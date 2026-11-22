@@ -241,7 +241,9 @@ under a watchdog:
   Every breach (the budget during the run, the budget after git exited, no
   progress, a pipe a helper keeps open after git exits) takes one path: stop git
   (the group in serve mode), reap it, keep watching until the pipes have closed
-  and `objects/pack` has stopped changing or 5 s have passed, then discard. The
+  and `objects/pack` has stopped changing or 5 s have passed, then discard; in
+  serve mode a normal exit runs the same stop, reap and settle steps before the
+  budget is checked. The
   files the fetch added to `objects/pack` and every local ref under `refs/sc/`
   are removed (the cache only mirrors the host; the next read fetches again) and
   the error names the cap. Discarding before the helpers are gone would let a
@@ -249,35 +251,57 @@ under a watchdog:
 - The cache path is made absolute before any git runs: git runs with the cache as
   its working directory and `GIT_DIR` set to it, so a relative serve home (`.`)
   would be resolved from inside the cache.
-- Serve mode, on unix, spawns git in its own process group and signals the group
-  (`kill -s KILL -- -<pgid>`, std only, no `unsafe`), so `ssh` and
-  `git-remote-https` die with it. The group is signalled only while the leader is
-  unreaped: its pid pins the group id then. Once the leader is reaped, the id of
-  the group is free to be reused by an unrelated process group of the same user,
-  and nothing observable shows that it has not been (an open pipe proves a live
-  member only at the instant it is looked at, and the external `kill` runs
-  later). Pinning the pid without reaping needs `waitid(WNOWAIT)`, which is
-  `unsafe` and not allowed here. So after the reap the group is never signalled,
-  whatever the pipes say; the decision is `may_signal_group`. That needs a `kill`
-  program on the PATH; if it cannot be run, the watchdog falls back to killing
-  git alone and prints one warning. The CLI does not use a process group: Ctrl-C
-  must still reach git and ssh must still be able to prompt on the terminal. It
-  kills git alone, and the pipe readers are detached threads, so a helper that
-  outlives git and holds the pipes cannot block the call. A git that exits while
-  a helper holds its pipes is an error once one shared 120 s deadline for both
-  pipes has passed, after which the watchdog settles for a bounded time and
-  discards what the fetch added. Windows kills the child only.
-- A helper that outlives git's exit is therefore not killed, in either mode, and
-  may keep writing after the discard until it exits. That covers a smart-HTTP
-  v0/v1 helper chain, an ssh `ControlPersist` master, and a hostile process. The
-  watchdog bounds disk only while git itself is running (or its group can still
-  be signalled); after git exits it measures, settles and discards, and cannot
-  stop a survivor. The planned fix (ROADMAP, `sc+git::` follow-on 10) is a
-  group-leading supervisor: in serve mode, run git under a std-only `sh` leader
-  (`sh -c 'git "$@"; echo $? > <status file>; read _' sh <args>`, with stdin piped
-  from sc) so the process group id stays pinned after git exits. The watchdog could
-  then group-kill a helper that outlives git, which closes this gap, before it
-  closes the leader's stdin and reaps it. Not built in v1.
+- Serve mode, on unix, runs git under a group-leading supervisor, std only, no
+  `unsafe`. The child is `/bin/sh` (an absolute path, not looked up on the PATH)
+  with its own process group, running a constant script with the git program, its
+  `-c` options and its arguments as positional parameters. The script runs git in a
+  subshell with stdin from `/dev/null`; the subshell writes git's exit code to
+  `<cache>/.fetch-status-<n>`; the shell closes its own stdout and stderr, so only
+  git and its helpers hold the pipes, and then blocks reading its stdin, a pipe
+  only sc holds. When that pipe closes, because sc dropped it or died, the shell
+  runs the builtin `kill -s KILL 0`: its whole group dies, itself included, and no
+  group id and no external program are involved. git runs through `command`, so a
+  shell function exported by the environment cannot stand in for it; `SC_GIT` is
+  resolved by `/bin/sh` the same way (a bare name through the PATH, a path as is).
+  The script uses a parenthesized subshell on purpose: with a `{ ...; } &` group
+  bash execs the command in place and the status line never runs.
+- sc never waits for the leader before the group is dead. It learns git's exit
+  from the status file (one to three ASCII digits and a newline, at most 255;
+  anything else, such as a partial write, counts as not yet), so the leader stays
+  unreaped and its pid keeps pinning the group id. A reaped leader would free the
+  id for reuse by an unrelated process group of the same user, and pinning a pid
+  without reaping it needs `waitid(WNOWAIT)`, which is `unsafe` and not allowed
+  here. A leader that dies early writes no status; the no-progress deadline ends
+  the fetch. Every end of a fetch, a normal exit or any breach, takes the same
+  steps: close the stdin pipe; signal the group through the system `kill` as a
+  backup while the leader is still unreaped (`may_signal_group`; it also reaches
+  helpers when the leader died before it saw the end of input); reap the leader,
+  within a bound; then settle and measure as below. After a successful fetch the
+  group is killed too, so every helper that stays in git's process group, a
+  smart-HTTP v0/v1 helper chain included, dies when git exits and cannot write
+  after the discard. After the reap the group is never signalled. `kill` is only
+  the backup: without it a warning is printed once and the leader's own `kill 0`
+  still ends the group, unless the leader died early.
+- A `/bin/sh` exit status of 126 or 127 means `command` could not run git and
+  gives the usual "cannot run git (...): install git or set SC_GIT" error. A git
+  killed by signal `n` reads as exit `128 + n`.
+- What escapes, and what is trusted. A process that leaves git's group with
+  `setsid` (an ssh `ControlPersist` master, a credential-cache daemon) is not
+  killed. If it holds a pipe, the fetch is an error after the shared deadline, and
+  the discard follows; if it closes its pipes and writes into `objects/pack`, the
+  watchdog bounds disk only while it measures. The status file is a channel that
+  trusts local executables: any process of the same user can write it (the cache
+  directory is private, mode 0700), and a forged "0" ends the fetch early without
+  any new authority. The CLI and Windows spawn git directly, as before: the CLI
+  kills git alone, the pipe readers are detached threads, so a helper that
+  outlives git and holds the pipes cannot block the call, and a helper that
+  outlives git is not killed and may keep writing after the discard until it
+  exits. The CLI does not use a process group: Ctrl-C must still reach git and ssh
+  must still be able to prompt on the terminal. A git that exits while something
+  holds its pipes is an error once one shared 120 s deadline for both pipes has
+  passed (in serve mode that is only a process outside the group), after which
+  the watchdog settles for a bounded time and discards what the fetch added.
+  Windows kills the child only.
 
 The exact limits:
 
@@ -288,13 +312,16 @@ The exact limits:
   caches keep.
 - Refs a family fetch writes are not measured. A hostile host can advertise a
   great many refs; only the 120 s no-progress deadline bounds that.
-- Only serve mode on unix actually bounds disk against a hostile HTTP host. Outside
-  it (the unix CLI, Windows), and possibly against a smart-HTTP host on protocol
-  v0 or v1, the kill may not reach the helper chain that writes the pack
-  (`git-remote-https`, `index-pack`), which can keep writing after git is killed.
-  Those cases are not disk-bounded; the watchdog still frees the call.
-- A fetch in its own process group outlives a killed `sc serve`: a supervisor
-  that kills the whole cgroup covers it.
+- Only serve mode on unix actually bounds disk against a hostile HTTP host: every
+  process that stays in git's group, a smart-HTTP v0/v1 helper chain included, is
+  killed when the fetch ends, and a process that leaves the group (`setsid`)
+  escapes. Outside serve mode (the unix CLI, Windows) the kill may not reach the
+  helper chain that writes the pack (`git-remote-https`, `index-pack`), which can
+  keep writing after git is killed. Those cases are not disk-bounded; the
+  watchdog still frees the call.
+- A fetch's group ends when `sc serve` dies, whatever the signal: the leader sees
+  the end of its stdin and kills the group. Only a process that left the group
+  outlives it.
 
 ### Private-branch opt-in
 
