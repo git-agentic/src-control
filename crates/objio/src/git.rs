@@ -4564,16 +4564,15 @@ mod tests {
         let pids = t.0.join("pids");
         let ack = t.0.join("ack");
         let body = format!(
-            "case \" $* \" in *\" fetch \"*) ( exec >/dev/null 2>&1; while :; do head -c 65536 /dev/zero >> \"$GIT_DIR/objects/pack/pack-late.pack\"; echo > {ack}; sleep 0.05; done ) & echo $! > {p}; until [ -e {ack} ]; do sleep 0.01; done; l=$(ps -o pgid= -p $$ | tr -d ' '); kill -s KILL $l; exit 0;; esac",
+            "case \" $* \" in *\" fetch \"*) ( exec >/dev/null 2>&1; i=0; while [ $i -lt 600 ]; do head -c 65536 /dev/zero >> \"$GIT_DIR/objects/pack/pack-late.pack\"; echo > {ack}; sleep 0.05; i=$((i+1)); done ) & echo $! > {p}; until [ -e {ack} ]; do sleep 0.01; done; l=$(ps -o pgid= -p $$ | tr -d ' '); kill -s KILL $l; exit 0;; esac",
             p = pids.display(),
             ack = ack.display()
         );
         let sh = shim(&t, "killedleader.sh", &body);
         let b = GitBucket::open_full(&url, sh, CHUNK, None, true).unwrap();
         let (out, over) = watched_fetch(&b);
-        let e = out.err().expect("not a success").to_string();
-        assert!(!over && e.contains("supervisor"), "{e}");
-        assert!(no_status_files(&b));
+        // The surviving writer goes first (it also stops on its own after ~30 s),
+        // so a failed assertion below never leaves it running.
         let helper: u32 = std::fs::read_to_string(&pids)
             .unwrap()
             .trim()
@@ -4581,6 +4580,9 @@ mod tests {
             .unwrap();
         kill_pid(helper);
         wait_gone(helper);
+        let e = out.err().expect("not a success").to_string();
+        assert!(!over && e.contains("supervisor"), "{e}");
+        assert!(no_status_files(&b));
     }
 
     /// After its stdin closes the leader must end by its own group kill, which is
