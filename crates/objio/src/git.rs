@@ -109,7 +109,9 @@ fn scrub_shell_env(cmd: &mut Command, extra: &[&str]) {
 }
 
 /// The leader's status file in the private cache directory, removed on drop so
-/// every exit path of a fetch cleans it up.
+/// every exit path of a fetch cleans it up. A leader killed from outside can leave
+/// git running, and git's status line can then appear after the drop; the cache
+/// removal takes it.
 #[cfg_attr(not(unix), allow(dead_code))]
 struct StatusFile(PathBuf);
 
@@ -4370,7 +4372,10 @@ mod tests {
     /// `kill` would be skipped, the background job would leave the group),
     /// `BASH_ENV` and `ENV` startup files, and exported functions that override
     /// `command`, `echo`, `read` and `kill`. The fetch fails with exit 3: its code
-    /// is reported, the helper is dead and no startup file ran.
+    /// is reported, the helper is dead and no startup file ran. Only a bash
+    /// `/bin/sh` (macOS, and the macOS CI job) can fail it: dash ignores these
+    /// variables, and a bash started as `sh` reads neither startup file, so the
+    /// marker check is a guard, not a proof.
     #[cfg(unix)]
     #[test]
     fn a_hostile_shell_environment_does_not_change_the_leader() {

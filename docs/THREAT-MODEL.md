@@ -795,11 +795,14 @@ The bucket model above applies unchanged, with the Git repository as the bucket 
     with its builtin `kill`, itself included, so `ssh`, `git-remote-https`, `index-pack` and
     any helper that outlives git, a smart-HTTP v0/v1 helper chain included, die and cannot
     write after the discard. The group also ends when `sc serve` exits, because the
-    supervisor's stdin closes (a child spawned at the same moment can briefly hold the pipe
-    open on macOS). The supervisor must be seen running when its stdin is closed and to end by
+    supervisor's stdin closes. On macOS a child that another thread spawns at the same moment
+    can inherit the write end of that pipe and hold it for its whole life (std sets
+    close-on-exec there after creating the pipe); the supervisor then sees no end of input,
+    and the fetch fails safe after a 5 s grace with a supervisor error. The supervisor must be seen running when its stdin is closed and to end by
     SIGKILL, its own group kill; if it was killed from outside first, or ends any other way,
     nothing killed the group, so the fetch is an error even if git succeeded (the download is
-    discarded), and helpers still in the group may survive. An outside SIGKILL that lands
+    discarded), and helpers still in the group, git itself included if it is still running,
+    may survive. An outside SIGKILL that lands
     after that check and before the leader's own kill looks the same and is not detected;
     only the serve user or root can send it, never the Git host. Outside serve mode (the unix CLI, Windows) the kill may not reach the
     helper chain that writes the pack, which can keep writing after git is killed, and a helper
