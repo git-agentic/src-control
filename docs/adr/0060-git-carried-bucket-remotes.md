@@ -303,7 +303,11 @@ under a watchdog:
   killed, and neither are the helpers still in the group when the leader died
   before it killed the group (it was killed from outside, so the fetch ends by the
   no-progress deadline or an early exit at the final wait): the fetch fails and
-  those helpers may survive. That is the one case without a second line of defense. If it holds a pipe, the fetch is an error after the shared deadline, and
+  those helpers may survive. One window is not detected: a SIGKILL from outside
+  that reaches the leader after sc saw it running and before its own group kill
+  ends it the same way, so the fetch can report success while such helpers keep
+  running. Only a process with signal rights over the leader (the serve user or
+  root) can send it, never the Git host. That is the one case without a second line of defense. If it holds a pipe, the fetch is an error after the shared deadline, and
   the discard follows; if it closes its pipes and writes into `objects/pack`, the
   watchdog bounds disk only while it measures. The status file is a channel that
   trusts local executables: any process of the same user can write it (the cache

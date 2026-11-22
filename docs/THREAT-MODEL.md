@@ -799,7 +799,9 @@ The bucket model above applies unchanged, with the Git repository as the bucket 
     open on macOS). The supervisor must be seen running when its stdin is closed and to end by
     SIGKILL, its own group kill; if it was killed from outside first, or ends any other way,
     nothing killed the group, so the fetch is an error even if git succeeded (the download is
-    discarded), and helpers still in the group may survive. Outside serve mode (the unix CLI, Windows) the kill may not reach the
+    discarded), and helpers still in the group may survive. An outside SIGKILL that lands
+    after that check and before the leader's own kill looks the same and is not detected;
+    only the serve user or root can send it, never the Git host. Outside serve mode (the unix CLI, Windows) the kill may not reach the
     helper chain that writes the pack, which can keep writing after git is killed, and a helper
     that outlives git is not killed: those cases are not disk-bounded. The call still returns,
     since detached pipe readers keep a surviving helper from blocking it.
