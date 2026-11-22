@@ -1049,16 +1049,15 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
   `update_ref`, remain because only `has_object` may use the memo). Not in scope:
   `ref_guard::check_ref_move` still downloads the old tip's pack to compare kinds
   on every push after the first (bandwidth, not round trips; the idx carries no
-  kind). (4) validated against a private GitHub repository on 2026-11-21 (custom
+  kind). (10) a group-leading supervisor for the serve-mode watchdog (unix:
+  git runs under a `/bin/sh` leader, and the group is killed when the fetch ends,
+  so a helper that stays in git's process group cannot outlive it or write after
+  the discard; a helper that leaves the group with `setsid`, such as an ssh
+  `ControlPersist` master or a credential-cache daemon, escapes; ADR-0060).
+  (4) validated against a private GitHub repository on 2026-11-21 (custom
   refs, lease CAS with one winner of two racing pushers, filtered fetch,
   compaction 18 → 5 refs); still unexercised there: per-push and per-blob limits,
-  rulesets on custom refs, and CAS across GitHub replicas beyond one race. Still
-  deferred: (10) a group-leading supervisor for the serve-mode watchdog: run git
-  under a std-only `sh` leader (`sh -c 'git "$@"; echo $? > <status file>; read
-  _' sh <args>`, stdin piped from sc) so the process group id stays pinned after
-  git exits, and the watchdog can group-kill a helper that outlives git (the
-  post-exit gap ADR-0060 documents: a smart-HTTP v0/v1 helper chain, an ssh
-  `ControlPersist` master) before it closes the leader's stdin and reaps it.
+  rulesets on custom refs, and CAS across GitHub replicas beyond one race.
   Declined, with reasons: (3) rollback and rewind of `refs/sc/manifest` by anyone with push
   access is the cross-cutting signed-ref effort already tracked under P34
   follow-on (6) and ADR-0059 follow-on (2), now reachable by more people; a

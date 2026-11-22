@@ -771,10 +771,10 @@ The bucket model above applies unchanged, with the Git repository as the bucket 
   after it exits, and the measuring goes on while a helper still holds git's pipes and once
   more after they close. Every breach (budget, budget after exit, no progress, a pipe held open
   after exit) stops git, waits up to 5 s for helpers to go and the directory to settle, then
-  discards. The process group is signalled only while git is unreaped, when its pid pins the
-  group id; after the reap it is never signalled, because the id may have been reused by an
-  unrelated process group of the same user and nothing observable shows otherwise (pinning the
-  pid without reaping needs `unsafe`). The limits, plainly:
+  discards; in serve mode a normal exit takes the same stop and settle steps first. sc runs
+  no external `kill` and signals no group id, so a reused group id cannot be hit: in serve mode
+  the group is killed by its `/bin/sh` supervisor's own builtin when its stdin closes.
+  The limits, plainly:
   - The bound is disk bytes per fetch. It does not cover git's memory while `index-pack`
     resolves a pack, and it does not cover the total size of the cache, which grows by what each
     fetch keeps and lives as long as the process. An HTTP daemon opens one cold cache per
@@ -788,19 +788,37 @@ The bucket model above applies unchanged, with the Git repository as the bucket 
     store that has grown past the family budget stays readable and can compact itself. A
     hostile host can force that slower path (one git round trip per key) by serving a big
     family; it cannot lift any per-key cap by doing so.
-  - Only serve mode on unix is disk-bounded against a hostile HTTP host, and only while git
-    runs. There git runs in its own process group and the whole group is killed while git is
-    unreaped (through the system `kill`; without one the watchdog warns once and kills git
-    alone), so `ssh`, `git-remote-https` and `index-pack` die with it. Outside serve mode (the
-    unix CLI, Windows), and possibly against a smart-HTTP host on protocol v0 or v1, the kill may
-    not reach the helper chain that writes the pack, which can keep writing after git is killed:
-    those cases are not disk-bounded. The call still returns, since detached pipe readers keep a
-    surviving helper from blocking it.
-  - A helper that outlives git's exit (a smart-HTTP v0/v1 helper chain, an ssh `ControlPersist`
-    master, a hostile process) is not killed in any mode, because the process group is never
-    signalled after the leader is reaped. It may keep writing after the discard until it exits.
-  - A fetch in its own process group outlives a killed `sc serve`; a supervisor that kills the
-    whole cgroup covers it.
+  - Only serve mode on unix is disk-bounded against a hostile HTTP host. There git runs under
+    a `/bin/sh` supervisor that leads its process group, holds a stdin pipe only sc has, and
+    writes git's exit code to a status file in the private cache directory. When the fetch ends
+    (a normal exit or any breach) sc closes that pipe and the supervisor kills the whole group
+    with its builtin `kill`, itself included, so `ssh`, `git-remote-https`, `index-pack` and
+    any helper that outlives git, a smart-HTTP v0/v1 helper chain included, die and cannot
+    write after the discard. The group also ends when `sc serve` exits, because the
+    supervisor's stdin closes. On macOS a child that another thread spawns at the same moment
+    can inherit the write end of that pipe and hold it for its whole life (std sets
+    close-on-exec there after creating the pipe); the supervisor then sees no end of input,
+    and the fetch fails safe after a 5 s grace with a supervisor error. The supervisor must be seen running when its stdin is closed and to end by
+    SIGKILL, its own group kill; if it was killed from outside first, or ends any other way,
+    nothing killed the group, so the fetch is an error even if git succeeded (the download is
+    discarded), and helpers still in the group, git itself included if it is still running,
+    may survive. An outside SIGKILL that lands
+    after that check and before the leader's own kill looks the same and is not detected;
+    only the serve user or root can send it, never the Git host. Outside serve mode (the unix CLI, Windows) the kill may not reach the
+    helper chain that writes the pack, which can keep writing after git is killed, and a helper
+    that outlives git is not killed: those cases are not disk-bounded. The call still returns,
+    since detached pipe readers keep a surviving helper from blocking it.
+  - A process that leaves git's process group (`setsid`: an ssh `ControlPersist` master, a
+    credential-cache daemon, a hostile process) escapes serve mode's kill. If it holds git's
+    pipes the fetch fails after the shared deadline; if it closes them and writes into
+    `objects/pack`, only the measuring bounds it.
+  - The status file trusts local executables: any process running as the user can write it, and
+    a forged exit code ends the fetch early with no new authority. git is run by the supervisor
+    through `command --` with the `SC_GIT` program resolved by `/bin/sh` (a bare name through the
+    PATH, a path as is). The supervisor's environment loses `SHELLOPTS`, `BASHOPTS`, `BASH_ENV`,
+    `ENV` and every `BASH_FUNC_*`, so a hostile parent environment cannot change the shell's
+    behavior or override its builtins with exported functions. Each fetch costs an extra `sh` and
+    about 20 ms.
   - Only fetches are watched. `ls-remote` and push run unwatched: over HTTP
     `http.lowSpeedLimit`/`lowSpeedTime` bound them, over ssh the operator should set
     `ServerAliveInterval` for the daemon's ssh user.

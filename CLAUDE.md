@@ -266,14 +266,24 @@ transport-adjacent. The rest, imperatively:
   instance, so a big store can still compact) or after 120 s with no progress,
   what it added removed. The bound is disk per fetch, not
   RAM inside `index-pack`, not the total cache, and not the refs a family fetch
-  writes. Only serve mode on unix bounds disk against a hostile HTTP host: it runs
-  git in its own process group and kills the group through the system `kill`,
-  but only while git is unreaped (after the reap the group id may have been
-  reused, so it is never signalled; `may_signal_group`). Without a `kill` it
-  warns once and kills git alone. The CLI and Windows kill git alone, and the
+  writes. Only serve mode on unix bounds disk against a hostile HTTP host: git
+  runs under a `/bin/sh` group leader that holds a stdin pipe only sc has and
+  writes git's exit code to `<cache>/.fetch-status-<n>`; when the fetch ends (a
+  normal exit or any breach) sc closes the pipe and the leader kills the whole
+  group with its builtin `kill`, so every helper that stays in git's process
+  group, including one that outlives git, dies (the group also ends when `sc serve`
+  exits, since the leader's stdin closes). That builtin is the only group kill: sc
+  runs no external `kill` and signals no group id. The leader must be seen running
+  when its stdin closes and to end by SIGKILL (its own group kill); otherwise
+  (killed from outside first, another exit, or still there after 5 s) the fetch is
+  an error even if git succeeded, and its helpers may survive. 126 or 127 from `/bin/sh` is the "cannot run
+  git" error. A helper that leaves the group (`setsid`: an ssh `ControlPersist`
+  master, a credential-cache daemon) escapes; the status file trusts local
+  executables; `SC_GIT` is resolved by `/bin/sh` through `command --`, with
+  `SHELLOPTS`, `BASHOPTS`, `BASH_ENV`, `ENV` and `BASH_FUNC_*` removed from its
+  environment (so no shell functions). The CLI and Windows spawn git directly and kill git alone, and the
   helpers that write the pack may keep writing; so may any helper that outlives
-  git's exit, in any mode, until it exits. Only fetches are watched; `ls-remote`
-  and push are not.
+  git's exit there. Only fetches are watched; `ls-remote` and push are not.
 - **`DirBucket` (`sc+wal://<dir>`) is a single-host, single-owner backend (#264).**
   Its CAS takes an OS advisory file lock (`File::lock`: `flock` on unix,
   `LockFileEx` on Windows) on `<root>/.cas-lock`, a file that is never removed and
