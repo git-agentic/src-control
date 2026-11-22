@@ -4339,7 +4339,15 @@ mod tests {
 
         // The holder going away (a killed server) is what frees the cache.
         drop(held);
-        assert_eq!(GitBucket::reap_stale(&parent), 1);
+        // A child another test thread is forking can hold a copy of the lock's
+        // descriptor until its exec closes it, so the lock frees a moment later.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut reaped = GitBucket::reap_stale(&parent);
+        while reaped == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            reaped = GitBucket::reap_stale(&parent);
+        }
+        assert_eq!(reaped, 1);
         assert!(!held_dir.exists());
         // So does dropping a bucket: it removes its own directory.
         let cache = a.cache.clone();
