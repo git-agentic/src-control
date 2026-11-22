@@ -771,12 +771,9 @@ The bucket model above applies unchanged, with the Git repository as the bucket 
   after it exits, and the measuring goes on while a helper still holds git's pipes and once
   more after they close. Every breach (budget, budget after exit, no progress, a pipe held open
   after exit) stops git, waits up to 5 s for helpers to go and the directory to settle, then
-  discards; in serve mode a normal exit takes the same stop and settle steps first. The
-  process group is signalled only while its leader is unreaped, when the leader's pid pins the
-  group id; after the reap it is never signalled, because the id may have been reused by an
-  unrelated process group of the same user and nothing observable shows otherwise (pinning the
-  pid without reaping needs `unsafe`). In serve mode the leader is a `/bin/sh` supervisor that
-  sc never waits for before the group is dead, so that is always the case until the final reap.
+  discards; in serve mode a normal exit takes the same stop and settle steps first. sc runs
+  no external `kill` and signals no group id, so a reused group id cannot be hit: in serve mode
+  the group is killed by its `/bin/sh` supervisor's own builtin when its stdin closes.
   The limits, plainly:
   - The bound is disk bytes per fetch. It does not cover git's memory while `index-pack`
     resolves a pack, and it does not cover the total size of the cache, which grows by what each
@@ -795,16 +792,16 @@ The bucket model above applies unchanged, with the Git repository as the bucket 
     a `/bin/sh` supervisor that leads its process group, holds a stdin pipe only sc has, and
     writes git's exit code to a status file in the private cache directory. When the fetch ends
     (a normal exit or any breach) sc closes that pipe and the supervisor kills the whole group
-    with its builtin `kill`, itself included; the system `kill` signals the group too, as a
-    backup while the supervisor is unreaped (without one the watchdog warns once). So `ssh`,
-    `git-remote-https`, `index-pack` and any helper that outlives git, a smart-HTTP v0/v1
-    helper chain included, die and cannot write after the discard. The group also ends when
-    `sc serve` exits, because the supervisor's stdin closes (if the supervisor itself was
-    killed first only the backup `kill` remains, and a child spawned at the same moment can
-    briefly hold the pipe open on macOS). Outside serve mode (the unix CLI, Windows) the kill may not reach the
+    with its builtin `kill`, itself included, so `ssh`, `git-remote-https`, `index-pack` and
+    any helper that outlives git, a smart-HTTP v0/v1 helper chain included, die and cannot
+    write after the discard. The group also ends when `sc serve` exits, because the
+    supervisor's stdin closes (a child spawned at the same moment can briefly hold the pipe
+    open on macOS). If the supervisor itself was killed from outside first, nothing kills the
+    group: the fetch fails (no status, then the no-progress deadline) and helpers still in the
+    group may survive. Outside serve mode (the unix CLI, Windows) the kill may not reach the
     helper chain that writes the pack, which can keep writing after git is killed, and a helper
-    that outlives git is not killed: those cases are not disk-bounded. The call still returns, since detached pipe
-    readers keep a surviving helper from blocking it.
+    that outlives git is not killed: those cases are not disk-bounded. The call still returns,
+    since detached pipe readers keep a surviving helper from blocking it.
   - A process that leaves git's process group (`setsid`: an ssh `ControlPersist` master, a
     credential-cache daemon, a hostile process) escapes serve mode's kill. If it holds git's
     pipes the fetch fails after the shared deadline; if it closes them and writes into
@@ -814,8 +811,8 @@ The bucket model above applies unchanged, with the Git repository as the bucket 
     through `command --` with the `SC_GIT` program resolved by `/bin/sh` (a bare name through the
     PATH, a path as is). The supervisor's environment loses `SHELLOPTS`, `BASHOPTS`, `BASH_ENV`,
     `ENV` and every `BASH_FUNC_*`, so a hostile parent environment cannot change the shell's
-    behavior or override its builtins with exported functions. Each fetch costs an extra `sh`, a
-    `kill` spawn and about 20 ms.
+    behavior or override its builtins with exported functions. Each fetch costs an extra `sh` and
+    about 20 ms.
   - Only fetches are watched. `ls-remote` and push run unwatched: over HTTP
     `http.lowSpeedLimit`/`lowSpeedTime` bound them, over ssh the operator should set
     `ServerAliveInterval` for the daemon's ssh user.

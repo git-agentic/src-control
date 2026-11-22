@@ -272,26 +272,19 @@ under a watchdog:
   on purpose: with a `{ ...; } &` group bash execs the command in place and the
   status line never runs. It was checked on `/bin/sh`, `dash`, `bash` and `zsh`
   (exit code propagated, group killed at stdin close, also mid-run).
-- sc never waits for the leader before the group is dead. It learns git's exit
-  from the status file (one to three ASCII digits and a newline, at most 255;
-  anything else, such as a partial write, counts as not yet), so the leader stays
-  unreaped and its pid keeps pinning the group id. A reaped leader would free the
-  id for reuse by an unrelated process group of the same user, and pinning a pid
-  without reaping it needs `waitid(WNOWAIT)`, which is `unsafe` and not allowed
-  here. A leader that dies early writes no status; the no-progress deadline ends
-  the fetch. Every end of a fetch, a normal exit or any breach, takes the same
-  steps: close the stdin pipe; signal the group through the system `kill` as a
-  backup while the leader is still unreaped (`may_signal_group`; it also reaches
-  helpers when the leader died before it saw the end of input); reap the leader,
-  within a bound; then settle and measure as below. After a successful fetch the
-  group is killed too, so every helper that stays in git's process group, a
-  smart-HTTP v0/v1 helper chain included, dies when git exits and cannot write
-  after the discard. After the reap the group is never signalled. `kill` is only
-  the backup: without it a warning is printed once and the leader's own `kill 0`
-  still ends the group, unless the leader died early. The backup is waited for at
-  most 2 s and then killed, and the leader gets 5 s to exit before it is killed
-  itself. Each serve-mode fetch costs an extra `sh`, a `kill` spawn and about
-  20 ms of settle time.
+- sc learns git's exit from the status file (one to three ASCII digits and a
+  newline, at most 255; anything else, such as a partial write, counts as not
+  yet), because the leader does not exit when git does: it waits for its stdin. A
+  leader that dies early writes no status; the no-progress deadline ends the
+  fetch. Every end of a fetch, a normal exit or any breach, takes the same steps:
+  close the stdin pipe, which makes the leader kill the group; give the leader 5 s
+  to exit, then kill it alone; reap it; then settle and measure as below. After a
+  successful fetch the group is killed too, so every helper that stays in git's
+  process group, a smart-HTTP v0/v1 helper chain included, dies when git exits and
+  cannot write after the discard. The leader's builtin `kill` is the only group
+  kill: sc runs no external `kill` program and signals no group id, so a reused
+  group id cannot be hit and the platform needs no `kill` on the PATH. Each
+  serve-mode fetch costs an extra `sh` and about 20 ms of settle time.
 - A `/bin/sh` exit status of 126 or 127 means `command` could not run git and
   gives the usual "cannot run git (...): install git or set SC_GIT" error, with
   git's own message. A missing `/bin/sh` is reported as that. A git killed by
@@ -299,7 +292,10 @@ under a watchdog:
   leader says.
 - What escapes, and what is trusted. A process that leaves git's group with
   `setsid` (an ssh `ControlPersist` master, a credential-cache daemon) is not
-  killed. If it holds a pipe, the fetch is an error after the shared deadline, and
+  killed, and neither are the helpers still in the group when the leader died
+  before it killed the group (it was killed from outside, so the fetch ends by the
+  no-progress deadline or an early exit at the final wait): the fetch fails and
+  those helpers may survive. That is the one case without a second line of defense. If it holds a pipe, the fetch is an error after the shared deadline, and
   the discard follows; if it closes its pipes and writes into `objects/pack`, the
   watchdog bounds disk only while it measures. The status file is a channel that
   trusts local executables: any process of the same user can write it (the cache
@@ -333,10 +329,9 @@ The exact limits:
   watchdog still frees the call.
 - The leader kills the group when its stdin closes, which happens when sc drops the
   pipe or exits, so a group normally ends with `sc serve`. If the leader itself is
-  killed first, only the backup `kill` remains, and a dead `sc serve` runs none.
-  On macOS a child spawned concurrently by another thread can briefly inherit the
-  stdin write end, which delays the end of input until it execs. A process that
-  left the group outlives all of this.
+  killed first, nothing kills the group. On macOS a child spawned concurrently by
+  another thread can briefly inherit the stdin write end, which delays the end of
+  input until it execs. A process that left the group outlives all of this.
 
 ### Private-branch opt-in
 
