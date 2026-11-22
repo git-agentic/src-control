@@ -798,8 +798,10 @@ The bucket model above applies unchanged, with the Git repository as the bucket 
     with its builtin `kill`, itself included; the system `kill` signals the group too, as a
     backup while the supervisor is unreaped (without one the watchdog warns once). So `ssh`,
     `git-remote-https`, `index-pack` and any helper that outlives git, a smart-HTTP v0/v1
-    helper chain included, die and cannot write after the discard, and a group also dies when
-    `sc serve` itself does. Outside serve mode (the unix CLI, Windows) the kill may not reach the
+    helper chain included, die and cannot write after the discard. The group also ends when
+    `sc serve` exits, because the supervisor's stdin closes (if the supervisor itself was
+    killed first only the backup `kill` remains, and a child spawned at the same moment can
+    briefly hold the pipe open on macOS). Outside serve mode (the unix CLI, Windows) the kill may not reach the
     helper chain that writes the pack, which can keep writing after git is killed, and a helper
     that outlives git is not killed: those cases are not disk-bounded. The call still returns, since detached pipe
     readers keep a surviving helper from blocking it.
@@ -809,8 +811,11 @@ The bucket model above applies unchanged, with the Git repository as the bucket 
     `objects/pack`, only the measuring bounds it.
   - The status file trusts local executables: any process running as the user can write it, and
     a forged exit code ends the fetch early with no new authority. git is run by the supervisor
-    through `command` with the `SC_GIT` program resolved by `/bin/sh` (a bare name through the
-    PATH, a path as is; shell functions are skipped).
+    through `command --` with the `SC_GIT` program resolved by `/bin/sh` (a bare name through the
+    PATH, a path as is). The supervisor's environment loses `SHELLOPTS`, `BASHOPTS`, `BASH_ENV`,
+    `ENV` and every `BASH_FUNC_*`, so a hostile parent environment cannot change the shell's
+    behavior or override its builtins with exported functions. Each fetch costs an extra `sh`, a
+    `kill` spawn and about 20 ms.
   - Only fetches are watched. `ls-remote` and push run unwatched: over HTTP
     `http.lowSpeedLimit`/`lowSpeedTime` bound them, over ssh the operator should set
     `ServerAliveInterval` for the daemon's ssh user.

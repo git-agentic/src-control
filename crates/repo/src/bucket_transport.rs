@@ -342,10 +342,10 @@ impl BucketTransport {
 
     /// Open the store behind `sc serve --store` (ADR-0060). For `sc+wal://` and
     /// `sc+s3://` this is [`BucketTransport::open`]. For `sc+git::` the Git
-    /// cache lives under `scratch` (the serve home's `.sc/tmp/`), every fetch
-    /// call runs under a supervisor that leads its own process group and kills
-    /// it when the call ends (a stuck `ssh`, `git-remote-https` or any helper
-    /// that stays in the group dies with git), and private-branch
+    /// cache lives under `scratch` (the serve home's `.sc/tmp/`), on unix every
+    /// fetch call runs under a supervisor that leads its own process group and
+    /// kills it when the call ends (a stuck `ssh`, `git-remote-https` or any
+    /// helper that stays in the group dies with git), and private-branch
     /// objects are refused unless `allow_private_branches` is set: a Git host
     /// shows the branch name, recipient ids and sizes to every reader and keeps
     /// the ciphertext, so the opt-in belongs to the operator, not to a client.

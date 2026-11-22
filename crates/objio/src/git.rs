@@ -74,13 +74,39 @@ const SETTLE: Duration = Duration::from_secs(5);
 /// <args...>`. It runs git in a subshell with stdin from `/dev/null` and writes
 /// git's exit code to the status file, drops its own stdout and stderr so only
 /// git and its helpers hold the pipes, then blocks reading its stdin, which only
-/// sc holds. When sc closes that pipe (or dies) it kills its whole group, itself
-/// included, with the builtin `kill`: no group id and no external program are
-/// involved. The parentheses matter: a `{ ...; } &` group lets bash exec the
-/// command in place and the status line never runs. `command` skips shell
-/// functions, so an exported `BASH_FUNC_*` cannot stand in for git.
+/// sc holds. When that pipe closes (sc dropped it, or exited) it kills its whole
+/// group, itself included, with the builtin `kill`: no group id and no external
+/// program are involved. The parentheses matter: a `{ ...; } &` group lets bash
+/// exec the command in place and the status line never runs. `|| r=$?` and
+/// `|| :` keep the status write and the final `kill` alive under `errexit`;
+/// `command --` skips shell functions and takes a program named like an option.
+/// The shell's own startup state is removed from its environment
+/// ([`scrub_shell_env`]), because it would change all of that.
 #[cfg_attr(not(unix), allow(dead_code))]
-const LEADER: &str = "s=$1; shift; ( command \"$@\" </dev/null; echo $? >\"$s\" ) & exec >/dev/null 2>&1; read _; kill -s KILL 0";
+const LEADER: &str = "s=$1; shift; ( r=0; command -- \"$@\" </dev/null || r=$?; echo $r >\"$s\" ) & exec >/dev/null 2>&1; read _ || :; kill -s KILL 0";
+
+/// Remove from `cmd` what makes a POSIX shell behave differently from the
+/// [`LEADER`] script: `SHELLOPTS` (`monitor` moves the background job into
+/// another process group, `errexit` skips the status line), `BASHOPTS`,
+/// `BASH_ENV` and `ENV` (startup files), and every exported function
+/// (`BASH_FUNC_*`), which would override `command`, `echo`, `read` or `kill`.
+/// `extra` names variables a test put on the command and the scrub must also
+/// catch.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn scrub_shell_env(cmd: &mut Command, extra: &[&str]) {
+    let names: Vec<OsString> = std::env::vars_os()
+        .map(|(k, _)| k)
+        .chain(extra.iter().map(OsString::from))
+        .collect();
+    for k in names {
+        let s = k.to_string_lossy();
+        if matches!(&*s, "SHELLOPTS" | "BASHOPTS" | "BASH_ENV" | "ENV")
+            || s.starts_with("BASH_FUNC_")
+        {
+            cmd.env_remove(&k);
+        }
+    }
+}
 
 /// The leader's status file in the private cache directory, removed on drop so
 /// every exit path of a fetch cleans it up.
@@ -136,12 +162,15 @@ struct Exit {
     code: Option<i32>,
 }
 
-/// An exit code for error text. A git killed by signal `n` reports `128 + n`
-/// through the serve-mode leader and no code at all when run directly.
-fn describe_code(code: Option<i32>) -> String {
-    match code {
+/// An exit code for error text. A git killed by signal `n` has no code when run
+/// directly and reports `128 + n` through the serve-mode leader, which only
+/// that case's text says (`led`).
+fn describe_exit(out: &Out) -> String {
+    match out.code {
         None => "signal".to_string(),
-        Some(c) if c > 128 => format!("{c} (128 + signal {}, if git was killed)", c - 128),
+        Some(c) if out.led && c > 128 => {
+            format!("{c} (128 + signal {}, if git was killed)", c - 128)
+        }
         Some(c) => c.to_string(),
     }
 }
@@ -281,6 +310,8 @@ struct Known {
 struct Out {
     success: bool,
     code: Option<i32>,
+    /// Run by the serve-mode leader, whose status reports a signal as `128 + n`.
+    led: bool,
     stdout: Vec<u8>,
     stderr: String,
 }
@@ -309,6 +340,10 @@ struct Tuning {
     /// the supervisor's own kill (tests point it at a missing one).
     #[cfg(unix)]
     kill: &'static str,
+    /// Variables put on the serve-mode leader's command before its environment
+    /// is scrubbed, standing in for a hostile parent environment (tests only).
+    #[cfg(unix)]
+    leader_env: &'static [(&'static str, &'static str)],
 }
 
 impl Default for Tuning {
@@ -320,6 +355,8 @@ impl Default for Tuning {
             poll: None,
             #[cfg(unix)]
             kill: "kill",
+            #[cfg(unix)]
+            leader_env: &[],
         }
     }
 }
@@ -569,17 +606,30 @@ fn may_signal_group(leader_reaped: bool) -> bool {
 
 /// Signal every process of group `pgid` with SIGKILL through the system `kill`.
 /// False only when that program cannot be run; a non-zero exit (the group is
-/// already gone) is fine.
+/// already gone) is fine. The program is waited for at most 2 s and then killed,
+/// so a `kill` that hangs cannot park the caller.
 #[cfg(unix)]
 fn kill_group(program: &str, pgid: u32) -> bool {
-    Command::new(program)
+    let Ok(mut c) = Command::new(program)
         .args(["-s", "KILL", "--"])
         .arg(format!("-{pgid}"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .is_ok()
+        .spawn()
+    else {
+        return false;
+    };
+    let end = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < end {
+        if !matches!(c.try_wait(), Ok(None)) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let _ = c.kill();
+    let _ = c.wait();
+    true
 }
 
 /// Set once a missing `kill` has been reported.
@@ -976,6 +1026,7 @@ impl GitBucket {
         Ok(Out {
             success: status.success(),
             code: status.code(),
+            led: false,
             stdout,
             stderr: self.scrub(&String::from_utf8_lossy(&stderr)),
         })
@@ -1021,7 +1072,17 @@ impl GitBucket {
                 sh.args(["-c", LEADER, "sc-fetch"])
                     .arg(&sf.0)
                     .arg(&self.git);
-                self.hardened(sh, args, &[], true)
+                let mut sh = self.hardened(sh, args, &[], true);
+                #[cfg(unix)]
+                for (k, v) in self.tune.leader_env {
+                    sh.env(k, v);
+                }
+                #[cfg(unix)]
+                let extra: Vec<&str> = self.tune.leader_env.iter().map(|(k, _)| *k).collect();
+                #[cfg(not(unix))]
+                let extra: Vec<&str> = Vec::new();
+                scrub_shell_env(&mut sh, &extra);
+                sh
             }
             None => self.command(args, &[], false),
         };
@@ -1029,7 +1090,15 @@ impl GitBucket {
         if status_file.is_some() {
             std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
         }
-        let mut child = self.spawn(&mut cmd)?;
+        let mut child = if status_file.is_some() {
+            cmd.spawn().map_err(|e| {
+                Error::Backend(format!(
+                    "cannot run /bin/sh, which supervises git in serve mode: {e}"
+                ))
+            })?
+        } else {
+            self.spawn(&mut cmd)?
+        };
         let mut lead_in = child.stdin.take();
         let mut sout = child.stdout.take().expect("piped");
         let mut serr = child.stderr.take().expect("piped");
@@ -1155,15 +1224,16 @@ impl GitBucket {
                 self.tune.idle
             )));
         }
+        let (stdout, over) = readers.got_out.take().unwrap_or_default();
+        let stderr = readers.got_err.take().unwrap_or_default();
         // `command` reports a git it cannot find or start as 127 or 126.
         if let (Some(_), Some(c @ (126 | 127))) = (&status_file, exit.code) {
             return Err(Error::Backend(format!(
-                "cannot run git ({}): the shell exited with status {c} (install git or set SC_GIT)",
-                self.git
+                "cannot run git ({}): exit status {c}: {} (install git or set SC_GIT)",
+                self.git,
+                self.scrub(&String::from_utf8_lossy(&stderr))
             )));
         }
-        let (stdout, over) = readers.got_out.take().unwrap_or_default();
-        let stderr = readers.got_err.take().unwrap_or_default();
         if over {
             return Err(Error::Backend(format!(
                 "git output exceeded {max_out} bytes (hostile or corrupt remote)"
@@ -1172,6 +1242,7 @@ impl GitBucket {
         Ok(Out {
             success: exit.success,
             code: exit.code,
+            led: status_file.is_some(),
             stdout,
             stderr: self.scrub(&String::from_utf8_lossy(&stderr)),
         })
@@ -1308,7 +1379,7 @@ impl GitBucket {
     fn fail(&self, what: &str, out: &Out) -> Error {
         Error::Backend(format!(
             "git {what} failed (exit {}): {}",
-            describe_code(out.code),
+            describe_exit(out),
             out.stderr
         ))
     }
@@ -1464,7 +1535,7 @@ impl GitBucket {
                 .unwrap_or_default();
             Ok(Pushed::Refused(format!(
                 "git push failed (exit {}): {} {}",
-                describe_code(out.code),
+                describe_exit(&out),
                 out.stderr,
                 first
             )))
@@ -2316,7 +2387,7 @@ impl Bucket for GitBucket {
                 .unwrap_or_default();
             let refusal = format!(
                 "git push failed (exit {}): {} {}",
-                describe_code(out.code),
+                describe_exit(&out),
                 out.stderr,
                 first
             );
@@ -4105,11 +4176,19 @@ mod tests {
     /// process group (macOS has no `setsid` program).
     #[cfg(unix)]
     fn have_setsid_perl() -> bool {
-        Command::new("perl")
-            .args(["-MPOSIX", "-e", "POSIX::setsid(); exit 0"])
+        // Run like the fixture: as a background child, never a group leader.
+        Command::new("sh")
+            .args(["-c", &format!("{PERL_SETSID} exit 0' & wait $!")])
             .status()
             .is_ok_and(|s| s.success())
     }
+
+    /// The start of a perl one-liner that leaves the process group: it needs a
+    /// positive session id (`setsid` fails with undef or -1 otherwise). The
+    /// caller closes the quote.
+    #[cfg(unix)]
+    const PERL_SETSID: &str =
+        "perl -MPOSIX -e 'my $s = POSIX::setsid(); exit 1 unless defined $s && $s > 0;";
 
     /// Shell text that starts `cmd` in the background in a new session, so it
     /// leaves git's process group, and then waits until it has: the perl wrapper
@@ -4117,7 +4196,7 @@ mod tests {
     #[cfg(unix)]
     fn escaped(cmd: &str, pids: &Path) -> String {
         format!(
-            "perl -MPOSIX -e 'POSIX::setsid() or exit 1; open(F, \">\", shift); print F \"$$\\n\"; close F; exec @ARGV' {p} {cmd} & until [ -s {p} ]; do sleep 0.01; done;",
+            "{PERL_SETSID} open(F, \">\", shift); print F \"$$\\n\"; close F; exec @ARGV' {p} {cmd} & i=0; until [ -s {p} ] || [ $i -ge 500 ]; do sleep 0.01; i=$((i+1)); done;",
             p = pids.display()
         )
     }
@@ -4238,15 +4317,20 @@ mod tests {
         }
     }
 
-    /// A `kill` stand-in that records its arguments and then really kills:
-    /// returns the program path and the log it appends to.
+    /// A `kill` stand-in that records its arguments and the state of the group
+    /// leader at that moment (`leader=` the `ps` state of the pid the group id
+    /// names, empty when it is gone; a zombie counts as there) and then really
+    /// kills: returns the program path and the log it appends to.
     #[cfg(unix)]
     fn recording_kill(t: &Tmp) -> (&'static str, PathBuf) {
         let log = t.0.join("kill.log");
         let sh = shim_script(
             t,
             "killrec.sh",
-            &format!("echo \"$@\" >> {}\nexec kill \"$@\"\n", log.display()),
+            &format!(
+                "echo \"$@ leader=$(ps -o stat= -p ${{4#-}} | tr -d ' ')\" >> {}\nexec kill \"$@\"\n",
+                log.display()
+            ),
         );
         (Box::leak(sh.into_boxed_str()), log)
     }
@@ -4291,6 +4375,10 @@ mod tests {
                 calls.lines().count(),
                 1,
                 "one signal while the leader is unreaped, none after: {calls:?}"
+            );
+            assert!(
+                !calls.trim_end().ends_with("leader="),
+                "the leader must still exist (unreaped) when it is signalled: {calls:?}"
             );
             if helper_holds_pipes {
                 let pid: u32 = std::fs::read_to_string(&pids)
@@ -4365,28 +4453,33 @@ mod tests {
     /// one that closed its pipes and keeps writing into `objects/pack`: it is dead
     /// afterwards and the directory stops growing. The download is discarded only
     /// where it crossed the budget (the second case: git exits at once, a fast
-    /// writer crosses the budget before the first poll that sees the exit).
+    /// writer crosses the budget before the first poll that sees the exit). The
+    /// writer acknowledges its first write before git exits. With the backup
+    /// `kill` missing the leader's own `kill 0` does the same.
     #[cfg(unix)]
     #[test]
     fn a_helper_that_closes_its_pipes_and_keeps_writing_is_dead_after_git_exits() {
         need_git!();
-        for (budget, crosses) in [(32u64 << 20, false), (1 << 20, true)] {
+        for (budget, crosses, backup) in [
+            (32u64 << 20, false, true),
+            (1 << 20, true, true),
+            (32 << 20, false, false),
+            (1 << 20, true, false),
+        ] {
             let t = Tmp::new("quietwriter");
             let (_, url) = hub(&t);
             let pids = t.0.join("pids");
-            let (pause, hold) = if crosses {
-                ("0.01", "")
-            } else {
-                ("0.05", "sleep 0.4;")
-            };
+            let ack = t.0.join("ack");
+            let pause = if crosses { "0.01" } else { "0.05" };
             let body = format!(
-                "case \" $* \" in *\" fetch \"*) ( exec >/dev/null 2>&1; while :; do head -c 65536 /dev/zero >> \"$GIT_DIR/objects/pack/pack-late.pack\"; sleep {pause}; done ) & echo $! > {}; {hold} exit 0;; esac",
-                pids.display()
+                "case \" $* \" in *\" fetch \"*) ( exec >/dev/null 2>&1; head -c 65536 /dev/zero >> \"$GIT_DIR/objects/pack/pack-late.pack\"; echo > {ack}; while :; do head -c 65536 /dev/zero >> \"$GIT_DIR/objects/pack/pack-late.pack\"; sleep {pause}; done ) & echo $! > {p}; until [ -e {ack} ]; do sleep 0.01; done; exit 0;; esac",
+                p = pids.display(),
+                ack = ack.display()
             );
             let sh = shim(&t, "quiet.sh", &body);
             let mut b = GitBucket::open_full(&url, sh, CHUNK, None, true).unwrap();
             let (kill, killed) = recording_kill(&t);
-            b.tune.kill = kill;
+            b.tune.kill = if backup { kill } else { "/no/such/kill" };
             b.tune.budget = Some(budget);
             if crosses {
                 b.tune.poll = Some(Duration::from_millis(1500));
@@ -4406,7 +4499,7 @@ mod tests {
             // The group is ended by git's exit, not left to the pipe closing when
             // the call returns: the backup signal went out exactly once.
             let calls = std::fs::read_to_string(&killed).unwrap_or_default();
-            assert_eq!(calls.lines().count(), 1, "{calls:?}");
+            assert_eq!(calls.lines().count(), usize::from(backup), "{calls:?}");
             if crosses {
                 assert!(over && out.is_err(), "crossed the budget: an error");
                 assert!(dir_files(&pack).is_empty(), "and the download is discarded");
@@ -4449,6 +4542,94 @@ mod tests {
         assert!(no_status_files(&b));
     }
 
+    /// A parent environment that changes how a POSIX shell behaves must not reach
+    /// the leader: `SHELLOPTS=errexit:monitor` (the status line and the final
+    /// `kill` would be skipped, the background job would leave the group),
+    /// `BASH_ENV` and `ENV` startup files, and exported functions that override
+    /// `command`, `echo`, `read` and `kill`. The fetch fails with exit 3: its code
+    /// is reported, the helper is dead and no startup file ran.
+    #[cfg(unix)]
+    #[test]
+    fn a_hostile_shell_environment_does_not_change_the_leader() {
+        need_git!();
+        let t = Tmp::new("hostileenv");
+        let (_, url) = hub(&t);
+        let pids = t.0.join("pids");
+        let marker = t.0.join("marker");
+        let startup = shim_script(
+            &t,
+            "startup.sh",
+            &format!("echo ran > {}\n", marker.display()),
+        );
+        let startup: &'static str = Box::leak(startup.into_boxed_str());
+        let body = format!(
+            "case \" $* \" in *\" fetch \"*) sleep 600 & echo $! > {}; exit 3;; esac",
+            pids.display()
+        );
+        let sh = shim(&t, "hostile.sh", &body);
+        let mut b = GitBucket::open_full(&url, sh, CHUNK, None, true).unwrap();
+        b.tune.leader_env = Box::leak(Box::new([
+            ("SHELLOPTS", "errexit:monitor"),
+            ("BASHOPTS", "login_shell"),
+            ("BASH_ENV", startup),
+            ("ENV", startup),
+            ("BASH_FUNC_echo%%", "() { :; }"),
+            ("BASH_FUNC_kill%%", "() { :; }"),
+            ("BASH_FUNC_read%%", "() { :; }"),
+            ("BASH_FUNC_command%%", "() { :; }"),
+        ]));
+        let (out, over) = watched_fetch(&b);
+        let out = out.unwrap();
+        assert!(
+            !over && !out.success && out.code == Some(3),
+            "{:?}",
+            out.code
+        );
+        let helper: u32 = std::fs::read_to_string(&pids)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        wait_gone(helper);
+        assert!(!marker.exists(), "a startup file ran in the leader");
+        assert!(no_status_files(&b));
+    }
+
+    /// A `kill` program that hangs cannot park a breach: it is waited for a
+    /// bounded time and killed, and the leader's own `kill 0` still ends the
+    /// group.
+    #[cfg(unix)]
+    #[test]
+    fn a_hanging_kill_program_is_bounded() {
+        need_git!();
+        let t = Tmp::new("hangkill");
+        let (_, url) = hub(&t);
+        let pids = t.0.join("pids");
+        let body = format!(
+            "case \" $* \" in *\" fetch \"*) sleep 600 & echo $! > {}; while :; do head -c 65536 /dev/zero >> \"$GIT_DIR/objects/pack/tmp_pack_x\"; sleep 0.01; done;; esac",
+            pids.display()
+        );
+        let sh = shim(&t, "hangrun.sh", &body);
+        let mut b = GitBucket::open_full(&url, sh, CHUNK, None, true).unwrap();
+        let hang = shim_script(&t, "hangkill.sh", "exec sleep 600\n");
+        b.tune.kill = Box::leak(hang.into_boxed_str());
+        b.tune.budget = Some(1 << 20);
+        let started = Instant::now();
+        let e = get_err(&b, "manifest");
+        assert!(e.contains("1048576 bytes"), "{e}");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+        let helper: u32 = std::fs::read_to_string(&pids)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        wait_gone(helper);
+    }
+
     /// git's exit code reaches the caller through the leader (a failing fetch is
     /// `!success` with that code), and a git killed by a signal reads as 128 + n.
     /// The CLI reports the same codes, and no code for a signal.
@@ -4481,12 +4662,21 @@ mod tests {
                 assert!(no_status_files(&b));
             }
         }
+        let out = |code, led| Out {
+            success: false,
+            code,
+            led,
+            stdout: Vec::new(),
+            stderr: String::new(),
+        };
         assert_eq!(
-            describe_code(Some(137)),
+            describe_exit(&out(Some(137), true)),
             "137 (128 + signal 9, if git was killed)"
         );
-        assert_eq!(describe_code(Some(3)), "3");
-        assert_eq!(describe_code(None), "signal");
+        // Direct runs (the CLI, push, ls-remote) keep the plain code.
+        assert_eq!(describe_exit(&out(Some(137), false)), "137");
+        assert_eq!(describe_exit(&out(Some(3), true)), "3");
+        assert_eq!(describe_exit(&out(None, false)), "signal");
     }
 
     /// `command` exits 127 for a git it cannot find and 126 for one it cannot
@@ -4524,11 +4714,14 @@ mod tests {
         let sh = shim(
             &t,
             "e127.sh",
-            "case \" $* \" in *\" fetch \"*) exit 127;; esac",
+            "case \" $* \" in *\" fetch \"*) echo 'no such helper' >&2; exit 127;; esac",
         );
         let b = GitBucket::open_full(&url, sh, CHUNK, None, true).unwrap();
         let e = watched_fetch(&b).0.err().unwrap().to_string();
-        assert!(e.contains("cannot run git"), "{e}");
+        assert!(
+            e.contains("cannot run git") && e.contains("no such helper"),
+            "git's own message must be in the error: {e}"
+        );
     }
 
     /// A leader that dies on its own (here a shim that kills the supervisor and

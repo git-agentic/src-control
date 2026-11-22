@@ -258,13 +258,20 @@ under a watchdog:
   subshell with stdin from `/dev/null`; the subshell writes git's exit code to
   `<cache>/.fetch-status-<n>`; the shell closes its own stdout and stderr, so only
   git and its helpers hold the pipes, and then blocks reading its stdin, a pipe
-  only sc holds. When that pipe closes, because sc dropped it or died, the shell
+  only sc holds. When that pipe closes, because sc dropped it or exited, the shell
   runs the builtin `kill -s KILL 0`: its whole group dies, itself included, and no
-  group id and no external program are involved. git runs through `command`, so a
-  shell function exported by the environment cannot stand in for it; `SC_GIT` is
-  resolved by `/bin/sh` the same way (a bare name through the PATH, a path as is).
-  The script uses a parenthesized subshell on purpose: with a `{ ...; } &` group
-  bash execs the command in place and the status line never runs.
+  group id and no external program are involved. git runs through `command --`;
+  `SC_GIT` is resolved by `/bin/sh` the same way (a bare name through the PATH, a
+  path as is). On macOS `/bin/sh` is bash, so the shell's own startup state is
+  removed from the leader's environment (and so from git's): `SHELLOPTS` (`monitor`
+  would move the background job into another process group, `errexit` would skip
+  the status line), `BASHOPTS`, `BASH_ENV`, `ENV`, and every `BASH_FUNC_*`
+  exported function, which would otherwise override `command`, `echo`, `read` or
+  `kill`. With that, shell functions cannot stand in for git. The script also
+  tolerates `errexit` (`|| r=$?`, `|| :`). The script uses a parenthesized subshell
+  on purpose: with a `{ ...; } &` group bash execs the command in place and the
+  status line never runs. It was checked on `/bin/sh`, `dash`, `bash` and `zsh`
+  (exit code propagated, group killed at stdin close, also mid-run).
 - sc never waits for the leader before the group is dead. It learns git's exit
   from the status file (one to three ASCII digits and a newline, at most 255;
   anything else, such as a partial write, counts as not yet), so the leader stays
@@ -281,10 +288,15 @@ under a watchdog:
   smart-HTTP v0/v1 helper chain included, dies when git exits and cannot write
   after the discard. After the reap the group is never signalled. `kill` is only
   the backup: without it a warning is printed once and the leader's own `kill 0`
-  still ends the group, unless the leader died early.
+  still ends the group, unless the leader died early. The backup is waited for at
+  most 2 s and then killed, and the leader gets 5 s to exit before it is killed
+  itself. Each serve-mode fetch costs an extra `sh`, a `kill` spawn and about
+  20 ms of settle time.
 - A `/bin/sh` exit status of 126 or 127 means `command` could not run git and
-  gives the usual "cannot run git (...): install git or set SC_GIT" error. A git
-  killed by signal `n` reads as exit `128 + n`.
+  gives the usual "cannot run git (...): install git or set SC_GIT" error, with
+  git's own message. A missing `/bin/sh` is reported as that. A git killed by
+  signal `n` reads as exit `128 + n`, which only the text of a fetch run by the
+  leader says.
 - What escapes, and what is trusted. A process that leaves git's group with
   `setsid` (an ssh `ControlPersist` master, a credential-cache daemon) is not
   killed. If it holds a pipe, the fetch is an error after the shared deadline, and
@@ -319,9 +331,12 @@ The exact limits:
   helper chain that writes the pack (`git-remote-https`, `index-pack`), which can
   keep writing after git is killed. Those cases are not disk-bounded; the
   watchdog still frees the call.
-- A fetch's group ends when `sc serve` dies, whatever the signal: the leader sees
-  the end of its stdin and kills the group. Only a process that left the group
-  outlives it.
+- The leader kills the group when its stdin closes, which happens when sc drops the
+  pipe or exits, so a group normally ends with `sc serve`. If the leader itself is
+  killed first, only the backup `kill` remains, and a dead `sc serve` runs none.
+  On macOS a child spawned concurrently by another thread can briefly inherit the
+  stdin write end, which delays the end of input until it execs. A process that
+  left the group outlives all of this.
 
 ### Private-branch opt-in
 

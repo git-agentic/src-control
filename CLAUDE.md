@@ -271,15 +271,17 @@ transport-adjacent. The rest, imperatively:
   writes git's exit code to `<cache>/.fetch-status-<n>`; when the fetch ends (a
   normal exit or any breach) sc closes the pipe and the leader kills the whole
   group with its builtin `kill`, so every helper that stays in git's process
-  group, including one that outlives git, dies (also when `sc serve` dies). The
+  group, including one that outlives git, dies (the group also ends when `sc serve`
+  exits, since the leader's stdin closes). The
   system `kill` signals the group too as a backup, only while the leader is
   unreaped (`may_signal_group`: sc never waits for the leader before the group is
   dead; after the final reap the id may be reused, so it is never signalled);
   without a `kill` it warns once. 126 or 127 from `/bin/sh` is the "cannot run
   git" error. A helper that leaves the group (`setsid`: an ssh `ControlPersist`
   master, a credential-cache daemon) escapes; the status file trusts local
-  executables; `SC_GIT` is resolved by `/bin/sh` through `command` (no shell
-  functions). The CLI and Windows spawn git directly and kill git alone, and the
+  executables; `SC_GIT` is resolved by `/bin/sh` through `command --`, with
+  `SHELLOPTS`, `BASHOPTS`, `BASH_ENV`, `ENV` and `BASH_FUNC_*` removed from its
+  environment (so no shell functions). The CLI and Windows spawn git directly and kill git alone, and the
   helpers that write the pack may keep writing; so may any helper that outlives
   git's exit there. Only fetches are watched; `ls-remote` and push are not.
 - **`DirBucket` (`sc+wal://<dir>`) is a single-host, single-owner backend (#264).**
