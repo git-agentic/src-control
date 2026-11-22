@@ -277,13 +277,21 @@ under a watchdog:
   yet), because the leader does not exit when git does: it waits for its stdin. A
   leader that dies early writes no status; the no-progress deadline ends the
   fetch. Every end of a fetch, a normal exit or any breach, takes the same steps:
-  close the stdin pipe, which makes the leader kill the group; give the leader 5 s
-  to exit, then kill it alone; reap it; then settle and measure as below. After a
-  successful fetch the group is killed too, so every helper that stays in git's
+  check that the leader is still running (one that has already exited never ran
+  its group kill), close the stdin pipe, which makes the leader kill the group, and
+  require the leader to end by SIGKILL, its own group kill. A leader that had
+  already exited, that exits any other way, or that is still there after 5 s makes
+  the fetch an error even when the status file says 0, because a helper with closed
+  pipes may still be writing; the download is discarded. The slow leader is killed
+  alone and waited for at most 2 s more, then left unreaped rather than waited for.
+  Then sc settles and measures as below. After a successful fetch the group is
+  killed too, so every helper that stays in git's
   process group, a smart-HTTP v0/v1 helper chain included, dies when git exits and
   cannot write after the discard. The leader's builtin `kill` is the only group
-  kill: sc runs no external `kill` program and signals no group id, so a reused
-  group id cannot be hit and the platform needs no `kill` on the PATH. Each
+  kill: sc runs no external `kill` program and signals no group id, so the order
+  of reaping is not part of the safety argument (a reused group id cannot be hit)
+  and the platform needs no `kill` on the PATH. What is seen is the argument: the
+  leader must be seen to end by its own group kill. Each
   serve-mode fetch costs an extra `sh` and about 20 ms of settle time.
 - A `/bin/sh` exit status of 126 or 127 means `command` could not run git and
   gives the usual "cannot run git (...): install git or set SC_GIT" error, with
@@ -329,7 +337,8 @@ The exact limits:
   watchdog still frees the call.
 - The leader kills the group when its stdin closes, which happens when sc drops the
   pipe or exits, so a group normally ends with `sc serve`. If the leader itself is
-  killed first, nothing kills the group. On macOS a child spawned concurrently by
+  killed first, nothing kills the group, which the fetch sees (the leader is gone
+  before its stdin is closed) and reports as an error. On macOS a child spawned concurrently by
   another thread can briefly inherit the stdin write end, which delays the end of
   input until it execs. A process that left the group outlives all of this.
 

@@ -340,6 +340,10 @@ struct Tuning {
     /// is scrubbed, standing in for a hostile parent environment (tests only).
     #[cfg(unix)]
     leader_env: &'static [(&'static str, &'static str)],
+    /// Replaces [`LEADER`] (tests only: a leader that does not end by its own
+    /// group kill).
+    #[cfg(unix)]
+    leader: Option<&'static str>,
 }
 
 impl Default for Tuning {
@@ -351,6 +355,8 @@ impl Default for Tuning {
             poll: None,
             #[cfg(unix)]
             leader_env: &[],
+            #[cfg(unix)]
+            leader: None,
         }
     }
 }
@@ -1001,7 +1007,11 @@ impl GitBucket {
         let mut cmd = match &status_file {
             Some(sf) => {
                 let mut sh = Command::new("/bin/sh");
-                sh.args(["-c", LEADER, "sc-fetch"])
+                #[cfg(unix)]
+                let script = self.tune.leader.unwrap_or(LEADER);
+                #[cfg(not(unix))]
+                let script = LEADER;
+                sh.args(["-c", script, "sc-fetch"])
                     .arg(&sf.0)
                     .arg(&self.git);
                 let mut sh = self.hardened(sh, args, &[], true);
@@ -1102,10 +1112,11 @@ impl GitBucket {
             self.terminate_and_discard(&mut child, &mut lead_in, &mut readers, &pack_dir, &before);
             return Err(breach.expect("only a breach leaves the loop without an exit"));
         };
+        let mut leader_ended_group = true;
         if status_file.is_some() {
             // Git is done: whatever is left in its group outlived git, so the
             // group always ends here, the same way as on a breach.
-            self.terminate(&mut child, &mut lead_in, &mut readers, &pack_dir);
+            leader_ended_group = self.terminate(&mut child, &mut lead_in, &mut readers, &pack_dir);
         }
         // Git has exited and the leader is gone. A holder of the pipes that
         // left the group (or, in the CLI, a helper that outlived git) may still
@@ -1138,6 +1149,16 @@ impl GitBucket {
                 "git exited but left its {what} open for {:?} (a helper outlived it)",
                 self.tune.idle
             )));
+        }
+        if !leader_ended_group {
+            // The status file may say 0, but the group was not killed by its
+            // leader, so a helper with closed pipes can still be writing.
+            self.discard_download(&pack_dir, &before);
+            return Err(Error::Backend(
+                "git's supervisor did not end its process group (it was killed or \
+                 stuck); the fetch was discarded and a helper may still be running"
+                    .into(),
+            ));
         }
         let (stdout, over) = readers.got_out.take().unwrap_or_default();
         let stderr = readers.got_err.take().unwrap_or_default();
@@ -1175,22 +1196,25 @@ impl GitBucket {
         pack_dir: &Path,
         before: &HashMap<OsString, u64>,
     ) {
-        self.terminate(child, lead_in, readers, pack_dir);
+        let _ = self.terminate(child, lead_in, readers, pack_dir);
         self.discard_download(pack_dir, before);
     }
 
-    /// Stop git (its whole group in serve mode), reap it, then keep watching
-    /// until the pipes have closed and the pack directory has stopped changing,
-    /// or a short settle deadline passes.
+    /// Stop git (its whole group in serve mode), then keep watching until the
+    /// pipes have closed and the pack directory has stopped changing, or a short
+    /// settle deadline passes. False when, in serve mode, the leader did not end
+    /// by its own group kill ([`Self::stop`]).
     fn terminate(
         &self,
         child: &mut Child,
         lead_in: &mut Option<std::process::ChildStdin>,
         readers: &mut Readers,
         pack_dir: &Path,
-    ) {
-        self.stop(child, lead_in);
-        let _ = child.wait();
+    ) -> bool {
+        let ended = self.stop(child, lead_in);
+        if !self.leads() {
+            let _ = child.wait();
+        }
         let settle = Instant::now() + self.tune.idle.min(SETTLE);
         let mut last = dir_bytes(pack_dir);
         loop {
@@ -1202,30 +1226,47 @@ impl GitBucket {
             }
             last = now;
         }
+        ended
     }
 
     /// Stop a watched git. In serve mode (the child is the [`LEADER`]) closing
     /// its stdin makes it kill the whole group, itself included, with the shell
     /// builtin: that is the only group kill, with no group id and no external
-    /// program. The leader gets [`SETTLE`] to exit and is then killed alone, so a
-    /// leader that cannot run leaves its group behind. A leader that died on its
-    /// own before it killed the group (killed from outside) also leaves the
-    /// group's helpers running. Without a leader (the CLI) git is just killed.
-    fn stop(&self, child: &mut Child, lead_in: &mut Option<std::process::ChildStdin>) {
+    /// program. The safety argument is what is seen: the leader must still be
+    /// running when its stdin is dropped, and must then end by SIGKILL, its own
+    /// group kill. True only then. A leader that had already exited (killed from
+    /// outside, so its group's helpers were never killed), that exits any other
+    /// way, or that does not exit within [`SETTLE`] returns false; the latter is
+    /// killed alone and waited for at most 2 s more, then left unreaped. Without
+    /// a leader (the CLI) git is just killed.
+    fn stop(&self, child: &mut Child, lead_in: &mut Option<std::process::ChildStdin>) -> bool {
         #[cfg(not(unix))]
         let _ = &lead_in; // no process groups: only the child is killed
         #[cfg(unix)]
         if self.group {
+            use std::os::unix::process::ExitStatusExt;
+            let early = !matches!(child.try_wait(), Ok(None));
             drop(lead_in.take());
+            if early {
+                return false;
+            }
             let end = Instant::now() + SETTLE;
             while Instant::now() < end {
-                if !matches!(child.try_wait(), Ok(None)) {
-                    return;
+                match child.try_wait() {
+                    Ok(None) => std::thread::sleep(Duration::from_millis(2)),
+                    Ok(Some(st)) => return st.signal() == Some(9),
+                    Err(_) => return false,
                 }
+            }
+            let _ = child.kill();
+            let end = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < end && matches!(child.try_wait(), Ok(None)) {
                 std::thread::sleep(Duration::from_millis(2));
             }
+            return false;
         }
         let _ = child.kill();
+        true
     }
 
     /// Undo a fetch that went over budget: remove every file it added to
@@ -4169,7 +4210,7 @@ mod tests {
             let (_, url) = hub(&t);
             let pids = t.0.join("pids");
             let body = format!(
-                "case \" $* \" in *\" fetch \"*) sleep 0.4; head -c 2000000 /dev/zero > \"$GIT_DIR/objects/pack/pack-fake.pack\"; sleep 600 & echo $! > {}; exit 0;; esac",
+                "case \" $* \" in *\" fetch \"*) sleep 600 & echo $! > {}; sleep 0.4; head -c 2000000 /dev/zero > \"$GIT_DIR/objects/pack/pack-fake.pack\"; exit 0;; esac",
                 pids.display()
             );
             let sh = shim(&t, "finalover.sh", &body);
@@ -4271,9 +4312,15 @@ mod tests {
             let pids = t.0.join("pids");
             let leader = t.0.join("leader");
             let ack = t.0.join("ack");
-            let pause = if crosses { "0.01" } else { "0.05" };
+            // Crossing is deterministic, not a race against the writer's speed: the
+            // first write alone is over the budget.
+            let (pause, first) = if crosses {
+                ("0.01", 2_000_000)
+            } else {
+                ("0.05", 65536)
+            };
             let body = format!(
-                "case \" $* \" in *\" fetch \"*) ps -o pgid= -p $$ | tr -d ' ' > {leader}; ( exec >/dev/null 2>&1; head -c 65536 /dev/zero >> \"$GIT_DIR/objects/pack/pack-late.pack\"; echo > {ack}; while :; do head -c 65536 /dev/zero >> \"$GIT_DIR/objects/pack/pack-late.pack\"; sleep {pause}; done ) & echo $! > {p}; until [ -e {ack} ]; do sleep 0.01; done; exit 0;; esac",
+                "case \" $* \" in *\" fetch \"*) ps -o pgid= -p $$ | tr -d ' ' > {leader}; ( exec >/dev/null 2>&1; head -c {first} /dev/zero >> \"$GIT_DIR/objects/pack/pack-late.pack\"; echo > {ack}; while :; do head -c 65536 /dev/zero >> \"$GIT_DIR/objects/pack/pack-late.pack\"; sleep {pause}; done ) & echo $! > {p}; until [ -e {ack} ]; do sleep 0.01; done; exit 0;; esac",
                 p = pids.display(),
                 leader = leader.display(),
                 ack = ack.display()
@@ -4502,6 +4549,70 @@ mod tests {
         assert!(!stat.is_empty() && !stat.starts_with('Z'), "stat {stat:?}");
         kill_pid(helper);
         wait_gone(helper);
+    }
+
+    /// The status line can say 0 while the leader was killed from outside, so it
+    /// never ran its group kill and a helper with closed pipes keeps writing. That
+    /// fetch is an error, not a success (and the download is discarded). The
+    /// helper survives: the documented limit (the test kills it).
+    #[cfg(unix)]
+    #[test]
+    fn a_leader_killed_from_outside_makes_a_successful_fetch_an_error() {
+        need_git!();
+        let t = Tmp::new("leaderkilled");
+        let (_, url) = hub(&t);
+        let pids = t.0.join("pids");
+        let ack = t.0.join("ack");
+        let body = format!(
+            "case \" $* \" in *\" fetch \"*) ( exec >/dev/null 2>&1; while :; do head -c 65536 /dev/zero >> \"$GIT_DIR/objects/pack/pack-late.pack\"; echo > {ack}; sleep 0.05; done ) & echo $! > {p}; until [ -e {ack} ]; do sleep 0.01; done; l=$(ps -o pgid= -p $$ | tr -d ' '); kill -s KILL $l; exit 0;; esac",
+            p = pids.display(),
+            ack = ack.display()
+        );
+        let sh = shim(&t, "killedleader.sh", &body);
+        let b = GitBucket::open_full(&url, sh, CHUNK, None, true).unwrap();
+        let (out, over) = watched_fetch(&b);
+        let e = out.err().expect("not a success").to_string();
+        assert!(!over && e.contains("supervisor"), "{e}");
+        assert!(no_status_files(&b));
+        let helper: u32 = std::fs::read_to_string(&pids)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        kill_pid(helper);
+        wait_gone(helper);
+    }
+
+    /// After its stdin closes the leader must end by its own group kill, which is
+    /// a SIGKILL: one that exits normally, or ignores the end of input and has to
+    /// be killed after the grace period, makes the fetch an error even though git
+    /// succeeded.
+    #[cfg(unix)]
+    #[test]
+    fn a_leader_that_does_not_end_by_its_own_group_kill_is_an_error() {
+        need_git!();
+        for (replacement, slow) in [("exit 0", false), ("exec sleep 600", true)] {
+            let t = Tmp::new("leaderother");
+            let (_, url) = hub(&t);
+            let sh = shim(&t, "ok.sh", "case \" $* \" in *\" fetch \"*) exit 0;; esac");
+            let mut b = GitBucket::open_full(&url, sh, CHUNK, None, true).unwrap();
+            b.tune.leader = Some(Box::leak(
+                LEADER
+                    .replace("kill -s KILL 0", replacement)
+                    .into_boxed_str(),
+            ));
+            let started = Instant::now();
+            let e = watched_fetch(&b)
+                .0
+                .err()
+                .expect("not a success")
+                .to_string();
+            assert!(e.contains("supervisor"), "{e}");
+            let took = started.elapsed();
+            assert!(took < Duration::from_secs(30), "{took:?}");
+            assert_eq!(took >= SETTLE, slow, "{replacement}: {took:?}");
+            assert!(no_status_files(&b));
+        }
     }
 
     /// The status line is read strictly: one to three digits and a newline, at

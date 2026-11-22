@@ -273,9 +273,10 @@ transport-adjacent. The rest, imperatively:
   group with its builtin `kill`, so every helper that stays in git's process
   group, including one that outlives git, dies (the group also ends when `sc serve`
   exits, since the leader's stdin closes). That builtin is the only group kill: sc
-  runs no external `kill` and signals no group id. If the leader is killed from
-  outside first, nothing kills the group: the fetch fails and its helpers may
-  survive. 126 or 127 from `/bin/sh` is the "cannot run
+  runs no external `kill` and signals no group id. The leader must be seen running
+  when its stdin closes and to end by SIGKILL (its own group kill); otherwise
+  (killed from outside first, another exit, or still there after 5 s) the fetch is
+  an error even if git succeeded, and its helpers may survive. 126 or 127 from `/bin/sh` is the "cannot run
   git" error. A helper that leaves the group (`setsid`: an ssh `ControlPersist`
   master, a credential-cache daemon) escapes; the status file trusts local
   executables; `SC_GIT` is resolved by `/bin/sh` through `command --`, with

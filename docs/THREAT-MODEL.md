@@ -796,9 +796,10 @@ The bucket model above applies unchanged, with the Git repository as the bucket 
     any helper that outlives git, a smart-HTTP v0/v1 helper chain included, die and cannot
     write after the discard. The group also ends when `sc serve` exits, because the
     supervisor's stdin closes (a child spawned at the same moment can briefly hold the pipe
-    open on macOS). If the supervisor itself was killed from outside first, nothing kills the
-    group: the fetch fails (no status, then the no-progress deadline) and helpers still in the
-    group may survive. Outside serve mode (the unix CLI, Windows) the kill may not reach the
+    open on macOS). The supervisor must be seen running when its stdin is closed and to end by
+    SIGKILL, its own group kill; if it was killed from outside first, or ends any other way,
+    nothing killed the group, so the fetch is an error even if git succeeded (the download is
+    discarded), and helpers still in the group may survive. Outside serve mode (the unix CLI, Windows) the kill may not reach the
     helper chain that writes the pack, which can keep writing after git is killed, and a helper
     that outlives git is not killed: those cases are not disk-bounded. The call still returns,
     since detached pipe readers keep a surviving helper from blocking it.
