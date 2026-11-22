@@ -13,8 +13,11 @@ use scl_objio::{Bucket, Fetched};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 mod compact;
+#[cfg(test)]
+mod git_push_tests;
 #[cfg(test)]
 mod git_remote_tests;
 #[cfg(test)]
@@ -25,6 +28,11 @@ pub use compact::{CompactOptions, CompactReport};
 /// view names has vanished (ADR-0057). Each restart needs the manifest to have
 /// moved, so a handful is plenty: one per compaction that lands mid-read.
 const MAX_RESTARTS: u32 = 8;
+
+/// How long `has_object` trusts a manifest probe that found the remote empty
+/// before it probes again (one per pushed object otherwise). Only the per-object
+/// probe uses it; every other read re-reads the manifest.
+const ABSENT_MEMO: Duration = Duration::from_secs(2);
 
 /// Reconstructed state of the WAL at one manifest tag: the manifest itself,
 /// the flattened branch tips after replaying the parent chain oldest-first,
@@ -97,6 +105,10 @@ pub struct BucketTransport {
     /// manifest and tell a compaction that moved on (restart) from a corrupt
     /// bucket (fail closed).
     saw_absent: Cell<bool>,
+    /// When the last manifest read found no manifest at all; cleared by any
+    /// other read result and by a successful manifest CAS. Consulted only by
+    /// `has_object`, which answers "absent" from it for [`ABSENT_MEMO`].
+    absent_at: Cell<Option<Instant>>,
     /// Tag of the manifest the in-progress `refresh_once` is building from, so
     /// a failed attempt can say which manifest it failed on.
     attempt_tag: RefCell<Option<String>>,
@@ -390,6 +402,7 @@ impl BucketTransport {
             pending_objects: RefCell::new(PendingObjects::default()),
             leaf_cache: RefCell::new(BTreeMap::new()),
             saw_absent: Cell::new(false),
+            absent_at: Cell::new(None),
             attempt_tag: RefCell::new(None),
             git_carrier,
             refuse_sealed: false,
@@ -458,114 +471,122 @@ impl BucketTransport {
     fn refresh_once(&self) -> Result<()> {
         let cached_tag = self.view.borrow().as_ref().map(|v| v.tag.clone());
         match self.bucket.get("manifest", cached_tag.as_deref())? {
-            Fetched::Unchanged => Ok(()),
+            Fetched::Unchanged => {
+                self.absent_at.set(None);
+                Ok(())
+            }
             Fetched::Absent => {
                 *self.view.borrow_mut() = None;
+                self.absent_at.set(Some(Instant::now()));
                 Ok(())
             }
             Fetched::New { bytes, tag } => {
-                *self.attempt_tag.borrow_mut() = Some(tag.clone());
-                let bytes = capped("manifest", bytes)?;
-                let manifest = Manifest::decode(&bytes)?;
-                let stop = manifest.checkpoint_seq;
-                // Seed from the checkpoint when the manifest names one. The
-                // checkpoint is untrusted input like everything else here.
-                let (mut refs, mut packs): (BTreeMap<String, ObjectId>, Vec<String>) = if stop != 0
-                {
-                    let ck_bytes = match self.bucket.get(&checkpoint_key(stop), None)? {
-                        Fetched::New { bytes, .. } => capped("checkpoint", bytes)?,
-                        _ => {
-                            return Err(self.gone(format!(
-                                "checkpoint {stop} referenced by manifest but absent"
-                            )))
-                        }
-                    };
-                    let ck = Checkpoint::decode(&ck_bytes)?;
-                    if ck.seq != stop {
-                        return Err(Error::Wal(format!(
-                            "checkpoint at {stop} claims seq {}",
-                            ck.seq
-                        )));
-                    }
-                    let mut refs = BTreeMap::new();
-                    for (branch, id) in &ck.refs {
-                        crate::refs::validate_branch_name(branch)?;
-                        refs.insert(branch.clone(), *id);
-                    }
-                    (refs, ck.packs)
-                } else {
-                    (BTreeMap::new(), Vec::new())
-                };
-                let mut entries = Vec::new();
-                let mut seq = manifest.head_seq;
-                while seq != stop {
-                    if seq < stop {
-                        return Err(Error::Wal(format!(
-                            "log chain bypasses checkpoint {stop} (reached {seq})"
-                        )));
-                    }
-                    let Fetched::New { bytes, .. } = self.bucket.get(&log_key(seq), None)? else {
-                        return Err(
-                            self.gone(format!("log entry {seq} referenced by chain but absent"))
-                        );
-                    };
-                    let e = LogEntry::decode(&capped("log entry", bytes)?)?;
-                    if e.seq != seq {
-                        return Err(Error::Wal(format!(
-                            "log entry at {} claims seq {}",
-                            seq, e.seq
-                        )));
-                    }
-                    if e.parent_seq >= e.seq {
-                        return Err(Error::Wal(format!(
-                            "log entry {} has non-decreasing parent {}",
-                            e.seq, e.parent_seq
-                        )));
-                    }
-                    seq = e.parent_seq;
-                    entries.push(e);
-                }
-                entries.reverse(); // oldest first
-                for e in &entries {
-                    for u in &e.updates {
-                        crate::refs::validate_branch_name(&u.branch)?;
-                        refs.insert(u.branch.clone(), u.new);
-                    }
-                    for hash in &e.packs {
-                        packs.push(hash.clone());
-                    }
-                }
-                // Index build: over the FULL cumulative pack list (checkpoint
-                // packs + tail packs), fetching each idx exactly as today.
-                let mut index = BTreeMap::new();
-                let mut pack_sizes = BTreeMap::new();
-                for hash in &packs {
-                    let Fetched::New { bytes, .. } = self.bucket.get(&idx_key(hash), None)? else {
-                        return Err(self.gone(format!("pack {hash} on chain but idx absent")));
-                    };
-                    let bytes = capped("pack idx", bytes)?;
-                    let entries = parse_index(&bytes)?;
-                    pack_sizes.insert(hash.clone(), declared_pack_len(&entries));
-                    for IndexEntry { id, offset, length } in entries {
-                        index.insert(id, (hash.clone(), offset, length));
-                    }
-                }
-                // Packs a compaction retired will never be asked about again.
-                {
-                    let live: std::collections::HashSet<&String> = packs.iter().collect();
-                    self.leaf_cache.borrow_mut().retain(|h, _| live.contains(h));
-                }
-                *self.view.borrow_mut() = Some(WalView {
-                    tag,
-                    manifest,
-                    refs,
-                    index,
-                    packs,
-                    pack_sizes,
-                });
-                Ok(())
+                self.absent_at.set(None);
+                self.build_view(bytes, tag)
             }
         }
+    }
+
+    /// Install the view for manifest `bytes` read at `tag` (or just written
+    /// there): walk the log chain and idx files it names and replace `view`.
+    fn build_view(&self, bytes: Vec<u8>, tag: String) -> Result<()> {
+        *self.attempt_tag.borrow_mut() = Some(tag.clone());
+        let bytes = capped("manifest", bytes)?;
+        let manifest = Manifest::decode(&bytes)?;
+        let stop = manifest.checkpoint_seq;
+        // Seed from the checkpoint when the manifest names one. The
+        // checkpoint is untrusted input like everything else here.
+        let (mut refs, mut packs): (BTreeMap<String, ObjectId>, Vec<String>) = if stop != 0 {
+            let ck_bytes = match self.bucket.get(&checkpoint_key(stop), None)? {
+                Fetched::New { bytes, .. } => capped("checkpoint", bytes)?,
+                _ => {
+                    return Err(self.gone(format!(
+                        "checkpoint {stop} referenced by manifest but absent"
+                    )))
+                }
+            };
+            let ck = Checkpoint::decode(&ck_bytes)?;
+            if ck.seq != stop {
+                return Err(Error::Wal(format!(
+                    "checkpoint at {stop} claims seq {}",
+                    ck.seq
+                )));
+            }
+            let mut refs = BTreeMap::new();
+            for (branch, id) in &ck.refs {
+                crate::refs::validate_branch_name(branch)?;
+                refs.insert(branch.clone(), *id);
+            }
+            (refs, ck.packs)
+        } else {
+            (BTreeMap::new(), Vec::new())
+        };
+        let mut entries = Vec::new();
+        let mut seq = manifest.head_seq;
+        while seq != stop {
+            if seq < stop {
+                return Err(Error::Wal(format!(
+                    "log chain bypasses checkpoint {stop} (reached {seq})"
+                )));
+            }
+            let Fetched::New { bytes, .. } = self.bucket.get(&log_key(seq), None)? else {
+                return Err(self.gone(format!("log entry {seq} referenced by chain but absent")));
+            };
+            let e = LogEntry::decode(&capped("log entry", bytes)?)?;
+            if e.seq != seq {
+                return Err(Error::Wal(format!(
+                    "log entry at {} claims seq {}",
+                    seq, e.seq
+                )));
+            }
+            if e.parent_seq >= e.seq {
+                return Err(Error::Wal(format!(
+                    "log entry {} has non-decreasing parent {}",
+                    e.seq, e.parent_seq
+                )));
+            }
+            seq = e.parent_seq;
+            entries.push(e);
+        }
+        entries.reverse(); // oldest first
+        for e in &entries {
+            for u in &e.updates {
+                crate::refs::validate_branch_name(&u.branch)?;
+                refs.insert(u.branch.clone(), u.new);
+            }
+            for hash in &e.packs {
+                packs.push(hash.clone());
+            }
+        }
+        // Index build: over the FULL cumulative pack list (checkpoint
+        // packs + tail packs), fetching each idx exactly as today.
+        let mut index = BTreeMap::new();
+        let mut pack_sizes = BTreeMap::new();
+        for hash in &packs {
+            let Fetched::New { bytes, .. } = self.bucket.get(&idx_key(hash), None)? else {
+                return Err(self.gone(format!("pack {hash} on chain but idx absent")));
+            };
+            let bytes = capped("pack idx", bytes)?;
+            let entries = parse_index(&bytes)?;
+            pack_sizes.insert(hash.clone(), declared_pack_len(&entries));
+            for IndexEntry { id, offset, length } in entries {
+                index.insert(id, (hash.clone(), offset, length));
+            }
+        }
+        // Packs a compaction retired will never be asked about again.
+        {
+            let live: std::collections::HashSet<&String> = packs.iter().collect();
+            self.leaf_cache.borrow_mut().retain(|h, _| live.contains(h));
+        }
+        *self.view.borrow_mut() = Some(WalView {
+            tag,
+            manifest,
+            refs,
+            index,
+            packs,
+            pack_sizes,
+        });
+        Ok(())
     }
 
     /// Canonical `encode()` bytes of one object, fetched via its pack
@@ -693,8 +714,11 @@ impl BucketTransport {
     fn upload_pack(&self, objects: &[(ObjectId, Vec<u8>)]) -> Result<(String, Vec<ObjectId>)> {
         let (pack, idx) = scl_core::pack::build_pack(objects)?;
         let hash = hex::encode(blake3::hash(&pack).as_bytes());
-        self.bucket.put_new(&pack_key(&hash), &pack)?;
-        self.bucket.put_new(&idx_key(&hash), &idx)?;
+        // One batch (one push on a Git carrier). `false` = already present.
+        self.bucket.put_new_batch(&[
+            (pack_key(&hash).as_str(), pack.as_slice()),
+            (idx_key(&hash).as_str(), idx.as_slice()),
+        ])?;
         Ok((hash, objects.iter().map(|(id, _)| *id).collect()))
     }
 
@@ -726,17 +750,22 @@ impl BucketTransport {
     /// (a compaction swept it as an unreferenced orphan after an unusually long
     /// gap, ADR-0057). Committing a log entry that names a deleted pack would
     /// corrupt the remote; failing lets the caller retry the push, which
-    /// re-uploads. Two HEADs per pending pack (read rights only: pushers need
-    /// no list or delete rights).
+    /// re-uploads. One batched existence check of every pack and idx (read rights
+    /// only: pushers need no list or delete rights).
     /// Called right before the manifest CAS.
     fn ensure_packs_present(&self, hashes: &[String]) -> Result<()> {
-        for hash in hashes {
-            if !(self.bucket.exists(&pack_key(hash))? && self.bucket.exists(&idx_key(hash))?) {
-                return Err(Error::Remote(format!(
-                    "pack {hash} was removed from the bucket before this push committed \
-                     (bucket compaction swept it); retry the push"
-                )));
-            }
+        let keys: Vec<String> = hashes
+            .iter()
+            .flat_map(|h| [pack_key(h), idx_key(h)])
+            .collect();
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let present = self.bucket.exists_batch(&refs)?;
+        if let Some(i) = present.iter().position(|p| !p) {
+            return Err(Error::Remote(format!(
+                "pack {} was removed from the bucket before this push committed \
+                 (bucket compaction swept it); retry the push",
+                hashes[i / 2]
+            )));
         }
         Ok(())
     }
@@ -918,7 +947,15 @@ impl Transport for BucketTransport {
     }
 
     fn has_object(&self, id: &ObjectId) -> Result<bool> {
-        self.refresh()?;
+        // A push asks once per object; an empty remote needs no re-probe for each.
+        let recently_absent = self.view.borrow().is_none()
+            && self
+                .absent_at
+                .get()
+                .is_some_and(|t| t.elapsed() < ABSENT_MEMO);
+        if !recently_absent {
+            self.refresh()?;
+        }
         Ok(self
             .view
             .borrow()
@@ -1164,15 +1201,17 @@ impl Transport for BucketTransport {
             // Last look before the commit point, to keep the window in which a
             // concurrent sweep could still remove a pack as small as possible.
             self.ensure_packs_present(&pending)?;
-            if self
-                .bucket
-                .put_if_tag("manifest", &manifest.encode(), prev_tag.as_deref())?
-                .is_some()
+            if let Some(new_tag) =
+                self.bucket
+                    .put_if_tag("manifest", &manifest.encode(), prev_tag.as_deref())?
             {
-                // Committed. The log entry we just claimed is now on-chain;
-                // pull the fresh view (cheap: one conditional GET, since our
-                // own write just changed the tag).
-                self.refresh()?;
+                // Committed. The manifest we wrote is the current one at the tag
+                // the CAS returned, so build the view from it instead of reading
+                // it back; if that fails, fall back to a plain re-read.
+                self.absent_at.set(None);
+                if self.build_view(manifest.encode(), new_tag).is_err() {
+                    self.refresh()?;
+                }
                 let _ = self.maybe_fold_checkpoint(); // best-effort by design (see its doc)
                 return Ok(());
             }
