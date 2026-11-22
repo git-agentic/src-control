@@ -1677,17 +1677,19 @@ impl GitBucket {
             .map(|(k, _)| accepted.contains(&format!("{NS}{k}")))
             .collect();
         let refusal = (!landed.iter().all(|l| *l)).then(|| {
-            let first = out
+            // Every rejected ref: a retry can see one key's "stale info" before
+            // the host's own refusal of another.
+            let rejected: Vec<String> = out
                 .stdout
                 .split(|b| *b == b'\n')
-                .find(|l| l.first() == Some(&b'!'))
+                .filter(|l| l.first() == Some(&b'!'))
                 .map(|l| self.scrub(&String::from_utf8_lossy(l)))
-                .unwrap_or_default();
+                .collect();
             format!(
                 "git push failed (exit {}): {} {}",
                 out.code.map_or("signal".to_string(), |c| c.to_string()),
                 out.stderr,
-                first
+                rejected.join("; ")
             )
         });
         Ok((landed, refusal))
@@ -1996,7 +1998,7 @@ impl Bucket for GitBucket {
                     }
                 }
                 Err(e) => {
-                    refusal = Some(e);
+                    refusal.get_or_insert(e);
                     break;
                 }
             }

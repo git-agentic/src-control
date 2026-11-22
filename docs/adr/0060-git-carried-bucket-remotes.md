@@ -461,10 +461,11 @@ every transport path.
 - Scaling: `ls-remote` and push download the whole ref advertisement (the pattern given to `ls-remote` filters on the client; a packet trace showed the server sends every ref; the manifest read no longer does, it is one fetch that a v2 host answers with that ref alone), and a cold read fetches every `log/` and `checkpoints/` entry behind the last checkpoint. Refs grow by at least three per push (a log entry, a pack and its idx); `sc remote compact` (above) is what bounds that, folding the small packs and deleting what nothing names, so a long-lived store should be compacted on a schedule. Between runs the advertisement still grows with the pushes since the last one, until a ref-filtering host exists.
 - Each cold read or push costs git round trips. The freshness window and family
   batching bound them, but a Git host is slower than S3. The per-object probe is
-  free on an empty remote (the transport remembers it for 2 s), but a push to a
-  non-empty remote still reads the manifest once per probe outside that window;
-  if push over `sc+git::` stays slow on large histories, the next step is a
-  batched `has_objects`.
+  free on an empty remote (the transport remembers it for 2 s). On a non-empty
+  `sc+git::` remote the freshness window answers the per-object probes without a
+  call; on S3 and `sc+wal://` each probe outside that window is one manifest
+  read. If push stays slow on large histories, the next step is a batched
+  `has_objects`.
 - sc-forge repositories keep a deleted or replaced value fetchable by id until
   the gc prune stage runs.
 - The "not independently audited, do not commit production secrets" warning is

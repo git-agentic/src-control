@@ -335,11 +335,12 @@ fn empty_then_published(
 fn only_the_per_object_probe_trusts_a_recent_empty_manifest() {
     // has_object answers from the memo and asks the bucket nothing
     let root = bucket_root("memo");
+    // Built first, so the probes below run well inside the memo window.
+    let h = history("memo", 1);
     let (c, calls) = Counting::over(&root);
     let t = BucketTransport::from_bucket(Box::new(c)).unwrap();
     let before = calls.count("get:manifest");
     assert_eq!(before, 1, "opened on an empty remote");
-    let h = history("memo", 1);
     for (id, _) in &h[0].1 {
         assert!(!t.has_object(id).unwrap());
     }
@@ -384,6 +385,8 @@ fn only_the_per_object_probe_trusts_a_recent_empty_manifest() {
 fn the_empty_memo_is_cleared_by_any_other_read_and_by_a_won_cas() {
     let (root, t1, _, _, id) = empty_then_published("memo-clear");
     assert!(t1.absent_at.get().is_some(), "set by the read at open");
+    // Restart the window: building and publishing the history took time.
+    t1.absent_at.set(Some(Instant::now()));
     // inside the window the probe is answered from the memo
     assert!(
         !t1.has_object(&id).unwrap(),

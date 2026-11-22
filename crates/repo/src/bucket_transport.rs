@@ -1209,7 +1209,9 @@ impl Transport for BucketTransport {
                 // the CAS returned, so build the view from it instead of reading
                 // it back; if that fails, fall back to a plain re-read.
                 self.absent_at.set(None);
-                if self.build_view(manifest.encode(), new_tag).is_err() {
+                // An empty tag (an S3-compatible host that sent no ETag) is no
+                // tag to build a view on.
+                if new_tag.is_empty() || self.build_view(manifest.encode(), new_tag).is_err() {
                     self.refresh()?;
                 }
                 let _ = self.maybe_fold_checkpoint(); // best-effort by design (see its doc)
