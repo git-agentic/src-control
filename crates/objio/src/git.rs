@@ -141,7 +141,7 @@ struct Exit {
 fn describe_code(code: Option<i32>) -> String {
     match code {
         None => "signal".to_string(),
-        Some(c) if c > 128 => format!("{c}, signal {} if it was killed", c - 128),
+        Some(c) if c > 128 => format!("{c} (128 + signal {}, if git was killed)", c - 128),
         Some(c) => c.to_string(),
     }
 }
@@ -4111,6 +4111,17 @@ mod tests {
             .is_ok_and(|s| s.success())
     }
 
+    /// Shell text that starts `cmd` in the background in a new session, so it
+    /// leaves git's process group, and then waits until it has: the perl wrapper
+    /// writes its pid to `pids` once `setsid` has succeeded.
+    #[cfg(unix)]
+    fn escaped(cmd: &str, pids: &Path) -> String {
+        format!(
+            "perl -MPOSIX -e 'POSIX::setsid() or exit 1; open(F, \">\", shift); print F \"$$\\n\"; close F; exec @ARGV' {p} {cmd} & until [ -s {p} ]; do sleep 0.01; done;",
+            p = pids.display()
+        )
+    }
+
     /// A git that exits cleanly while something keeps its pipes open is an error
     /// within `idle`, not a hang, and what the fetch added is discarded. In the
     /// CLI that is any helper. In serve mode the group is killed when git exits,
@@ -4128,16 +4139,15 @@ mod tests {
             let t = Tmp::new("held");
             let (_, url) = hub(&t);
             let pids = t.0.join("pids");
-            let sleeper = if group {
-                "perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' sleep 600"
+            // The fetch "downloads" something small and exits cleanly (in serve
+            // mode once the helper has left the group).
+            let launch = if group {
+                escaped("sleep 600", &pids)
             } else {
-                "sleep 600"
+                format!("sleep 600 & echo $! > {};", pids.display())
             };
-            // The fetch "downloads" something small and exits cleanly, once the
-            // helper has had time to leave the group.
             let body = format!(
-                "case \" $* \" in *\" fetch \"*) head -c 1000 /dev/zero > \"$GIT_DIR/objects/pack/tmp_pack_held\"; {sleeper} & echo $! > {}; sleep 0.5; exit 0;; esac",
-                pids.display()
+                "case \" $* \" in *\" fetch \"*) head -c 1000 /dev/zero > \"$GIT_DIR/objects/pack/tmp_pack_held\"; {launch} exit 0;; esac"
             );
             let sh = shim(&t, "held.sh", &body);
             let mut b = GitBucket::open_full(&url, sh, CHUNK, None, group).unwrap();
@@ -4301,26 +4311,42 @@ mod tests {
         assert!(!may_signal_group(true), "a reaped leader pins nothing");
     }
 
-    /// In the CLI a helper that outlives git can cross the budget after git has
-    /// exited and close both pipes before the shared deadline. The watchdog must
-    /// still catch it, and must not call the fetch good.
+    /// A helper that outlives git can cross the budget after git has exited and
+    /// close both pipes before the shared deadline. The watchdog must still catch
+    /// it, and must not call the fetch good. In the CLI any helper can do this; in
+    /// serve mode only one that left git's group (`setsid`) can, since the group
+    /// is killed at git's exit.
     #[cfg(unix)]
     #[test]
     fn a_helper_that_crosses_the_budget_after_git_exits_is_caught() {
         need_git!();
-        let t = Tmp::new("late");
-        let (_, url) = hub(&t);
-        // git exits at once; a helper holds the pipes, then writes too much and exits.
-        let body = "case \" $* \" in *\" fetch \"*) ( sleep 0.6; head -c 2000000 /dev/zero > \"$GIT_DIR/objects/pack/pack-late.pack\" ) & exit 0;; esac";
-        let sh = shim(&t, "late.sh", body);
-        let mut b = GitBucket::open_full(&url, sh, CHUNK, None, false).unwrap();
-        b.tune.budget = Some(64 << 10);
-        let e = get_err(&b, "manifest");
-        assert!(e.contains("65536 bytes"), "{e}");
-        assert!(
-            dir_files(&b.cache.join("objects").join("pack")).is_empty(),
-            "the late download must be discarded"
-        );
+        for group in [true, false] {
+            if group && !have_setsid_perl() {
+                continue;
+            }
+            let t = Tmp::new("late");
+            let (_, url) = hub(&t);
+            let pids = t.0.join("pids");
+            let write =
+                "sleep 0.6; head -c 2000000 /dev/zero > \"$GIT_DIR/objects/pack/pack-late.pack\"";
+            // git exits at once; a helper holds the pipes, then writes too much and exits.
+            let launch = if group {
+                escaped(&format!("sh -c '{write}'"), &pids)
+            } else {
+                format!("( {write} ) &")
+            };
+            let body = format!("case \" $* \" in *\" fetch \"*) {launch} exit 0;; esac");
+            let sh = shim(&t, "late.sh", &body);
+            let mut b = GitBucket::open_full(&url, sh, CHUNK, None, group).unwrap();
+            b.tune.budget = Some(64 << 10);
+            let e = get_err(&b, "manifest");
+            assert!(e.contains("65536 bytes"), "{e}");
+            assert!(
+                dir_files(&b.cache.join("objects").join("pack")).is_empty(),
+                "the late download must be discarded"
+            );
+            assert!(no_status_files(&b));
+        }
     }
 
     /// One `fetch` of `refs/sc/manifest` through the watchdog, for tests that
@@ -4455,7 +4481,10 @@ mod tests {
                 assert!(no_status_files(&b));
             }
         }
-        assert_eq!(describe_code(Some(137)), "137, signal 9 if it was killed");
+        assert_eq!(
+            describe_code(Some(137)),
+            "137 (128 + signal 9, if git was killed)"
+        );
         assert_eq!(describe_code(Some(3)), "3");
         assert_eq!(describe_code(None), "signal");
     }

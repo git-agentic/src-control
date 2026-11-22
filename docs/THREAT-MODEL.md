@@ -799,10 +799,9 @@ The bucket model above applies unchanged, with the Git repository as the bucket 
     backup while the supervisor is unreaped (without one the watchdog warns once). So `ssh`,
     `git-remote-https`, `index-pack` and any helper that outlives git, a smart-HTTP v0/v1
     helper chain included, die and cannot write after the discard, and a group also dies when
-    `sc serve` itself does. Outside serve mode (the unix CLI, Windows), and possibly against a
-    smart-HTTP host on protocol v0 or v1, the kill may not reach the helper chain that writes
-    the pack, which can keep writing after git is killed, and a helper that outlives git is not
-    killed: those cases are not disk-bounded. The call still returns, since detached pipe
+    `sc serve` itself does. Outside serve mode (the unix CLI, Windows) the kill may not reach the
+    helper chain that writes the pack, which can keep writing after git is killed, and a helper
+    that outlives git is not killed: those cases are not disk-bounded. The call still returns, since detached pipe
     readers keep a surviving helper from blocking it.
   - A process that leaves git's process group (`setsid`: an ssh `ControlPersist` master, a
     credential-cache daemon, a hostile process) escapes serve mode's kill. If it holds git's
