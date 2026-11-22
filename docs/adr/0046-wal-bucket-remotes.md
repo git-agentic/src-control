@@ -238,6 +238,11 @@ ADR-0057. Effects on this ADR's contracts:
 - **A pending pack is verified present right before the manifest CAS**, so a
   push whose pack was swept fails with a retry message rather than committing
   an entry that names a deleted pack.
+- **`has_object` may answer "absent" from a 2 s memo of an empty remote** (a
+  manifest read that found none), instead of probing once per pushed object;
+  every other read still re-reads the manifest. `Bucket` also gained
+  `put_new_batch` and `exists_batch` for the upload and the check above (ADR-0060
+  addendum).
 - `objio`'s `Bucket` gained `list_meta` and `delete`. The "nothing already in
   the bucket is ever overwritten" property holds; compaction only adds new
   objects and removes unreferenced ones.

@@ -74,6 +74,24 @@ pub trait Bucket: Send {
     fn list_meta(&self, prefix: &str) -> Result<Vec<ObjectMeta>>;
     /// Whether `key` exists (a HEAD: needs read rights only, no listing).
     fn exists(&self, key: &str) -> Result<bool>;
+    /// [`Bucket::put_new`] for several keys at once: one outcome per item, in
+    /// input order (`true` = created, `false` = the key already existed and was
+    /// left untouched). Empty input is `Ok(vec![])`; a bad or duplicate key is
+    /// refused before any write. An error may leave any subset of the keys created
+    /// (orphans a compaction sweeps); a retry of the same items is safe because
+    /// every key is create-only. A backend that can batch the round trips
+    /// overrides this; the default is one `put_new` per item and stops at the
+    /// first error.
+    fn put_new_batch(&self, items: &[(&str, &[u8])]) -> Result<Vec<bool>> {
+        check_batch(items.iter().map(|(k, _)| *k))?;
+        items.iter().map(|(k, v)| self.put_new(k, v)).collect()
+    }
+    /// [`Bucket::exists`] for several keys at once, one answer per key in
+    /// input order. Empty input is `Ok(vec![])`. The default is one `exists` per
+    /// key.
+    fn exists_batch(&self, keys: &[&str]) -> Result<Vec<bool>> {
+        keys.iter().map(|k| self.exists(k)).collect()
+    }
     /// Remove `key`. Idempotent: an absent key is success.
     fn delete(&self, key: &str) -> Result<()>;
     /// Keys starting with the raw string `prefix`, each with the tag
@@ -112,6 +130,19 @@ pub(crate) fn validate_key(key: &str) -> Result<()> {
         || key.chars().any(|c| c.is_whitespace() || c.is_control())
     {
         return Err(Error::BadKey(format!("{key:?}")));
+    }
+    Ok(())
+}
+
+/// Refuse a batch that holds a bad key or names a key twice, before any
+/// backend writes anything.
+pub(crate) fn check_batch<'a>(keys: impl Iterator<Item = &'a str>) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for k in keys {
+        validate_key(k)?;
+        if !seen.insert(k) {
+            return Err(Error::Backend(format!("duplicate key {k:?} in a batch")));
+        }
     }
     Ok(())
 }
@@ -190,6 +221,38 @@ pub fn contract_suite(b: &dyn Bucket) {
     assert_eq!(b.list_meta("packs/").unwrap().len(), 2);
     // a deleted key can be created again
     assert!(b.put_new("packs/ab12.pack", b"again").unwrap());
+    // batches: empty is a no-op, outcomes come back in input order, an existing
+    // key is reported false and keeps its value
+    assert!(b.put_new_batch(&[]).unwrap().is_empty());
+    assert!(b.exists_batch(&[]).unwrap().is_empty());
+    assert_eq!(
+        b.put_new_batch(&[
+            ("batch/a", b"1".as_slice()),
+            ("log/1", b"clobber".as_slice()),
+            ("batch/b", b"2".as_slice()),
+        ])
+        .unwrap(),
+        vec![true, false, true]
+    );
+    let Fetched::New { bytes, .. } = b.get("log/1", None).unwrap() else {
+        panic!()
+    };
+    assert_eq!(bytes, b"entry-one");
+    assert_eq!(
+        b.exists_batch(&["batch/b", "batch/none", "batch/a", "log/1"])
+            .unwrap(),
+        vec![true, false, true, true]
+    );
+    // a repeated key is refused before anything is written
+    assert!(b
+        .put_new_batch(&[("batch/c", b"1".as_slice()), ("batch/c", b"2".as_slice())])
+        .is_err());
+    assert!(!b.exists("batch/c").unwrap());
+    // a bad key is refused before anything is written
+    assert!(b
+        .put_new_batch(&[("batch/d", b"1".as_slice()), ("../x", b"2".as_slice())])
+        .is_err());
+    assert!(!b.exists("batch/d").unwrap());
 }
 
 /// Conformance checks for a backend that overrides [`Bucket::delete_leased`]

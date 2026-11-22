@@ -118,6 +118,27 @@ under the temp directory (mode 0700), removed on `Drop`.
   by one. All fetches are `--depth=1`, so a hostile commit's parents are never
   downloaded. A counting `SC_GIT` shim test bounds the git network calls of a
   cold clone and an incremental push independent of the log length.
+- **Batched writes and presence checks.** `Bucket::put_new_batch` pushes the
+  value commits of several create-only keys in one `git push --porcelain` per
+  chunk (at most 64 MiB of values, an item over that alone, and the leased
+  delete's item and command-line bounds), with one `--force-with-lease=refs/sc/K:`
+  per ref; never `+`, never `--atomic`, since the keys are independent (a pack
+  without its idx is an orphan compaction sweeps, as after two separate pushes).
+  Which refs landed is read from the per-ref porcelain lines whatever the exit
+  status; every other ref is dropped from the cache and classified together by
+  one `ls-remote` of its exact refs, with the same rules as a single `put`
+  (our commit there: landed; another value: lost; nothing: the host refused).
+  If that re-read fails the push refusal is returned, never `false`.
+  `exists_batch` is one `ls-remote` per command-line-bounded chunk with an exact
+  refname compare, and is never answered from the local cache. `BucketTransport`
+  uploads a pack and its idx with one `put_new_batch`, checks every pending pack
+  and idx with one `exists_batch` before the manifest CAS, and after a won CAS
+  builds its view from the manifest it just wrote instead of reading it back.
+  Counted with a logging `SC_GIT` shim through `sc push` of one small commit: a
+  first push 19 network git calls → 10 (three probes of the empty remote at open,
+  in `list_refs` and in `update_ref`, three pushes, one existence check), a second
+  push 11 → 8. The old tip's pack is still downloaded by the ref rule on every
+  push after the first (bandwidth, not round trips).
 - A mutable key (the manifest) is read with one call, `git fetch --depth=1
   +refs/sc/K:refs/sc/K`, instead of `ls-remote` followed by `fetch`. The local ref
   after the fetch is the tag; if it equals the caller's cached tag the read is
@@ -439,8 +460,12 @@ every transport path.
   home whose owner lock is free at startup (unix). A normal exit and an error returned to `main` remove it.
 - Scaling: `ls-remote` and push download the whole ref advertisement (the pattern given to `ls-remote` filters on the client; a packet trace showed the server sends every ref; the manifest read no longer does, it is one fetch that a v2 host answers with that ref alone), and a cold read fetches every `log/` and `checkpoints/` entry behind the last checkpoint. Refs grow by at least three per push (a log entry, a pack and its idx); `sc remote compact` (above) is what bounds that, folding the small packs and deleting what nothing names, so a long-lived store should be compacted on a schedule. Between runs the advertisement still grows with the pushes since the last one, until a ref-filtering host exists.
 - Each cold read or push costs git round trips. The freshness window and family
-  batching bound them, but a Git host is slower than S3. If push over `sc+git::`
-  stays slow on large histories, the next step is a batched `has_objects`.
+  batching bound them, but a Git host is slower than S3. The per-object probe is
+  free on an empty remote (the transport remembers it for 2 s). On a non-empty
+  `sc+git::` remote the freshness window answers the per-object probes, and git
+  reads the manifest again only once the cached tag is older than 2 s; S3 and
+  `sc+wal://` have no such window and read the manifest on every probe. If push stays slow on large histories, the next step is a batched
+  `has_objects`.
 - sc-forge repositories keep a deleted or replaced value fetchable by id until
   the gc prune stage runs.
 - The "not independently audited, do not commit production secrets" warning is

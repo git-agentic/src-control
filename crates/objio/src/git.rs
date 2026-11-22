@@ -56,6 +56,10 @@ const FETCH_BATCH: usize = 256;
 /// 32 KiB, so the budget stays well under it).
 const DELETE_BATCH: usize = 128;
 const DELETE_ARG_BUDGET: usize = 24 << 10;
+/// Most value bytes one batched create push carries (an item larger than this
+/// goes in a push of its own). The item and command-line bounds of the leased
+/// delete apply too, so a batch never outgrows what a host accepts in one push.
+const PUSH_VALUE_BUDGET: u64 = 64 << 20;
 /// How long a fetch may neither grow `objects/pack` nor exit before the
 /// watchdog kills it (a served store depends on its git child, so a silent
 /// host must not park a session forever).
@@ -563,6 +567,27 @@ fn classify_refusal(ours: &str, lease: &str, remote: Option<&str>) -> Settled {
     }
 }
 
+/// How many leading items of `rest` go in one batched git call: the first
+/// always does, and more join while the item count stays within
+/// [`DELETE_BATCH`], their summed command-line cost within [`DELETE_ARG_BUDGET`]
+/// and their summed value bytes within [`PUSH_VALUE_BUDGET`]. `cost` gives an
+/// item's `(command-line bytes, value bytes)`.
+fn batch_len<T>(rest: &[T], cost: impl Fn(&T) -> (usize, u64)) -> usize {
+    let (mut n, mut args, mut value) = (0, 0usize, 0u64);
+    while let Some(item) = rest.get(n) {
+        let (a, v) = cost(item);
+        if n > 0
+            && (n >= DELETE_BATCH || args + a > DELETE_ARG_BUDGET || value + v > PUSH_VALUE_BUDGET)
+        {
+            break;
+        }
+        args += a;
+        value += v;
+        n += 1;
+    }
+    n
+}
+
 /// Result of [`GitBucket::put`].
 enum Written {
     Landed(String),
@@ -695,6 +720,14 @@ impl GitBucket {
     #[doc(hidden)]
     pub fn cap_family_fetches_at(&mut self, bytes: u64) {
         self.tune.family_budget = Some(bytes);
+    }
+
+    /// Test hook for other crates: [`GitBucket::open`] running `program` instead
+    /// of `git` (a shim that logs the calls it passes through), without touching
+    /// the process environment. Not for production use.
+    #[doc(hidden)]
+    pub fn open_with_program(url: &str, program: &str) -> Result<GitBucket> {
+        Self::open_with(url, program.to_string(), CHUNK)
     }
 
     fn open_with(url: &str, git: String, chunk: usize) -> Result<GitBucket> {
@@ -1097,18 +1130,14 @@ impl GitBucket {
     /// `ls-remote` lines `(oid, refname)` for `pattern`. Patterns tail-match, so
     /// callers must compare full refnames themselves.
     fn ls_remote(&self, pattern: &str) -> Result<Vec<(String, String)>> {
-        let out = self.run(
-            &[
-                "ls-remote",
-                "--refs",
-                "--end-of-options",
-                &self.url,
-                pattern,
-            ],
-            None,
-            &[],
-            LS_REMOTE_CAP,
-        )?;
+        self.ls_remote_all(&[pattern])
+    }
+
+    /// [`Self::ls_remote`] for several patterns in one call.
+    fn ls_remote_all(&self, patterns: &[&str]) -> Result<Vec<(String, String)>> {
+        let mut a = vec!["ls-remote", "--refs", "--end-of-options", self.url.as_str()];
+        a.extend(patterns);
+        let out = self.run(&a, None, &[], LS_REMOTE_CAP)?;
         if !out.success {
             return Err(self.fail("ls-remote", &out));
         }
@@ -1581,15 +1610,89 @@ impl GitBucket {
                 Settled::Landed => {}
             }
         }
-        self.lock().insert(
-            key.to_string(),
-            Known {
-                oid: oid.clone(),
-                create_only: create_only_key(key),
-                at: Instant::now(),
-            },
-        );
+        self.lock().insert(key.to_string(), Self::known(key, &oid));
         Ok(Written::Landed(oid))
+    }
+
+    /// The cached state of a key this instance just wrote at `oid`.
+    fn known(key: &str, oid: &str) -> Known {
+        Known {
+            oid: oid.to_string(),
+            create_only: create_only_key(key),
+            at: Instant::now(),
+        }
+    }
+
+    /// The remote oid of each exactly named `refs/sc/<key>` among `keys`, from
+    /// one `ls-remote` per command-line-bounded chunk. Patterns tail-match, so
+    /// each line is compared by its full refname.
+    fn remote_refs(&self, keys: &[&str]) -> Result<HashMap<String, String>> {
+        let mut found = HashMap::new();
+        let mut rest = keys;
+        while !rest.is_empty() {
+            let (chunk, tail) = rest.split_at(batch_len(rest, |k| (NS.len() + k.len() + 1, 0)));
+            rest = tail;
+            let patterns: Vec<String> = chunk.iter().map(|k| format!("{NS}{k}")).collect();
+            let pats: Vec<&str> = patterns.iter().map(String::as_str).collect();
+            for (oid, name) in self.ls_remote_all(&pats)? {
+                if patterns.contains(&name) {
+                    found.insert(name, oid);
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// One create-only push of `chunk` (`(key, commit)` pairs): a
+    /// `--force-with-lease=refs/sc/K:` and an `oid:refs/sc/K` refspec per key,
+    /// never `+`, never `--atomic` (the keys are independent). Which keys landed
+    /// is read from git's per-ref porcelain lines whatever its exit status: a
+    /// push where the host refused some refs exits non-zero yet applied the rest.
+    /// Returns the landed flags and, when any key did not land, the refusal text.
+    fn push_new_chunk(&self, chunk: &[(&str, &str)]) -> Result<(Vec<bool>, Option<String>)> {
+        let leases: Vec<String> = chunk
+            .iter()
+            .map(|(k, _)| format!("--force-with-lease={NS}{k}:"))
+            .collect();
+        let specs: Vec<String> = chunk
+            .iter()
+            .map(|(k, oid)| format!("{oid}:{NS}{k}"))
+            .collect();
+        let mut a = vec!["push", "--porcelain", "--no-verify"];
+        a.extend(leases.iter().map(String::as_str));
+        a.extend(["--end-of-options", &self.url]);
+        a.extend(specs.iter().map(String::as_str));
+        let out = self.run(&a, None, &[], SMALL_CAP)?;
+        let mut accepted = std::collections::HashSet::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut f = line.split('\t');
+            let flag = f.next().unwrap_or("");
+            let to = f.next().and_then(|r| r.rsplit_once(':')).map(|(_, t)| t);
+            if let (Some(to), " " | "+" | "*") = (to, flag) {
+                accepted.insert(to.to_string());
+            }
+        }
+        let landed: Vec<bool> = chunk
+            .iter()
+            .map(|(k, _)| accepted.contains(&format!("{NS}{k}")))
+            .collect();
+        let refusal = (!landed.iter().all(|l| *l)).then(|| {
+            // Every rejected ref: a retry can see one key's "stale info" before
+            // the host's own refusal of another.
+            let rejected: Vec<String> = out
+                .stdout
+                .split(|b| *b == b'\n')
+                .filter(|l| l.first() == Some(&b'!'))
+                .map(|l| self.scrub(&String::from_utf8_lossy(l)))
+                .collect();
+            format!(
+                "git push failed (exit {}): {} {}",
+                out.code.map_or("signal".to_string(), |c| c.to_string()),
+                out.stderr,
+                rejected.join("; ")
+            )
+        });
+        Ok((landed, refusal))
     }
 }
 
@@ -1840,6 +1943,106 @@ impl Bucket for GitBucket {
     fn exists(&self, key: &str) -> Result<bool> {
         check_key(key)?;
         Ok(self.remote_ref(key)?.is_some())
+    }
+
+    /// One `ls-remote` per command-line-bounded chunk, every `refs/sc/<key>` a
+    /// pattern, compared by exact refname. Never answered from the local state:
+    /// a key another writer deleted must read as absent.
+    fn exists_batch(&self, keys: &[&str]) -> Result<Vec<bool>> {
+        for k in keys {
+            check_key(k)?;
+        }
+        let found = self.remote_refs(keys)?;
+        Ok(keys
+            .iter()
+            .map(|k| found.contains_key(&format!("{NS}{k}")))
+            .collect())
+    }
+
+    /// Builds every value commit locally, then pushes in chunks (see
+    /// [`batch_len`]): one `git push` per chunk instead of one per key. A key the
+    /// push did not report as landed drops its cached state, and all such keys are
+    /// classified together by one `ls-remote` of their exact refs with
+    /// [`classify_refusal`], as [`GitBucket::put`] does for one key: our commit
+    /// there is a lost ack (landed), another value is a lost race (`false`),
+    /// nothing is a refusal by the host (an error). If the re-read itself fails
+    /// the push refusal is returned, never `false`. An error may leave any subset
+    /// of the keys created: orphans a compaction sweeps.
+    fn put_new_batch(&self, items: &[(&str, &[u8])]) -> Result<Vec<bool>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        for (k, _) in items {
+            check_key(k)?;
+        }
+        crate::check_batch(items.iter().map(|(k, _)| *k))?;
+        let oids = items
+            .iter()
+            .map(|(k, v)| self.make_commit(k, v, "new"))
+            .collect::<Result<Vec<String>>>()?;
+        let mut landed = vec![false; items.len()];
+        let mut refusal: Option<Error> = None;
+        let mut start = 0;
+        while start < items.len() {
+            let n = batch_len(&items[start..], |(k, v)| {
+                (2 * (NS.len() + k.len()) + 64, v.len() as u64)
+            });
+            let chunk: Vec<(&str, &str)> = (start..start + n)
+                .map(|i| (items[i].0, oids[i].as_str()))
+                .collect();
+            match self.push_new_chunk(&chunk) {
+                Ok((flags, msg)) => {
+                    landed[start..start + n].copy_from_slice(&flags);
+                    if refusal.is_none() {
+                        refusal = msg.map(Error::Backend);
+                    }
+                }
+                Err(e) => {
+                    refusal.get_or_insert(e);
+                    break;
+                }
+            }
+            start += n;
+        }
+        {
+            let mut st = self.lock();
+            for (i, (k, _)) in items.iter().enumerate() {
+                if landed[i] {
+                    st.insert(k.to_string(), Self::known(k, &oids[i]));
+                } else {
+                    st.remove(*k);
+                }
+            }
+        }
+        let unlanded: Vec<usize> = (0..items.len()).filter(|i| !landed[*i]).collect();
+        if unlanded.is_empty() {
+            return Ok(landed);
+        }
+        let refusal =
+            refusal.unwrap_or_else(|| Error::Backend("git push did not report the refs".into()));
+        let keys: Vec<&str> = unlanded.iter().map(|i| items[*i].0).collect();
+        // Cannot re-read (network): report the push failure itself.
+        let Ok(remote) = self.remote_refs(&keys) else {
+            return Err(refusal);
+        };
+        let mut genuine = false;
+        for i in unlanded {
+            let key = items[i].0;
+            let cur = remote.get(&format!("{NS}{key}")).map(String::as_str);
+            match classify_refusal(&oids[i], "", cur) {
+                Settled::Landed => {
+                    landed[i] = true;
+                    self.lock()
+                        .insert(key.to_string(), Self::known(key, &oids[i]));
+                }
+                Settled::Lost => {}
+                Settled::Genuine => genuine = true,
+            }
+        }
+        if genuine {
+            return Err(refusal);
+        }
+        Ok(landed)
     }
 
     fn delete(&self, key: &str) -> Result<()> {
@@ -3062,6 +3265,298 @@ mod tests {
         assert_eq!(leases, N, "one lease per ref");
     }
 
+    /// [`Bucket::put_new_batch`] over string values.
+    fn batch(b: &GitBucket, items: &[(&str, &str)]) -> Result<Vec<bool>> {
+        let v: Vec<(&str, &[u8])> = items.iter().map(|(k, v)| (*k, v.as_bytes())).collect();
+        b.put_new_batch(&v)
+    }
+
+    fn value_of(b: &GitBucket, key: &str) -> String {
+        let Fetched::New { bytes, .. } = b.get(key, None).unwrap() else {
+            panic!("{key} should exist")
+        };
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// Shell that sets `s` to the git subcommand (skipping `-c <x>` pairs).
+    #[cfg(unix)]
+    const SUBCOMMAND: &str = "s=; k=0; for x in \"$@\"; do if [ $k = 1 ]; then k=0; continue; fi; if [ \"$x\" = -c ]; then k=1; continue; fi; s=$x; break; done";
+
+    /// A shim that logs the full command line of every push and the subcommand
+    /// of every other network call.
+    #[cfg(unix)]
+    fn call_log_shim(t: &Tmp, log: &Path) -> String {
+        shim(
+            t,
+            "calls.sh",
+            &format!(
+                "{SUBCOMMAND}; case \"$s\" in push) echo \"push $*\" >> {l};; fetch) echo \"$s\" >> {l};; ls-remote) echo \"ls-remote $*\" >> {l};; esac",
+                l = log.display()
+            ),
+        )
+    }
+
+    #[cfg(unix)]
+    fn logged(log: &Path, prefix: &str) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.starts_with(prefix))
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn put_new_batch_reports_each_key_and_leaves_an_existing_one_alone() {
+        need_git!();
+        let t = Tmp::new("batch-mixed");
+        let (_, url) = hub(&t);
+        assert!(open(&url).put_new("log/2", b"theirs").unwrap());
+        // this instance has never seen log/2
+        let b = open(&url);
+        let out = batch(
+            &b,
+            &[("log/1", "one"), ("log/2", "mine"), ("log/3", "three")],
+        )
+        .unwrap();
+        assert_eq!(out, [true, false, true]);
+        let r = open(&url);
+        assert_eq!(value_of(&r, "log/1"), "one");
+        assert_eq!(value_of(&r, "log/2"), "theirs");
+        assert_eq!(value_of(&r, "log/3"), "three");
+        // the lost key was not cached as ours, the landed ones are
+        assert_eq!(value_of(&b, "log/2"), "theirs");
+        assert_eq!(value_of(&b, "log/1"), "one");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn put_new_batch_reports_a_ref_the_host_refuses_and_a_retry_finishes() {
+        use std::os::unix::fs::PermissionsExt;
+        need_git!();
+        let t = Tmp::new("batch-hook");
+        let (hubdir, url) = hub(&t);
+        let log = t.0.join("calls.log");
+        let b = open_git(&url, &call_log_shim(&t, &log));
+        // An `update` hook judges each ref on its own: it refuses log/2 only.
+        let hook = hubdir.join("hooks/update");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\ncase \"$1\" in refs/sc/log/2) echo 'keep log two' >&2; exit 1;; esac\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let items = [("log/1", "one"), ("log/2", "two"), ("log/3", "three")];
+        let e = batch(&b, &items).unwrap_err().to_string();
+        assert!(e.contains("keep log two"), "{e}");
+        // the push exits non-zero but its per-ref lines say log/1 and log/3
+        // landed, so only log/2 is re-read
+        let reads = logged(&log, "ls-remote");
+        assert_eq!(reads.len(), 1, "{reads:?}");
+        assert!(reads[0].contains("refs/sc/log/2"), "{reads:?}");
+        assert!(
+            !reads[0].contains("refs/sc/log/1") && !reads[0].contains("refs/sc/log/3"),
+            "{reads:?}"
+        );
+        // not mistaken for a lost race, and the other keys landed
+        assert_eq!(
+            names(&open(&url).list_tags("").unwrap()),
+            ["log/1", "log/3"]
+        );
+        // once the host allows it, the same call finishes the job: the keys that
+        // landed report false, the refused one true
+        std::fs::remove_file(&hook).unwrap();
+        assert_eq!(batch(&b, &items).unwrap(), [false, true, false]);
+        let r = open(&url);
+        assert_eq!(value_of(&r, "log/2"), "two");
+        assert_eq!(
+            names(&r.list_tags("").unwrap()),
+            ["log/1", "log/2", "log/3"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn put_new_batch_never_reports_false_when_it_cannot_tell() {
+        need_git!();
+        // push and the re-read both fail: an error carrying the push refusal
+        let t = Tmp::new("batch-blind");
+        let (_, url) = hub(&t);
+        let sh = shim(
+            &t,
+            "blind.sh",
+            &format!("{SUBCOMMAND}; case \"$s\" in push|ls-remote) echo boom >&2; exit 1;; esac"),
+        );
+        let b = open_git(&url, &sh);
+        let e = batch(&b, &[("log/1", "one")]).unwrap_err().to_string();
+        assert!(e.contains("git push failed") && e.contains("boom"), "{e}");
+        // push fails, the re-read works and finds nothing: the host refused
+        let sh = shim(
+            &t,
+            "refuse.sh",
+            &format!("{SUBCOMMAND}; case \"$s\" in push) echo boom >&2; exit 1;; esac"),
+        );
+        let b = open_git(&url, &sh);
+        let e = batch(&b, &[("log/1", "one")]).unwrap_err().to_string();
+        assert!(e.contains("boom"), "{e}");
+        assert!(!open(&url).exists("log/1").unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lost_batch_acknowledgement_is_success_when_the_remote_holds_our_commits() {
+        need_git!();
+        let t = Tmp::new("batch-ack");
+        let (_, url) = hub(&t);
+        // the push lands but its answer (exit status and per-ref lines) is lost
+        let sh = shim_script(
+            &t,
+            "ack.sh",
+            &format!("{SUBCOMMAND}\ncase \"$s\" in push) git \"$@\" >/dev/null 2>&1; exit 1;; esac\nexec git \"$@\"\n"),
+        );
+        let b = open_git(&url, &sh);
+        assert_eq!(
+            batch(&b, &[("log/1", "one"), ("log/2", "two")]).unwrap(),
+            [true, true]
+        );
+        assert_eq!(value_of(&open(&url), "log/2"), "two");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn put_new_batch_is_one_push_per_chunk_with_a_lease_per_ref_and_never_plus_or_atomic() {
+        need_git!();
+        let t = Tmp::new("batch-chunks");
+        let (_, url) = hub(&t);
+        let log = t.0.join("calls.log");
+        let b = open_git(&url, &call_log_shim(&t, &log));
+        // a few keys: one push, and no re-read when everything landed
+        let few: Vec<String> = (0..5).map(|i| format!("log/{i:04}")).collect();
+        let items: Vec<(&str, &str)> = few.iter().map(|k| (k.as_str(), "v")).collect();
+        assert_eq!(batch(&b, &items).unwrap(), [true; 5]);
+        assert_eq!(logged(&log, "push").len(), 1);
+        assert!(logged(&log, "ls-remote").is_empty() && logged(&log, "fetch").is_empty());
+        // what landed is cached as ours: a create-only key is read with no call
+        assert!(matches!(
+            b.get("log/0003", None).unwrap(),
+            Fetched::New { .. }
+        ));
+        assert!(logged(&log, "fetch").is_empty() && logged(&log, "ls-remote").is_empty());
+        // more than DELETE_BATCH keys: split, each push within the line budget
+        let n = DELETE_BATCH + 2;
+        let many: Vec<String> = (0..n).map(|i| format!("packs/h{i:04}.idx")).collect();
+        let items: Vec<(&str, &str)> = many.iter().map(|k| (k.as_str(), "v")).collect();
+        assert_eq!(batch(&b, &items).unwrap(), vec![true; n]);
+        let pushes = logged(&log, "push");
+        assert_eq!(pushes.len(), 3, "1 + ceil({n} / {DELETE_BATCH})");
+        let mut leases = 0;
+        for p in &pushes[1..] {
+            assert!(p.len() < 32 * 1024, "command line of {} bytes", p.len());
+            assert!(!p.contains("--atomic"), "{p}");
+            for tok in p.split(' ') {
+                assert!(!tok.starts_with('+'), "plus refspec: {tok}");
+                if let Some(l) = tok.strip_prefix("--force-with-lease=refs/sc/packs/") {
+                    assert!(l.ends_with(".idx:"), "create-only lease expected: {tok}");
+                    leases += 1;
+                }
+            }
+        }
+        assert_eq!(leases, n, "one lease per ref");
+        assert_eq!(b.list("packs/").unwrap().len(), n);
+    }
+
+    #[test]
+    fn batch_chunks_respect_the_item_line_and_value_bounds() {
+        let mib = 1u64 << 20;
+        // value bytes: 40 + 40 would pass 64, so they split; an item over the
+        // budget goes alone
+        let sizes = [40 * mib, 40 * mib, 100 * mib, 1];
+        let mut rest: &[u64] = &sizes;
+        let mut chunks = Vec::new();
+        while !rest.is_empty() {
+            let n = batch_len(rest, |v| (100, *v));
+            chunks.push(n);
+            rest = &rest[n..];
+        }
+        assert_eq!(chunks, [1, 1, 1, 1]);
+        assert_eq!(batch_len(&[mib; 64], |v| (100, *v)), 64);
+        assert_eq!(
+            batch_len(&[mib; 65], |v| (100, *v)),
+            64,
+            "64 MiB fits, 65 do not"
+        );
+        // item count
+        assert_eq!(batch_len(&[0u64; 500], |v| (1, *v)), DELETE_BATCH);
+        // command-line bytes: the first item always fits, then the budget bounds
+        assert_eq!(batch_len(&[0u64; 10], |_| (DELETE_ARG_BUDGET, 0)), 1);
+        assert_eq!(batch_len(&[0u64; 10], |_| (DELETE_ARG_BUDGET / 4, 0)), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_calls_validate_before_any_git_call_and_empty_is_free() {
+        need_git!();
+        let t = Tmp::new("batch-validate");
+        let (_, url) = hub(&t);
+        let log = t.0.join("calls.log");
+        let b = open_git(&url, &call_log_shim(&t, &log));
+        assert!(b.put_new_batch(&[]).unwrap().is_empty());
+        assert!(b.exists_batch(&[]).unwrap().is_empty());
+        assert!(batch(&b, &[("log/1", "x"), ("bad key", "y")]).is_err());
+        assert!(batch(&b, &[("log/1", "x"), ("log/2/../3", "y")]).is_err());
+        assert!(batch(&b, &[("log/1", "x"), ("log/1", "y")]).is_err());
+        // acceptable to the shared key check, not to a refspec
+        assert!(batch(&b, &[("log/1", "x"), ("log/a..b", "y")]).is_err());
+        assert!(batch(&b, &[("log/1", "x"), ("log/a:b", "y")]).is_err());
+        assert!(b.exists_batch(&["log/1", "a b"]).is_err());
+        assert!(b.exists_batch(&["log/1", "log/*"]).is_err());
+        assert!(
+            std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
+            "no network call for an empty or invalid batch"
+        );
+        assert!(!open(&url).exists("log/1").unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exists_batch_compares_exact_refnames_and_never_trusts_the_local_state() {
+        need_git!();
+        let t = Tmp::new("exists-batch");
+        let (hubdir, url) = hub(&t);
+        let log = t.0.join("calls.log");
+        let b = open_git(&url, &call_log_shim(&t, &log));
+        assert!(batch(&b, &[("log/1", "one"), ("packs/a.pack", "p")])
+            .unwrap()
+            .iter()
+            .all(|x| *x));
+        let oid = git(&hubdir, &["rev-parse", "refs/sc/log/1"], "");
+        // a branch whose tail looks like a bucket key is not that key
+        git(
+            &hubdir,
+            &["update-ref", "refs/heads/x/refs/sc/log/9", &oid],
+            "",
+        );
+        let before = logged(&log, "ls-remote").len();
+        assert_eq!(
+            b.exists_batch(&["log/9", "log/1", "log/2", "packs/a.pack"])
+                .unwrap(),
+            [false, true, false, true]
+        );
+        assert_eq!(logged(&log, "ls-remote").len(), before + 1, "one call");
+        // a key another writer deleted reads as absent although we wrote it
+        git(&hubdir, &["update-ref", "-d", "refs/sc/log/1"], "");
+        assert_eq!(b.exists_batch(&["log/1"]).unwrap(), [false]);
+        // a long list is split by command-line bytes, one ls-remote per chunk
+        let keys: Vec<String> = (0..300)
+            .map(|i| format!("packs/{}{i:04}.pack", "h".repeat(50)))
+            .collect();
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let before = logged(&log, "ls-remote").len();
+        let got = b.exists_batch(&refs).unwrap();
+        assert!(got.iter().all(|x| !x));
+        assert_eq!(logged(&log, "ls-remote").len() - before, 3);
+    }
+
     /// Shell snippet for a shim that logs the git subcommand of every call.
     #[cfg(unix)]
     fn count_snippet(log: &Path) -> String {
@@ -3844,7 +4339,15 @@ mod tests {
 
         // The holder going away (a killed server) is what frees the cache.
         drop(held);
-        assert_eq!(GitBucket::reap_stale(&parent), 1);
+        // A child another test thread is forking can hold a copy of the lock's
+        // descriptor until its exec closes it, so the lock frees a moment later.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut reaped = GitBucket::reap_stale(&parent);
+        while reaped == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            reaped = GitBucket::reap_stale(&parent);
+        }
+        assert_eq!(reaped, 1);
         assert!(!held_dir.exists());
         // So does dropping a bucket: it removes its own directory.
         let cache = a.cache.clone();
