@@ -54,10 +54,12 @@ jobs:
           #   because unmaintained advisories only warn) until Scorecard's OSV
           #   check counted it — OSTIF audit G-035. Same GTK4 removal gate.
           # - heapless 0.8 (RUSTSEC-2026-0574..0582) reaches us only through
-          #   gix-hash -> faster-hex 0.10, which imports heapless solely under
-          #   cfg(not(feature = "alloc")); gix enables alloc, so no heapless code
-          #   runs. Remove when gix-hash moves to faster-hex >= 2 (heapless 0.9).
-          # - chrono (RUSTSEC-2026-0543, unmaintained, no vulnerability) reaches
-          #   us only through tauri-utils -> serde_with; remove when Tauri drops
-          #   it.
+          #   faster-hex 0.10 (via gix-hash and gix-packetline), which imports
+          #   heapless solely under cfg(not(feature = "alloc")); both enable
+          #   faster-hex/std, so no heapless code runs. Remove when heapless 0.8
+          #   leaves Cargo.lock.
+          # - chrono (RUSTSEC-2026-0543, unmaintained, no vulnerability) is in
+          #   the lockfile only as serde_with's optional chrono_0_4 dependency
+          #   (via tauri-utils) and is never compiled; remove when it leaves
+          #   Cargo.lock.
           ignore: RUSTSEC-2024-0416,RUSTSEC-2024-0412,RUSTSEC-2024-0413,RUSTSEC-2024-0418,RUSTSEC-2024-0411,RUSTSEC-2024-0417,RUSTSEC-2024-0414,RUSTSEC-2024-0415,RUSTSEC-2024-0420,RUSTSEC-2024-0419,RUSTSEC-2024-0370,RUSTSEC-2025-0081,RUSTSEC-2025-0075,RUSTSEC-2025-0080,RUSTSEC-2025-0100,RUSTSEC-2025-0098,RUSTSEC-2024-0429,RUSTSEC-2026-0173,RUSTSEC-2026-0574,RUSTSEC-2026-0575,RUSTSEC-2026-0576,RUSTSEC-2026-0577,RUSTSEC-2026-0578,RUSTSEC-2026-0579,RUSTSEC-2026-0580,RUSTSEC-2026-0581,RUSTSEC-2026-0582,RUSTSEC-2026-0543
