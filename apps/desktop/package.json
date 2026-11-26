@@ -20,7 +20,7 @@
   "license": "Apache-2.0",
   "type": "module",
   "dependencies": {
-    "@pierre/diffs": "^1.6.4",
+    "@pierre/diffs": "^1.7.1",
     "@pierre/trees": "1.0.0",
     "@tauri-apps/api": "^2.12.5",
     "react": "^19.3.1",
